@@ -36,7 +36,8 @@ const loadPackageInfo = async (loggerInstance?: ChildLogger): Promise<{ name: st
   return await ErrorHandler.tryCatch(
     async () => {
       // Use the globally defined __dirname from the top of the file
-      const pkgPath = path.resolve(__dirname, '../../package.json');
+      // Go up three levels from the compiled file location (e.g., dist/mcp-server/server.js)
+      const pkgPath = path.resolve(__dirname, '../../../package.json');
       const safePath = sanitizeInput.path(pkgPath);
       
       pkgLogger.debug(`Looking for package.json at: ${safePath}`);

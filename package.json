@@ -1,6 +1,6 @@
 {
   "name": "ntfy-mcp-server",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "An MCP (Model Context Protocol) server designed to interact with the ntfy push notification service. It enables LLMs and AI agents to send notifications to your devices with extensive customization options.",
   "main": "dist/index.js",
   "type": "module",
@@ -36,14 +36,15 @@
     "ntfy",
     "notifications",
     "push-notifications",
+    "pub-sub",
     "MCP",
     "model-context-protocol",
+    "mcp-server",
     "LLM",
     "AI-integration",
     "server",
     "typescript",
-    "claude",
-    "messaging"
+    "claude"
   ],
   "author": "Casey Hand @cyanheads",
   "license": "Apache-2.0"
