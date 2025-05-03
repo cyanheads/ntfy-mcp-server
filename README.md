@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/cyanheads-ntfy-mcp-server-badge.png)](https://mseep.ai/app/cyanheads-ntfy-mcp-server)
+
 # Ntfy MCP Server
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8.3-blue.svg)](https://www.typescriptlang.org/)
