@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-05-08 22:44:15
+Generated on: 2026-05-08 23:49:25
 
 ```text
 ntfy-mcp-server/
@@ -15,7 +15,8 @@ ntfy-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
-│   ├── 0.1.x/
+│   ├── 1.0.x/
+│   ├── 2.0.x/
 │   └── template.md
 ├── docs/
 │   └── ntfy/
@@ -109,21 +110,14 @@ ntfy-mcp-server/
 │       └── SKILL.md
 ├── src/
 │   ├── mcp-server/
-│   │   ├── prompts/
-│   │   │   └── definitions/
-│   │   │       └── echo.prompt.ts
 │   │   ├── resources/
 │   │   │   └── definitions/
-│   │   │       ├── echo-app-ui.app-resource.ts
 │   │   │       └── echo.resource.ts
 │   │   └── tools/
 │   │       └── definitions/
-│   │           ├── echo-app.app-tool.ts
 │   │           └── echo.tool.ts
 │   └── index.ts
 ├── tests/
-│   ├── prompts/
-│   │   └── echo.prompt.test.ts
 │   ├── resources/
 │   │   └── echo.resource.test.ts
 │   └── tools/
@@ -131,13 +125,14 @@ ntfy-mcp-server/
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
-├── AGENTS.md
 ├── biome.json
 ├── bun.lock
+├── bunfig.toml
 ├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
+├── LICENSE
 ├── package.json
 ├── server.json
 ├── tsconfig.build.json
