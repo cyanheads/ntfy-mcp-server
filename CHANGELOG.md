@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [2.0.0](changelog/2.0.x/2.0.0.md) — 2026-05-08 · ⚠️ Breaking
 
-Major rewrite on @cyanheads/mcp-ts-core — new transport, config, and error model. Breaking config and tool-surface changes from the 1.x line.
+Major rewrite on @cyanheads/mcp-ts-core. New 4-tool surface (publish, manage, fetch, emoji search), two ntfy resources, env-driven config, retry-aware HTTP client. Breaking changes from 1.x.
 
 ## [1.0.6](changelog/1.0.x/1.0.6.md) — 2025-05-05
 
