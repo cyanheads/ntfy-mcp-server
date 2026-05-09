@@ -34,11 +34,11 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ## Core Rules
 
-- **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch`. Plain `Error` is fine; the framework catches, classifies, and formats. Use error factories (`notFound()`, `validationError()`, etc.) when the error code matters.
+- **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch` for control flow. The narrow `try/catch` blocks in this codebase exist solely to translate upstream ntfy errors into typed contract failures via `ctx.fail()` before re-throwing; everything else bubbles for framework auto-classification. Use error factories (`notFound()`, `forbidden()`, `validationError()`, …) when no contract entry fits.
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
-- **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly.
-- **Check `ctx.elicit` / `ctx.sample`** for presence before calling.
-- **Secrets in env vars only** — never hardcoded.
+- **Auth scope is the configured `NTFY_BASE_URL`.** When a tool's `base_url` argument differs from the configured base, `NtfyService` strips the auth header before sending — never widen this to "always forward credentials" without explicit operator opt-in.
+- **Secrets in env vars only** — never hardcoded. `NTFY_AUTH_TOKEN` is mutually exclusive with `NTFY_AUTH_USERNAME` / `NTFY_AUTH_PASSWORD`; the basic-auth pair must be set together. Validation enforces this at config load.
+- **Treat topic names as secrets.** Anyone who knows a topic name can publish or subscribe — surface that in tool descriptions and never log full topic names at info level when the topic is private.
 
 ---
 
@@ -46,73 +46,118 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ### Tool
 
+`ntfy_search_emoji_tags` — minimal in-memory tool, illustrates the basic shape:
+
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { getEmojiTagService } from '@/services/emoji-tags/emoji-tag-service.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
+  description:
+    "Look up ntfy emoji tag short codes. Use the returned `tag` strings in `ntfy_publish_message`'s `tags` field…",
+  annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    query: z.string().optional().describe('Substring to match (case-insensitive).'),
+    limit: z.number().int().positive().max(200).default(25).describe('Max matches.'),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    matches: z.array(z.object({
+      tag: z.string().describe('Short code.'),
+      emoji: z.string().describe('Rendered Unicode emoji.'),
+    })).describe('Tag → emoji rows.'),
+    total: z.number().describe('Total matches before truncation.'),
+    truncated: z.boolean().describe('True when more matches existed than `limit`.'),
   }),
-  auth: ['inventory:read'],
 
-  async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+  handler(input) {
+    return getEmojiTagService().search(input.query, input.limit);
   },
 
-  // format() populates content[] — the markdown twin of structuredContent.
-  // Different clients read different surfaces (Claude Code → structuredContent,
-  // Claude Desktop → content[]); both must carry the same data.
-  // Enforced at lint time: every field in `output` must appear in the rendered text.
   format: (result) => [{
     type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
+    text: result.matches.length === 0
+      ? `No emoji tags matched (total: ${result.total}).`
+      : `${result.matches.map(m => `| \`${m.tag}\` | ${m.emoji} |`).join('\n')}`,
   }],
+});
+```
+
+`ntfy_publish_message` — typed error contract with upstream classification:
+
+```ts
+import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
+
+export const ntfyPublishMessage = tool('ntfy_publish_message', {
+  description: 'Send or update a push notification on an ntfy topic…',
+  annotations: { openWorldHint: true },
+  input: /* … */,
+  output: /* … */,
+
+  errors: [
+    { reason: 'forbidden_topic', code: JsonRpcErrorCode.Forbidden,
+      when: 'Auth required for the target topic.',
+      recovery: 'Try a public topic instead; if this topic must stay protected, ask the operator to provision ntfy auth credentials.' },
+    { reason: 'rate_limited', code: JsonRpcErrorCode.RateLimited,
+      when: 'Upstream returned 429 after retries were exhausted.',
+      retryable: true,
+      recovery: "Wait the rate-limit window before retrying." },
+  ],
+
+  async handler(input, ctx) {
+    const topic = input.topic ?? getServerConfig().defaultTopic;
+    if (!topic) {
+      throw validationError('Topic is required when NTFY_DEFAULT_TOPIC is unset.', {
+        recovery: { hint: 'Pass a `topic` argument or configure NTFY_DEFAULT_TOPIC.' },
+      });
+    }
+    try {
+      const response = await getNtfyService().publish({ topic, ...input }, { signal: ctx.signal });
+      return { id: response.id, /* … */ };
+    } catch (err) {
+      if (isAuthCode(getCode(err))) {
+        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${topic}`);
+      }
+      throw err; // Let framework auto-classify the rest
+    }
+  },
 });
 ```
 
 ### Resource
 
+`ntfy://{topic}` — snapshot resource that delegates to the same service the polling tool uses:
+
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { forbidden } from '@cyanheads/mcp-ts-core/errors';
+import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
-  async handler(params, ctx) {
-    const item = await ctx.state.get(`item:${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
-  },
-});
-```
-
-### Prompt
-
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
+export const ntfyTopicResource = resource('ntfy://{topic}', {
+  name: 'ntfy-topic-snapshot',
+  description: "Snapshot of a topic's last 20 messages from the past hour…",
+  mimeType: 'application/json',
+  params: z.object({
+    topic: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/).describe('Topic name.'),
   }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
+
+  async handler(params, ctx) {
+    try {
+      const raw = await getNtfyService().fetch(
+        { topic: params.topic, since: '1h' },
+        { signal: ctx.signal },
+      );
+      return { topic: params.topic, messages: raw, /* … */ };
+    } catch (err) {
+      if (isAuthCode(getCode(err))) {
+        throw forbidden(getMessage(err) || `Forbidden for topic ${params.topic}`, {
+          recovery: { hint: 'Try an unprotected topic.' },
+        }, { cause: err });
+      }
+      throw err;
+    }
+  },
 });
 ```
 
@@ -123,39 +168,46 @@ export const reviewCode = prompt('review_code', {
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
-const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
-});
+const ServerConfigSchema = z
+  .object({
+    baseUrl: z.string().url().default('https://ntfy.sh').transform((u) => u.replace(/\/+$/, '')),
+    defaultTopic: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/).optional(),
+    authToken: z.string().min(1).optional(),
+    authUsername: z.string().min(1).optional(),
+    authPassword: z.string().min(1).optional(),
+    requestTimeoutMs: z.coerce.number().int().positive().default(15_000),
+    maxRetries: z.coerce.number().int().min(0).default(3),
+  })
+  .superRefine((cfg, ctx) => {
+    // token vs username/password are mutually exclusive; basic-auth pair must be set together.
+  });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
+    baseUrl: 'NTFY_BASE_URL',
+    defaultTopic: 'NTFY_DEFAULT_TOPIC',
+    authToken: 'NTFY_AUTH_TOKEN',
+    /* … */
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so validation errors name the actual variable (`MY_API_KEY`) rather than the internal path (`apiKey`). It throws a `ConfigurationError` the framework catches and prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so validation errors name the actual variable (`NTFY_AUTH_TOKEN`) rather than the internal path (`authToken`). It throws a `ConfigurationError` the framework catches and prints as a clean startup banner.
 
 ---
 
 ## Context
 
-Handlers receive a unified `ctx` object. Key properties:
+Handlers receive a unified `ctx` object. Key properties this server uses today (the framework exposes more — see `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md`):
 
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.list(prefix, { cursor, limit })`. Accepts any serializable value. |
-| `ctx.elicit` | Ask user for structured input. **Check for presence first:** `if (ctx.elicit) { ... }` |
-| `ctx.sample` | Request LLM completion from the client. **Check for presence first:** `if (ctx.sample) { ... }` |
-| `ctx.signal` | `AbortSignal` for cancellation. |
-| `ctx.progress` | Task progress (present when `task: true`) — `.setTotal(n)`, `.increment()`, `.update(message)`. |
-| `ctx.requestId` | Unique request ID. |
-| `ctx.tenantId` | Tenant ID from JWT or `'default'` for stdio. |
+| `ctx.signal` | `AbortSignal` forwarded into `NtfyService` calls so client cancellations propagate to upstream HTTP. |
+| `ctx.fail(reason, ...)` | Throw a typed contract failure declared in the tool's `errors[]` array. Pair with `ctx.recoveryFor(reason)` to attach the declared `recovery` hint to the wire payload. |
+| `ctx.requestId` | Unique request ID. Surfaces in logs and error payloads. |
 
 ---
 
@@ -207,18 +259,24 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # NTFY_* env vars (Zod schema, lazy-parsed)
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    ntfy/
+      ntfy-service.ts                   # HTTP client (publish, manage, fetch)
+      error-classifier.ts               # Map upstream errors → contract reasons
+      types.ts                          # Domain types (NtfyMessage, NtfyAction, …)
+    emoji-tags/
+      emoji-tag-service.ts              # In-memory tag → emoji lookup
+      data.generated.ts                 # Generated from docs/ntfy/emojis.md
   mcp-server/
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+      ntfy-publish-message.tool.ts      # Send/update a notification
+      ntfy-manage-message.tool.ts       # Clear/delete by sequence_id
+      ntfy-fetch-messages.tool.ts       # Poll cached messages with filters
+      ntfy-search-emoji-tags.tool.ts    # Look up emoji short codes
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      ntfy-topic.resource.ts            # ntfy://{topic} snapshot
+      ntfy-emojis.resource.ts           # ntfy://emojis full reference
 ```
 
 ---
@@ -253,10 +311,12 @@ Available skills:
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
+| `tool-defs-analysis` | Read-only audit of tool/resource/prompt definition language across the surface |
 | `security-pass` | Audit server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
-| `devcheck` | Lint, format, typecheck, audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
+| `release-and-publish` | Run final verification, push commits/tags, publish to npm/MCP Registry/GHCR |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
+| `migrate-mcp-ts-template` | Migrate a legacy `mcp-ts-template` fork to `@cyanheads/mcp-ts-core` (one-shot) |
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
 | `report-issue-local` | File a bug or feature request against this server's own repo via `gh` CLI |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
@@ -264,6 +324,7 @@ Available skills:
 | `api-config` | AppConfig, parseConfig, env vars |
 | `api-context` | Context interface, logger, state, progress |
 | `api-errors` | McpError, JsonRpcErrorCode, error patterns |
+| `api-linter` | MCP definition linter rules reference |
 | `api-services` | LLM, Speech, Graph services |
 | `api-testing` | createMockContext, test patterns |
 | `api-utils` | Formatting, parsing, security, pagination, scheduling, telemetry helpers |
@@ -276,27 +337,29 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Commands
 
-**Runtime:** Scripts use `tsx` — both `npm run <cmd>` and `bun run <cmd>` work. Use whichever package manager you have; `bun` is slightly faster for invoking scripts but not required.
+**Runtime:** Scripts shell out to `bun`. `npm run <cmd>` works too, but the scripts assume Bun is on the PATH.
 
 | Command | Purpose |
 |:--------|:--------|
-| `npm run build` | Compile TypeScript |
-| `npm run rebuild` | Clean + build |
-| `npm run clean` | Remove build artifacts |
-| `npm run devcheck` | Lint + format + typecheck + security + changelog sync |
-| `npm run tree` | Generate directory structure doc |
-| `npm run format` | Auto-fix formatting |
-| `npm test` | Run tests |
-| `npm run start:stdio` | Production mode (stdio) |
-| `npm run start:http` | Production mode (HTTP) |
-| `npm run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
-| `npm run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
+| `bun run build` | Compile TypeScript via `scripts/build.ts` |
+| `bun run rebuild` | Clean + build |
+| `bun run clean` | Remove build artifacts |
+| `bun run devcheck` | Lint + format + typecheck + security + changelog sync |
+| `bun run tree` | Regenerate `docs/tree.md` |
+| `bun run format` | Auto-fix formatting (Biome) |
+| `bun run lint:mcp` | Validate MCP definitions against the spec |
+| `bun run test` | Run the Vitest test suite |
+| `bun run start:stdio` | Production mode (stdio) |
+| `bun run start:http` | Production mode (HTTP) |
+| `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/<minor>.x/*.md` |
+| `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
+| `bun run scripts/build-emoji-tags.ts` | Regenerate `src/services/emoji-tags/data.generated.ts` from `docs/ntfy/emojis.md` |
 
 ---
 
 ## Changelog
 
-Directory-based, grouped by minor series using the `.x` semver-wildcard convention. Source of truth is `changelog/<major.minor>.x/<version>.md` (e.g. `changelog/0.1.x/0.1.0.md`) — one file per released version, shipped in the npm package. At release time, author the per-version file with a concrete version and date, then run `npm run changelog:build` to regenerate the rollup. `changelog/template.md` is a **pristine format reference** — never edited, never renamed, never moved. Read it to remember the frontmatter + section layout when scaffolding a new per-version file. `CHANGELOG.md` is a **navigation index** (header + link + one-line summary per version), regenerated by `npm run changelog:build`. Devcheck hard-fails on drift. Never hand-edit `CHANGELOG.md`.
+Directory-based, grouped by minor series using the `.x` semver-wildcard convention. Source of truth is `changelog/<major.minor>.x/<version>.md` (e.g. `changelog/2.0.x/2.0.0.md`) — one file per released version, shipped in the npm package. At release time, author the per-version file with a concrete version and date, then run `bun run changelog:build` to regenerate the rollup. `changelog/template.md` is a **pristine format reference** — never edited, never renamed, never moved. Read it to remember the frontmatter + section layout when scaffolding a new per-version file. `CHANGELOG.md` is a **navigation index** (header + link + one-line summary per version), regenerated by `bun run changelog:build`. Devcheck hard-fails on drift. Never hand-edit `CHANGELOG.md`.
 
 Each per-version file opens with YAML frontmatter:
 
@@ -335,12 +398,13 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] Zod schemas: all fields have `.describe()`, only JSON-Schema-serializable types (no `z.custom()`, `z.date()`, `z.transform()`, `z.bigint()`, `z.symbol()`, `z.void()`, `z.map()`, `z.set()`, `z.function()`, `z.nan()`)
 - [ ] Optional nested objects: handler guards for empty inner values from form-based clients (`if (input.obj?.field && ...)`, not just `if (input.obj)`). When regex/length constraints matter, use `z.union([z.literal(''), z.string().regex(...).describe(...)])` — literal variants are exempt from `describe-on-fields`.
 - [ ] JSDoc `@fileoverview` + `@module` on every file
-- [ ] `ctx.log` for logging, `ctx.state` for storage
-- [ ] Handlers throw on failure — error factories or plain `Error`, no try/catch
+- [ ] `ctx.log` for logging, `ctx.signal` forwarded to upstream HTTP calls
+- [ ] Handlers throw on failure — `ctx.fail()` for declared contract reasons, error factories or plain `Error` for everything else; no defensive try/catch (the only `try`/`catch` in this codebase translates upstream errors into contract reasons before re-throwing)
 - [ ] `format()` renders all data the LLM needs — different clients forward different surfaces (Claude Code → `structuredContent`, Claude Desktop → `content[]`); both must carry the same data
-- [ ] If wrapping external API: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
-- [ ] If wrapping external API: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
-- [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
-- [ ] Registered in `createApp()` arrays (directly or via barrel exports)
+- [ ] ntfy-specific: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
+- [ ] ntfy-specific: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
+- [ ] ntfy-specific: tests include at least one sparse payload case with omitted upstream fields
+- [ ] ntfy-specific: per-call `base_url` overrides go out unauthenticated when they differ from the configured base — never widen this without explicit operator opt-in
+- [ ] Registered in `createApp()` arrays in `src/index.ts`
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
-- [ ] `npm run devcheck` passes
+- [ ] `bun run devcheck` passes

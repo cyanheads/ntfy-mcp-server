@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "cyanheads/ntfy-mcp-server",
+  "name": "io.github.cyanheads/ntfy-mcp-server",
   "description": "MCP server for ntfy — send push notifications to devices via the ntfy.sh service.",
   "repository": {
     "url": "https://github.com/cyanheads/ntfy-mcp-server",
@@ -12,19 +12,58 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "bun",
       "version": "2.0.0",
       "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:stdio"
-        }
+        { "type": "positional", "value": "run" },
+        { "type": "positional", "value": "start:stdio" }
       ],
       "environmentVariables": [
+        {
+          "name": "NTFY_BASE_URL",
+          "description": "Base URL of the ntfy server (no trailing slash).",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://ntfy.sh"
+        },
+        {
+          "name": "NTFY_DEFAULT_TOPIC",
+          "description": "Topic used when a tool call omits `topic`. Treat the topic name as a secret — anyone who knows it can publish or subscribe.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_TOKEN",
+          "description": "Bearer access token (`tk_…`). Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_USERNAME",
+          "description": "Basic-auth username — must be set together with NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_PASSWORD",
+          "description": "Basic-auth password — must be set together with NTFY_AUTH_USERNAME.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_REQUEST_TIMEOUT_MS",
+          "description": "Per-request HTTP timeout in milliseconds.",
+          "format": "string",
+          "isRequired": false,
+          "default": "15000"
+        },
+        {
+          "name": "NTFY_MAX_RETRIES",
+          "description": "Max retry attempts for transient upstream failures (5xx, network, 429).",
+          "format": "string",
+          "isRequired": false,
+          "default": "3"
+        },
         {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
@@ -41,19 +80,58 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "bun",
       "version": "2.0.0",
       "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:http"
-        }
+        { "type": "positional", "value": "run" },
+        { "type": "positional", "value": "start:http" }
       ],
       "environmentVariables": [
+        {
+          "name": "NTFY_BASE_URL",
+          "description": "Base URL of the ntfy server (no trailing slash).",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://ntfy.sh"
+        },
+        {
+          "name": "NTFY_DEFAULT_TOPIC",
+          "description": "Topic used when a tool call omits `topic`. Treat the topic name as a secret — anyone who knows it can publish or subscribe.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_TOKEN",
+          "description": "Bearer access token (`tk_…`). Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_USERNAME",
+          "description": "Basic-auth username — must be set together with NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_PASSWORD",
+          "description": "Basic-auth password — must be set together with NTFY_AUTH_USERNAME.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_REQUEST_TIMEOUT_MS",
+          "description": "Per-request HTTP timeout in milliseconds.",
+          "format": "string",
+          "isRequired": false,
+          "default": "15000"
+        },
+        {
+          "name": "NTFY_MAX_RETRIES",
+          "description": "Max retry attempts for transient upstream failures (5xx, network, 429).",
+          "format": "string",
+          "isRequired": false,
+          "default": "3"
+        },
         {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",
@@ -92,7 +170,7 @@
       ],
       "transport": {
         "type": "streamable-http",
-        "url": "http://localhost:3010/mcp"
+        "url": "http://127.0.0.1:3010/mcp"
       }
     }
   ]

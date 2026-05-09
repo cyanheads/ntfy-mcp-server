@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-05-09 01:49:29
+Generated on: 2026-05-09 02:32:53
 
 ```text
 ntfy-mcp-server/
@@ -158,6 +158,7 @@ ntfy-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── package.json
+├── README.md
 ├── server.json
 ├── tsconfig.build.json
 ├── tsconfig.json
