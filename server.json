@@ -70,6 +70,20 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "LOGS_DIR",
+          "description": "Directory for file-based logs (Node only; ignored on Workers).",
+          "format": "string",
+          "isRequired": false,
+          "default": "./logs"
+        },
+        {
+          "name": "OTEL_ENABLED",
+          "description": "Enable OpenTelemetry instrumentation (spans, metrics, completion logs).",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
         }
       ],
       "transport": {
@@ -133,6 +147,13 @@
           "default": "3"
         },
         {
+          "name": "MCP_SESSION_MODE",
+          "description": "HTTP session model: 'stateless', 'stateful', or 'auto'.",
+          "format": "string",
+          "isRequired": false,
+          "default": "auto"
+        },
+        {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",
           "format": "string",
@@ -166,6 +187,20 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "LOGS_DIR",
+          "description": "Directory for file-based logs (Node only; ignored on Workers).",
+          "format": "string",
+          "isRequired": false,
+          "default": "./logs"
+        },
+        {
+          "name": "OTEL_ENABLED",
+          "description": "Enable OpenTelemetry instrumentation (spans, metrics, completion logs).",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
         }
       ],
       "transport": {
