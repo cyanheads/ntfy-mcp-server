@@ -203,7 +203,7 @@ cp .env.example .env
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `LOGS_DIR` | Directory for file-based logs (Node only; ignored on Workers). | `./logs` |
-| `OTEL_ENABLED` | Enable OpenTelemetry instrumentation (spans, metrics, completion logs). | `false` |
+| `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry) (spans, metrics, completion logs). | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 
