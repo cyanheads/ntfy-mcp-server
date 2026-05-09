@@ -15,6 +15,7 @@ import {
   getMessage,
   isAuthCode,
   isNotFoundCode,
+  isUpstreamUnreachable,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyManageResponse } from '@/services/ntfy/types.js';
@@ -39,7 +40,7 @@ const InputSchema = z.object({
   operation: z
     .enum(['clear', 'delete'])
     .describe(
-      'What to do: `clear` marks the notification read & dismisses it (subscribers see `message_clear`); `delete` removes it from the drawer (subscribers see `message_delete`). Both are no-ops on already-cleared/deleted sequences.',
+      'What to do: `clear` marks the notification read & dismisses it (subscribers see `message_clear`); `delete` removes it from the drawer (subscribers see `message_delete`). Safe to re-issue — the original message stays in cache, but a fresh event is emitted to subscribers each call.',
     ),
   base_url: z
     .url()
@@ -63,7 +64,7 @@ const OutputSchema = z.object({
 
 export const ntfyManageMessage = tool('ntfy_manage_message', {
   description:
-    'Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only: the original message stays in cache and a `message_clear`/`message_delete` event is emitted to subscribers. Idempotent — clearing a cleared message or deleting a deleted message is a no-op.',
+    'Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only: the original message stays in cache and a `message_clear`/`message_delete` event is emitted to subscribers. Re-issuing the same operation is safe — message state does not change, but a fresh event fires each time. ntfy.sh accepts unknown sequence IDs without error; stricter ntfy variants surface a `not_found` failure.',
   annotations: {
     destructiveHint: true,
     idempotentHint: true,
@@ -83,9 +84,17 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The sequence_id was never published to this topic, or the cache window has elapsed.',
+      when: 'Stricter ntfy variants returned 404 because the sequence_id was never published to this topic, or the cache window has elapsed. (ntfy.sh accepts unknown sequences without error.)',
       recovery:
         'Confirm the topic and `sequence_id` were correct (call `ntfy_fetch_messages` to inspect what is still cached), or accept that the message has aged out (default cache window is 12h).',
+    },
+    {
+      reason: 'upstream_unreachable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted.',
+      retryable: true,
+      recovery:
+        'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
     },
   ],
 
@@ -122,6 +131,11 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
           msg || `No cached message ${input.sequence_id} on topic ${topic}.`,
           { ...ctx.recoveryFor('not_found') },
         );
+      }
+      if (isUpstreamUnreachable(err)) {
+        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.', {
+          ...ctx.recoveryFor('upstream_unreachable'),
+        });
       }
       throw err;
     }

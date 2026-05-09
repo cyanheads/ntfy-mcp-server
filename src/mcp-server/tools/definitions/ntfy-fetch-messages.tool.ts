@@ -15,6 +15,7 @@ import {
   getMessage,
   isAuthCode,
   isInvalidParamsCode,
+  isUpstreamUnreachable,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage, Priority } from '@/services/ntfy/types.js';
@@ -192,6 +193,12 @@ const MessageSchema = z
   .describe('A single cached ntfy message envelope.');
 
 const OutputSchema = z.object({
+  topic: z
+    .string()
+    .describe(
+      'Echo of the resolved topic (or comma-separated list) — useful when `NTFY_DEFAULT_TOPIC` was used and the input omitted `topic`.',
+    ),
+  since: z.string().describe('Echo of the resolved `since` value (input or default `10m`).'),
   messages: z
     .array(MessageSchema)
     .describe(
@@ -203,6 +210,24 @@ const OutputSchema = z.object({
     .describe(
       'True when the server returned more messages than `limit` and the tail was dropped — refetch with a tighter `since` or use `id` to target a specific message.',
     ),
+  filters: z
+    .object({
+      priority: z
+        .array(PrioritySchema.describe('Single priority value (1=min, 5=max).'))
+        .optional()
+        .describe('Echo of the input priority filter; absent when not set.'),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe('Echo of the input tag filter; absent when not set.'),
+      id: z.string().optional().describe('Echo of the input id filter; absent when not set.'),
+      title: z.string().optional().describe('Echo of the input title filter; absent when not set.'),
+      message: z
+        .string()
+        .optional()
+        .describe('Echo of the input message filter; absent when not set.'),
+    })
+    .describe('Echo of the active filter inputs — useful for explaining empty results.'),
 });
 
 type Input = z.infer<typeof InputSchema>;
@@ -278,6 +303,14 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       recovery:
         'Use one of: `all`, `latest`, a duration like `10m` / `2h` / `1d`, a Unix timestamp (seconds), or a known message ID.',
     },
+    {
+      reason: 'upstream_unreachable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted.',
+      retryable: true,
+      recovery:
+        'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
+    },
   ],
 
   async handler(input: Input, ctx): Promise<Output> {
@@ -321,6 +354,11 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
           ...ctx.recoveryFor('invalid_since'),
         });
       }
+      if (isUpstreamUnreachable(err)) {
+        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.', {
+          ...ctx.recoveryFor('upstream_unreachable'),
+        });
+      }
       throw err;
     }
 
@@ -336,15 +374,49 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     });
 
     return {
+      topic,
+      since: input.since,
       messages: slice.map(shapeMessage),
       count: slice.length,
       truncated,
+      filters: {
+        priority: input.priority,
+        tags: input.tags,
+        id: input.id,
+        title: input.title,
+        message: input.message,
+      },
     };
   },
 
   format(result) {
+    const filterParts: string[] = [];
+    if (result.filters.id) filterParts.push(`id=\`${result.filters.id}\``);
+    if (result.filters.title) filterParts.push(`title=\`${result.filters.title}\``);
+    if (result.filters.message) filterParts.push(`message=\`${result.filters.message}\``);
+    if (result.filters.priority?.length) {
+      filterParts.push(`priority=[${result.filters.priority.join(',')}]`);
+    }
+    if (result.filters.tags?.length) {
+      filterParts.push(`tags=[${result.filters.tags.map((t) => `\`${t}\``).join(',')}]`);
+    }
+    const filterSummary = filterParts.length ? ` filtering by ${filterParts.join(', ')}` : '';
+    const criteria = `topic \`${result.topic}\` (since \`${result.since}\`)${filterSummary}`;
+
+    if (result.count === 0) {
+      const hint = filterParts.length
+        ? 'Try a wider `since` window, drop filters, or check that the topic is correct.'
+        : 'Try a wider `since` window or check that the topic is correct.';
+      return [
+        {
+          type: 'text',
+          text: `**0** messages on ${criteria}. ${hint}`,
+        },
+      ];
+    }
+
     const lines: string[] = [
-      `**${result.count}** message${result.count === 1 ? '' : 's'} returned (truncated: ${result.truncated})`,
+      `**${result.count}** message${result.count === 1 ? '' : 's'} on ${criteria} (truncated: ${result.truncated})`,
     ];
     for (const m of result.messages) {
       lines.push('');

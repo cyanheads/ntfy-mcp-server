@@ -29,6 +29,10 @@ const InputSchema = z.object({
 });
 
 const OutputSchema = z.object({
+  query: z
+    .string()
+    .optional()
+    .describe('Echo of the input query; absent when no query was supplied.'),
   matches: z
     .array(
       z
@@ -55,21 +59,25 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
   output: OutputSchema,
 
   handler(input) {
-    return getEmojiTagService().search(input.query, input.limit);
+    return { query: input.query, ...getEmojiTagService().search(input.query, input.limit) };
   },
 
   format(result) {
     if (result.matches.length === 0) {
+      const tail = result.query
+        ? ` query \`${result.query}\`. Try a shorter substring or omit the query to browse the curated default set.`
+        : '. The default reference is empty — this should not happen; report it.';
       return [
         {
           type: 'text',
-          text: `No emoji tags matched (total: ${result.total}, truncated: ${result.truncated}).`,
+          text: `No emoji tags matched${tail}`,
         },
       ];
     }
     const header = '| Tag | Emoji |\n|:----|:------|';
     const rows = result.matches.map((m) => `| \`${m.tag}\` | ${m.emoji} |`);
-    const footer = `\n_${result.total} total match${result.total === 1 ? '' : 'es'} (truncated: ${result.truncated})._`;
+    const queryLine = result.query ? `_Query: \`${result.query}\`._\n` : '';
+    const footer = `\n${queryLine}_${result.total} total match${result.total === 1 ? '' : 'es'} (truncated: ${result.truncated})._`;
     return [{ type: 'text', text: `${header}\n${rows.join('\n')}${footer}` }];
   },
 });

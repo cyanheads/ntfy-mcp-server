@@ -54,6 +54,7 @@ export type NtfyAction = ViewAction | BroadcastAction | HttpAction | CopyAction;
 
 /** Shape returned by the upstream `POST /` publish call. */
 export interface NtfyPublishResponse {
+  actions?: NtfyAction[];
   attachment?: NtfyAttachment;
   click?: string;
   expires?: number;

@@ -38,19 +38,22 @@ describe('ntfySearchEmojiTags handler', () => {
     expect(result.truncated).toBe(true);
   });
 
-  it('renders an empty-state message when nothing matches', () => {
+  it('renders an empty-state message that echoes the query and offers a recovery hint', () => {
     const blocks = ntfySearchEmojiTags.format!({
+      query: 'zzznevermatchz',
       matches: [],
       total: 0,
       truncated: false,
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('No emoji tags matched');
-    expect(text).toContain('truncated: false');
+    expect(text).toContain('zzznevermatchz');
+    expect(text.toLowerCase()).toContain('shorter');
   });
 
   it('renders rows + total + truncated state when there are matches', () => {
     const blocks = ntfySearchEmojiTags.format!({
+      query: 'celebrate',
       matches: [
         { tag: 'warning', emoji: '⚠️' },
         { tag: 'tada', emoji: '🎉' },
@@ -63,5 +66,6 @@ describe('ntfySearchEmojiTags handler', () => {
     expect(text).toContain('tada');
     expect(text).toContain('7 total matches');
     expect(text).toContain('truncated: true');
+    expect(text).toContain('celebrate');
   });
 });

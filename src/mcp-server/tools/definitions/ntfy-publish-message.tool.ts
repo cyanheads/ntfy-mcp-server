@@ -16,6 +16,7 @@ import {
   isAuthCode,
   isInvalidParamsCode,
   isRateLimitedCode,
+  isUpstreamUnreachable,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type {
@@ -261,6 +262,12 @@ const OutputSchema = z.object({
     .describe('Echo of the input tags; absent when none were set.'),
   click: z.string().optional().describe('Echo of the input click URL; absent when not set.'),
   attachment: AttachmentSchema.optional(),
+  actions: z
+    .array(ActionSchema)
+    .optional()
+    .describe(
+      'Echo of the input action buttons. Discriminated by `action`. Absent when none were set.',
+    ),
 });
 
 type Input = z.infer<typeof InputSchema>;
@@ -283,7 +290,7 @@ function priorityLabel(p?: Priority): string {
 
 export const ntfyPublishMessage = tool('ntfy_publish_message', {
   description:
-    'Send or update a push notification on an ntfy topic. Topics are created on first publish — agents should treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`.',
+    'Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`.',
   annotations: { openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
@@ -317,6 +324,14 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       when: '`email`/`call` set but the authenticated user has no verified address/number, or auth is missing.',
       recovery:
         'Drop the `email`/`call` field and resend; if forwarding is essential, ask the operator to verify the address or number in the ntfy account settings.',
+    },
+    {
+      reason: 'upstream_unreachable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted.',
+      retryable: true,
+      recovery:
+        'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
     },
   ],
 
@@ -363,9 +378,14 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       throw classifyPublishError(err, ctx, topic);
     }
 
+    // Upstream ntfy.sh does not echo `scheduled` in the publish response, so
+    // synthesize it from the input: a successful publish with `delay` set means
+    // the message was queued for later delivery.
+    const scheduled = response.scheduled === true || Boolean(input.delay);
+
     ctx.log.info('Published ntfy message', {
       messageId: response.id,
-      scheduled: response.scheduled === true,
+      scheduled,
     });
 
     const baseUrl = overrideBase ?? getNtfyService().baseUrl;
@@ -379,13 +399,14 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
           ? new Date(response.expires * 1000).toISOString()
           : undefined,
       sequence_id: response.sequence_id,
-      scheduled: response.scheduled,
+      scheduled: scheduled || undefined,
       title: response.title,
       message: response.message,
       priority: response.priority,
       tags: response.tags,
       click: response.click,
       attachment: response.attachment,
+      actions: response.actions as Output['actions'],
     };
   },
 
@@ -421,6 +442,12 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       const suffix = meta.length ? ` (${meta.join(', ')})` : '';
       lines.push('', `Attachment: [${a.name}](${a.url})${suffix}`);
     }
+    if (result.actions?.length) {
+      lines.push('', 'Actions:');
+      for (const a of result.actions) {
+        lines.push(`- \`\`\`json\n${JSON.stringify(a)}\n\`\`\``);
+      }
+    }
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });
@@ -449,7 +476,7 @@ function classifyPublishError(
     });
   }
   if (isInvalidParamsCode(code)) {
-    const sub = classifyInvalidParams(message);
+    const sub = classifyInvalidParams(err);
     if (sub === 'payload_too_large') {
       return ctx.fail('payload_too_large', message, {
         ...ctx.recoveryFor('payload_too_large'),
@@ -460,6 +487,11 @@ function classifyPublishError(
         ...ctx.recoveryFor('unverified_contact'),
       });
     }
+  }
+  if (isUpstreamUnreachable(err)) {
+    return ctx.fail('upstream_unreachable', message || 'ntfy server is unreachable.', {
+      ...ctx.recoveryFor('upstream_unreachable'),
+    });
   }
   return err;
 }

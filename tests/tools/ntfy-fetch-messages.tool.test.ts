@@ -155,6 +155,8 @@ describe('ntfyFetchMessages handler', () => {
 
   it('renders message bodies and truncation note in format()', () => {
     const blocks = ntfyFetchMessages.format!({
+      topic: 'alerts',
+      since: '10m',
       messages: [
         {
           id: 'm1',
@@ -175,6 +177,7 @@ describe('ntfyFetchMessages handler', () => {
       ],
       count: 1,
       truncated: true,
+      filters: {},
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('Backup failed');
@@ -183,5 +186,22 @@ describe('ntfyFetchMessages handler', () => {
     expect(text).toContain('log.txt');
     expect(text).toContain('seq_1');
     expect(text).toContain('and more');
+  });
+
+  it('echoes the resolved topic, since, and active filters in the empty-result message', () => {
+    const blocks = ntfyFetchMessages.format!({
+      topic: 'alerts',
+      since: '10m',
+      messages: [],
+      count: 0,
+      truncated: false,
+      filters: { title: 'never-matches-xyz' },
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('0');
+    expect(text).toContain('alerts');
+    expect(text).toContain('10m');
+    expect(text).toContain('never-matches-xyz');
+    expect(text.toLowerCase()).toContain('try');
   });
 });
