@@ -25,7 +25,7 @@ const ENV_KEYS = [
 
 function freshService() {
   return initNtfyService({
-    baseUrl: 'https://ntfy.test',
+    servers: [{ baseUrl: 'https://ntfy.test' }],
     requestTimeoutMs: 1000,
     maxRetries: 0,
   } as never);

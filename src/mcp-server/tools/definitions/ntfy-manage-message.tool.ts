@@ -78,7 +78,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       code: JsonRpcErrorCode.Forbidden,
       when: 'Auth required for the target topic.',
       recovery:
-        'Try an unprotected topic instead; if this topic must stay protected, ask the operator to provision ntfy auth credentials for the server before retrying.',
+        'Try an unprotected topic instead; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`) before retrying.',
     },
     {
       reason: 'not_found',

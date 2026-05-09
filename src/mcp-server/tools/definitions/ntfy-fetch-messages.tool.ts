@@ -269,7 +269,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       code: JsonRpcErrorCode.Forbidden,
       when: 'Auth required for the target topic.',
       recovery:
-        'Try an unprotected topic instead; if this topic must stay protected, ask the operator to provision ntfy auth credentials for the server before retrying.',
+        'Try an unprotected topic instead; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`) before retrying.',
     },
     {
       reason: 'invalid_since',

@@ -9,7 +9,6 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { forbidden } from '@cyanheads/mcp-ts-core/errors';
 
-import { getServerConfig } from '@/config/server-config.js';
 import { getCode, getMessage, isAuthCode } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage } from '@/services/ntfy/types.js';
@@ -35,7 +34,6 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
   params: ParamsSchema,
 
   async handler(params, ctx) {
-    const cfg = getServerConfig();
     const service = getNtfyService();
 
     let raw: NtfyMessage[];
@@ -50,7 +48,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
           getMessage(err) || `Forbidden for topic ${params.topic}`,
           {
             recovery: {
-              hint: 'Try an unprotected topic; if this topic must stay protected, ask the operator to provision ntfy auth credentials.',
+              hint: 'Try an unprotected topic; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`).',
             },
           },
           { cause: err },
@@ -65,8 +63,8 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
 
     return {
       topic: params.topic,
-      url: `${cfg.baseUrl}/${params.topic}`,
-      baseUrl: cfg.baseUrl,
+      url: `${service.baseUrl}/${params.topic}`,
+      baseUrl: service.baseUrl,
       since: SNAPSHOT_SINCE,
       messages: slice,
       count: slice.length,

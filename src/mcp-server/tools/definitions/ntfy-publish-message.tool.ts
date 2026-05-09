@@ -216,7 +216,7 @@ const InputSchema = z.object({
     .url()
     .optional()
     .describe(
-      'Override the configured `NTFY_BASE_URL` for this call. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded — protect tokens by running a separate server instance for protected topics on alternate hosts.',
+      'Override the configured `NTFY_BASE_URL` for this call. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
     ),
 });
 
@@ -294,7 +294,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       code: JsonRpcErrorCode.Forbidden,
       when: 'Auth required for the target topic.',
       recovery:
-        'Try a public topic instead; if this topic must stay protected, ask the operator to provision ntfy auth credentials for the server before retrying.',
+        'Try a public topic instead; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`) before retrying.',
     },
     {
       reason: 'rate_limited',
@@ -368,7 +368,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       scheduled: response.scheduled === true,
     });
 
-    const baseUrl = overrideBase ?? cfg.baseUrl;
+    const baseUrl = overrideBase ?? getNtfyService().baseUrl;
     return {
       id: response.id,
       time: new Date(response.time * 1000).toISOString(),

@@ -1,15 +1,16 @@
 /**
  * @fileoverview HTTP client for the ntfy publish/subscribe API. Wraps
  * `fetchWithTimeout` + `withRetry` so the publish, manage, and fetch calls
- * share one transient-failure boundary. Auth header injection is scoped to the
- * configured base URL — per-call `baseUrl` overrides go out unauthenticated to
- * avoid leaking credentials to arbitrary hosts the agent picks.
+ * share one transient-failure boundary. Auth headers are scoped to specific
+ * registered base URLs — per-call `baseUrl` overrides that match a registered
+ * base forward that base's credentials, anything else goes out unauthenticated
+ * to avoid leaking credentials to arbitrary hosts the agent picks.
  * @module services/ntfy/ntfy-service
  */
 
 import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
-import type { ServerConfig } from '@/config/server-config.js';
+import type { NtfyServerEntry, ServerConfig } from '@/config/server-config.js';
 import type {
   ManageOperation,
   NtfyCallOptions,
@@ -52,10 +53,10 @@ function trimTrailingSlash(url: string): string {
   return url.replace(/\/+$/, '');
 }
 
-function buildAuthHeader(cfg: ServerConfig): string | undefined {
-  if (cfg.authToken) return `Bearer ${cfg.authToken}`;
-  if (cfg.authUsername && cfg.authPassword) {
-    const encoded = Buffer.from(`${cfg.authUsername}:${cfg.authPassword}`, 'utf-8').toString(
+function buildAuthHeader(entry: NtfyServerEntry): string | undefined {
+  if (entry.authToken) return `Bearer ${entry.authToken}`;
+  if (entry.authUsername && entry.authPassword) {
+    const encoded = Buffer.from(`${entry.authUsername}:${entry.authPassword}`, 'utf-8').toString(
       'base64',
     );
     return `Basic ${encoded}`;
@@ -64,36 +65,40 @@ function buildAuthHeader(cfg: ServerConfig): string | undefined {
 }
 
 export class NtfyService {
-  private readonly authHeader: string | undefined;
-  private readonly configuredBase: string;
+  private readonly authByBase: Map<string, string>;
+  private readonly defaultBase: string;
 
   constructor(private readonly cfg: ServerConfig) {
-    this.configuredBase = trimTrailingSlash(cfg.baseUrl);
-    this.authHeader = buildAuthHeader(cfg);
+    this.authByBase = new Map();
+    for (const entry of cfg.servers) {
+      const base = trimTrailingSlash(entry.baseUrl);
+      const header = buildAuthHeader(entry);
+      if (header) this.authByBase.set(base, header);
+    }
+    const first = cfg.servers[0];
+    if (!first) throw new Error('ServerConfig.servers must contain at least one entry.');
+    this.defaultBase = trimTrailingSlash(first.baseUrl);
   }
 
   /** Visible for tests / resources that need to render canonical topic URLs. */
   get baseUrl(): string {
-    return this.configuredBase;
+    return this.defaultBase;
   }
 
   private resolveBase(override?: string): {
     base: string;
-    forwardAuth: boolean;
+    authHeader: string | undefined;
   } {
-    if (!override) return { base: this.configuredBase, forwardAuth: true };
-    const base = trimTrailingSlash(override);
-    return { base, forwardAuth: base === this.configuredBase };
+    const base = trimTrailingSlash(override ?? this.defaultBase);
+    return { base, authHeader: this.authByBase.get(base) };
   }
 
   private buildHeaders(
-    forwardAuth: boolean,
+    authHeader: string | undefined,
     extra: Record<string, string> = {},
   ): Record<string, string> {
     const headers: Record<string, string> = { ...extra };
-    if (forwardAuth && this.authHeader) {
-      headers.Authorization = this.authHeader;
-    }
+    if (authHeader) headers.Authorization = authHeader;
     return headers;
   }
 
@@ -105,7 +110,7 @@ export class NtfyService {
     body: NtfyPublishRequest,
     opts: NtfyCallOptions = {},
   ): Promise<NtfyPublishResponse> {
-    const { base, forwardAuth } = this.resolveBase(opts.baseUrl);
+    const { base, authHeader } = this.resolveBase(opts.baseUrl);
     const url = `${base}/`;
 
     // `cache` / `firebase` are wire-level headers, not JSON body fields.
@@ -122,7 +127,7 @@ export class NtfyService {
           url,
           {
             method: 'POST',
-            headers: this.buildHeaders(forwardAuth, extraHeaders),
+            headers: this.buildHeaders(authHeader, extraHeaders),
             body: JSON.stringify(jsonBody),
           },
           this.cfg.requestTimeoutMs,
@@ -151,7 +156,7 @@ export class NtfyService {
     operation: ManageOperation,
     opts: NtfyCallOptions = {},
   ): Promise<NtfyManageResponse> {
-    const { base, forwardAuth } = this.resolveBase(opts.baseUrl);
+    const { base, authHeader } = this.resolveBase(opts.baseUrl);
     const path =
       operation === 'clear'
         ? `${base}/${encodeURIComponent(topic)}/${encodeURIComponent(sequenceId)}/clear`
@@ -163,7 +168,7 @@ export class NtfyService {
           path,
           {
             method: operation === 'clear' ? 'PUT' : 'DELETE',
-            headers: this.buildHeaders(forwardAuth),
+            headers: this.buildHeaders(authHeader),
           },
           this.cfg.requestTimeoutMs,
           signal,
@@ -187,7 +192,7 @@ export class NtfyService {
    * caller (they're connection-level, not notification data).
    */
   async fetch(params: NtfyFetchParams, opts: NtfyCallOptions = {}): Promise<NtfyMessage[]> {
-    const { base, forwardAuth } = this.resolveBase(opts.baseUrl);
+    const { base, authHeader } = this.resolveBase(opts.baseUrl);
     const search = new URLSearchParams({ poll: '1' });
     if (params.since) search.set('since', params.since);
     if (params.scheduled) search.set('scheduled', '1');
@@ -205,7 +210,7 @@ export class NtfyService {
           url,
           {
             method: 'GET',
-            headers: this.buildHeaders(forwardAuth),
+            headers: this.buildHeaders(authHeader),
           },
           this.cfg.requestTimeoutMs,
           signal,

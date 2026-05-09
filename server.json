@@ -20,8 +20,14 @@
       ],
       "environmentVariables": [
         {
+          "name": "NTFY_SERVERS",
+          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
           "name": "NTFY_BASE_URL",
-          "description": "Base URL of the ntfy server (no trailing slash).",
+          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when NTFY_SERVERS is unset.",
           "format": "string",
           "isRequired": false,
           "default": "https://ntfy.sh"
@@ -34,19 +40,19 @@
         },
         {
           "name": "NTFY_AUTH_TOKEN",
-          "description": "Bearer access token (`tk_…`). Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
+          "description": "Bearer access token (`tk_…`) for the single-server shorthand. Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "NTFY_AUTH_USERNAME",
-          "description": "Basic-auth username — must be set together with NTFY_AUTH_PASSWORD.",
+          "description": "Basic-auth username for the single-server shorthand — must be set together with NTFY_AUTH_PASSWORD.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "NTFY_AUTH_PASSWORD",
-          "description": "Basic-auth password — must be set together with NTFY_AUTH_USERNAME.",
+          "description": "Basic-auth password for the single-server shorthand — must be set together with NTFY_AUTH_USERNAME.",
           "format": "string",
           "isRequired": false
         },
@@ -102,8 +108,14 @@
       ],
       "environmentVariables": [
         {
+          "name": "NTFY_SERVERS",
+          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
           "name": "NTFY_BASE_URL",
-          "description": "Base URL of the ntfy server (no trailing slash).",
+          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when NTFY_SERVERS is unset.",
           "format": "string",
           "isRequired": false,
           "default": "https://ntfy.sh"
@@ -116,19 +128,19 @@
         },
         {
           "name": "NTFY_AUTH_TOKEN",
-          "description": "Bearer access token (`tk_…`). Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
+          "description": "Bearer access token (`tk_…`) for the single-server shorthand. Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "NTFY_AUTH_USERNAME",
-          "description": "Basic-auth username — must be set together with NTFY_AUTH_PASSWORD.",
+          "description": "Basic-auth username for the single-server shorthand — must be set together with NTFY_AUTH_PASSWORD.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "NTFY_AUTH_PASSWORD",
-          "description": "Basic-auth password — must be set together with NTFY_AUTH_USERNAME.",
+          "description": "Basic-auth password for the single-server shorthand — must be set together with NTFY_AUTH_USERNAME.",
           "format": "string",
           "isRequired": false
         },
