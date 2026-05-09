@@ -65,11 +65,11 @@ describe('ntfyManageMessage handler', () => {
 
     expect(manage).toHaveBeenCalledWith('alerts', 'seq_1', 'clear', expect.objectContaining({}));
     expect(result).toEqual({
-      id: 'evt_1',
+      event_id: 'evt_1',
       topic: 'alerts',
       sequence_id: 'seq_1',
       operation: 'clear',
-      time: 1700000000,
+      time: '2023-11-14T22:13:20.000Z',
     });
   });
 

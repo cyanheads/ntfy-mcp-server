@@ -50,11 +50,15 @@ const InputSchema = z.object({
 });
 
 const OutputSchema = z.object({
-  id: z.string().describe('Server-assigned ID of the emitted clear/delete event.'),
+  event_id: z
+    .string()
+    .describe(
+      'Server-assigned ID of the emitted `message_clear` / `message_delete` event — distinct from the original message `sequence_id` it references.',
+    ),
   topic: z.string().describe('Topic the event was emitted on.'),
-  sequence_id: z.string().describe('Sequence ID the event references.'),
+  sequence_id: z.string().describe('Sequence ID of the original message the event references.'),
   operation: z.enum(['clear', 'delete']).describe('Echo of the requested operation.'),
-  time: z.number().describe('Unix seconds when ntfy emitted the event.'),
+  time: z.string().describe('ISO 8601 timestamp when ntfy emitted the event.'),
 });
 
 export const ntfyManageMessage = tool('ntfy_manage_message', {
@@ -96,10 +100,12 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       });
     }
 
+    const overrideBase = input.base_url?.replace(/\/+$/, '');
+
     let response: NtfyManageResponse;
     try {
       response = await getNtfyService().manage(topic, input.sequence_id, input.operation, {
-        baseUrl: input.base_url,
+        baseUrl: overrideBase,
         signal: ctx.signal,
       });
     } catch (err) {
@@ -126,11 +132,11 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     });
 
     return {
-      id: response.id,
+      event_id: response.id,
       topic: response.topic,
       sequence_id: response.sequence_id,
       operation: input.operation,
-      time: response.time,
+      time: new Date(response.time * 1000).toISOString(),
     };
   },
 
@@ -138,9 +144,9 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     const verb = result.operation === 'clear' ? 'cleared' : 'deleted';
     const lines = [
       `**${verb.toUpperCase()}** sequence \`${result.sequence_id}\` on topic \`${result.topic}\``,
-      `Event ID: \`${result.id}\``,
+      `Event ID: \`${result.event_id}\``,
       `Operation: ${result.operation}`,
-      `Time: ${result.time} (Unix seconds)`,
+      `Time: ${result.time}`,
     ];
     return [{ type: 'text', text: lines.join('\n') }];
   },

@@ -224,7 +224,9 @@ const OutputSchema = z.object({
   id: z
     .string()
     .describe('Server-assigned message ID — pass back as `sequence_id` to update later.'),
-  time: z.number().describe('Unix seconds when ntfy accepted the message (not delivery time).'),
+  time: z
+    .string()
+    .describe('ISO 8601 timestamp when ntfy accepted the message (not delivery time).'),
   topic: z.string().describe('Topic the message was published to.'),
   url: z
     .string()
@@ -232,17 +234,15 @@ const OutputSchema = z.object({
       'Browser URL `<baseUrl>/<topic>`. Synthesized by the tool — ntfy does not return it.',
     ),
   expires: z
-    .number()
+    .string()
     .optional()
     .describe(
-      'Unix seconds when the message ages out of server cache. Absent when published with `cache: false`.',
+      'ISO 8601 timestamp when the message ages out of server cache. Absent when published with `cache: false`.',
     ),
   sequence_id: z
     .string()
     .optional()
-    .describe(
-      'Present only when this call updated an earlier message and the input `sequence_id` differed from the new id.',
-    ),
+    .describe('Echo of the input `sequence_id`; absent when no `sequence_id` was supplied.'),
   scheduled: z
     .boolean()
     .optional()
@@ -351,10 +351,12 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       firebase: input.firebase,
     };
 
+    const overrideBase = input.base_url?.replace(/\/+$/, '');
+
     let response: NtfyPublishResponse;
     try {
       response = await getNtfyService().publish(requestBody, {
-        baseUrl: input.base_url,
+        baseUrl: overrideBase,
         signal: ctx.signal,
       });
     } catch (err) {
@@ -366,13 +368,16 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       scheduled: response.scheduled === true,
     });
 
-    const baseUrl = (input.base_url ?? cfg.baseUrl).replace(/\/+$/, '');
+    const baseUrl = overrideBase ?? cfg.baseUrl;
     return {
       id: response.id,
-      time: response.time,
+      time: new Date(response.time * 1000).toISOString(),
       topic: response.topic,
       url: `${baseUrl}/${response.topic}`,
-      expires: response.expires,
+      expires:
+        response.expires !== undefined
+          ? new Date(response.expires * 1000).toISOString()
+          : undefined,
       sequence_id: response.sequence_id,
       scheduled: response.scheduled,
       title: response.title,
@@ -391,12 +396,12 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       : `**Sent** — ntfy accepted message \`${result.id}\` on \`${result.topic}\``;
     lines.push(banner);
     lines.push(`URL: ${result.url}`);
-    lines.push(`Time: ${result.time} (Unix seconds)`);
-    if (result.expires !== undefined) {
-      lines.push(`Cache expires: ${result.expires} (Unix seconds)`);
+    lines.push(`Time: ${result.time}`);
+    if (result.expires) {
+      lines.push(`Cache expires: ${result.expires}`);
     }
     if (result.sequence_id) {
-      lines.push(`Sequence ID: \`${result.sequence_id}\` (this call replaced an earlier message)`);
+      lines.push(`Sequence ID: \`${result.sequence_id}\``);
     }
     if (result.title) lines.push(`Title: ${result.title}`);
     if (result.priority !== undefined) {

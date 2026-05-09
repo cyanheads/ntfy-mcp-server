@@ -32,6 +32,58 @@ const PrioritySchema = z.union([
   z.literal(5),
 ]);
 
+const ActionReadbackSchema = z
+  .discriminatedUnion('action', [
+    z
+      .object({
+        action: z.literal('view').describe('Discriminator — `view`.'),
+        label: z.string().describe('Button label.'),
+        url: z.string().describe('URL opened on tap.'),
+        clear: z.boolean().optional().describe('Whether the notification dismisses on tap.'),
+      })
+      .describe('Open a URL or app on tap.'),
+    z
+      .object({
+        action: z.literal('broadcast').describe('Discriminator — `broadcast`.'),
+        label: z.string().describe('Button label.'),
+        intent: z.string().optional().describe('Android intent name.'),
+        extras: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe('String extras passed alongside the broadcast.'),
+        clear: z.boolean().optional().describe('Whether the notification dismisses on tap.'),
+      })
+      .describe('Send an Android broadcast intent on tap.'),
+    z
+      .object({
+        action: z.literal('http').describe('Discriminator — `http`.'),
+        label: z.string().describe('Button label.'),
+        url: z.string().describe('URL the request goes to.'),
+        method: z.string().optional().describe('HTTP method (defaults POST upstream).'),
+        headers: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe('Headers attached to the request.'),
+        body: z.string().optional().describe('Request body.'),
+        clear: z
+          .boolean()
+          .optional()
+          .describe('Whether the notification dismisses when the request succeeds.'),
+      })
+      .describe('Fire an HTTP request on tap.'),
+    z
+      .object({
+        action: z.literal('copy').describe('Discriminator — `copy`.'),
+        label: z.string().describe('Button label.'),
+        value: z.string().describe('Value copied to the device clipboard on tap.'),
+        clear: z.boolean().optional().describe('Whether the notification dismisses on tap.'),
+      })
+      .describe('Copy a value to the clipboard on tap.'),
+  ])
+  .describe(
+    'Action button echoed by ntfy. Discriminated by `action` (`view`, `broadcast`, `http`, `copy`).',
+  );
+
 const AttachmentSchema = z
   .object({
     name: z.string().describe('Attachment display filename.'),
@@ -95,12 +147,15 @@ const MessageSchema = z
       .describe(
         'Message ID — pass back as `since` to paginate from this point or as `sequence_id` to manage.',
       ),
-    time: z.number().describe('Unix seconds when ntfy accepted the message.'),
+    time: z.string().describe('ISO 8601 timestamp when ntfy accepted the message.'),
     event: z
       .enum(['message', 'message_clear', 'message_delete', 'poll_request'])
       .describe('Event type.'),
     topic: z.string().describe('Topic the message was published to.'),
-    expires: z.number().optional().describe('Unix seconds when the message ages out of cache.'),
+    expires: z
+      .string()
+      .optional()
+      .describe('ISO 8601 timestamp when the message ages out of cache.'),
     sequence_id: z
       .string()
       .optional()
@@ -127,10 +182,10 @@ const MessageSchema = z
       .describe('Tags applied to the notification; absent when none.'),
     click: z.string().optional().describe('Click URL; absent when no click action was set.'),
     actions: z
-      .array(z.record(z.string(), z.unknown()))
+      .array(ActionReadbackSchema)
       .optional()
       .describe(
-        'Action buttons — same discriminated shape as the publish input: each object has an `action` key (`view`, `broadcast`, `http`, or `copy`) plus a `label` and per-type fields. Absent when none.',
+        'Action buttons echoed by ntfy. Discriminated by `action`. Absent when no actions were set.',
       ),
     attachment: AttachmentSchema.optional(),
   })
@@ -139,7 +194,9 @@ const MessageSchema = z
 const OutputSchema = z.object({
   messages: z
     .array(MessageSchema)
-    .describe('Cached messages matching the filters, newest-first per ntfy.'),
+    .describe(
+      'Cached messages matching the filters, oldest-first (chronological order from ntfy).',
+    ),
   count: z.number().describe('Number of messages returned in this response.'),
   truncated: z
     .boolean()
@@ -183,10 +240,10 @@ function shapeMessage(raw: NtfyMessage): OutputMessage {
   const truncation = truncateMessage(raw.message);
   return {
     id: raw.id,
-    time: raw.time,
+    time: new Date(raw.time * 1000).toISOString(),
     event: raw.event as OutputMessage['event'],
     topic: raw.topic,
-    expires: raw.expires,
+    expires: raw.expires !== undefined ? new Date(raw.expires * 1000).toISOString() : undefined,
     sequence_id: raw.sequence_id,
     title: raw.title,
     message: truncation.message,
@@ -234,6 +291,8 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       });
     }
 
+    const overrideBase = input.base_url?.replace(/\/+$/, '');
+
     let raw: NtfyMessage[];
     try {
       raw = await getNtfyService().fetch(
@@ -247,7 +306,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
           title: input.title,
           message: input.message,
         },
-        { baseUrl: input.base_url, signal: ctx.signal },
+        { baseUrl: overrideBase, signal: ctx.signal },
       );
     } catch (err) {
       const code = getCode(err);
@@ -290,9 +349,9 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     for (const m of result.messages) {
       lines.push('');
       lines.push(`### \`${m.id}\` — \`${m.event}\` on \`${m.topic}\``);
-      lines.push(`Time: ${m.time} (Unix seconds)`);
-      if (m.expires !== undefined) {
-        lines.push(`Cache expires: ${m.expires} (Unix seconds)`);
+      lines.push(`Time: ${m.time}`);
+      if (m.expires) {
+        lines.push(`Cache expires: ${m.expires}`);
       }
       if (m.sequence_id) {
         lines.push(`References sequence: \`${m.sequence_id}\``);
