@@ -18,7 +18,6 @@ Wraps the [ntfy](https://ntfy.sh) HTTP publish/subscribe API so an LLM agent can
 | URI Template | Description | Pagination |
 |:-------------|:------------|:-----------|
 | `ntfy://{topic}` | Snapshot of a topic's recently-cached messages — latest 20 from the last 1 hour, plus the topic's browser URL. Discoverable "what's happening on topic X" lookup; for filters, custom windows, or replay use `ntfy_fetch_messages`. `application/json`. | None — fixed window. |
-| `ntfy://emojis` | Full emoji tag → emoji reference, mirrored from upstream `docs/ntfy/emojis.md`. `text/markdown`. | None — full dump (data is exposed via the search tool for tool-only clients). |
 
 ### Prompts
 
@@ -48,7 +47,7 @@ ntfy is a pub/sub HTTP service for push notifications. Anyone with a topic name 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
 | `NtfyService` | ntfy HTTP API (`POST /` for JSON publish, `PUT /<topic>/<sequence_id>/clear`, `DELETE /<topic>/<sequence_id>`, `GET /<topic>/json?poll=1&...`). Wraps `fetchWithTimeout` + `withRetry` from `@cyanheads/mcp-ts-core/utils`. Each method accepts an optional per-call `baseUrl` override; when omitted, falls back to `NTFY_BASE_URL`. Auth header (Bearer or Basic) is injected only when the resolved base URL matches the configured one — overrides go out unauthenticated. | `ntfy_publish_message`, `ntfy_manage_message`, `ntfy_fetch_messages`, `ntfy://{topic}` |
-| `EmojiTagService` | In-memory map of tag short code → emoji, parsed at startup from a TS module generated at build time from `docs/ntfy/emojis.md`. No external deps. | `ntfy_search_emoji_tags`, `ntfy://emojis` |
+| `EmojiTagService` | In-memory map of tag short code → emoji, parsed at startup from a TS module generated at build time from `docs/ntfy/emojis.md`. No external deps. | `ntfy_search_emoji_tags` |
 
 `NtfyService` resilience: retry boundary is the full publish/fetch round trip; backoff base 500ms with 3 attempts; `withRetry` enriches the final error with attempt count. 429 responses retry with the upstream `Retry-After` honoured (or 2× base if absent). 4xx other than 408/429 do not retry.
 
@@ -73,7 +72,7 @@ All env vars are optional except where noted. The server runs unauthenticated ag
 3. **`ntfy_publish_message`** — main tool; calls `NtfyService.publish()` (POST `/` JSON body). Cover all publish fields. Smoke test against `ntfy.sh/<random_topic>` from the phone app.
 4. **`ntfy_manage_message`** — clear/delete via `NtfyService.manage()`. Verify subscriber receives `message_clear` / `message_delete` events.
 5. **`ntfy_fetch_messages`** + **`ntfy://{topic}`** resource — `NtfyService.fetch()` (GET with `poll=1`); parse NDJSON response into a typed array, surface `since` / filter args. The resource is a thin wrapper that calls `fetch()` with fixed defaults (`since: '1h'`, `limit: 20`).
-6. **`ntfy_search_emoji_tags`** + **`ntfy://emojis`** resource — emoji discovery surface.
+6. **`ntfy_search_emoji_tags`** — emoji discovery surface.
 7. **devcheck pass** — lint, format, typecheck, security audit.
 8. **Field test** — exercise every tool with realistic inputs against `ntfy.sh`.
 
@@ -99,7 +98,7 @@ Underlying domain operations the ntfy API supports:
 |:-----|:-----------|:----------|
 | Message | publish (with all 18 publish params), update (publish with `sequence_id`), clear, delete, list/poll | `ntfy_publish_message`, `ntfy_manage_message`, `ntfy_fetch_messages` |
 | Topic | implicit (created on first publish, no separate API); per-topic snapshot lookup | `ntfy://{topic}` |
-| Emoji tag | search reference, fetch full reference | `ntfy_search_emoji_tags`, `ntfy://emojis` |
+| Emoji tag | search reference (substring + limit) | `ntfy_search_emoji_tags` |
 
 Excluded entirely (stays in the ntfy web app — recovery requires vendor UI):
 - Account / billing / tier management

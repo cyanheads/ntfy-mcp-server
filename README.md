@@ -65,9 +65,8 @@ Substring search over the bundled ntfy emoji-tag reference. Returns the `tag` st
 | Type | Name | Description |
 |:---|:---|:---|
 | Resource | `ntfy://{topic}` | Snapshot of a topic — last 20 messages from the past 1 hour, plus the topic's browser URL. |
-| Resource | `ntfy://emojis` | Full emoji-tag reference rendered as Markdown. |
 
-All resource data is also reachable via tools. `ntfy_fetch_messages` covers topic snapshots with custom windows and filters; `ntfy_search_emoji_tags` covers the emoji reference with substring queries — useful for tool-only clients that don't surface resources.
+`ntfy_fetch_messages` covers the same topic data with custom windows and filters when the resource's fixed defaults aren't enough.
 
 ## Features
 

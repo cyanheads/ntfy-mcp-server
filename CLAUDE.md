@@ -276,7 +276,6 @@ src/
       ntfy-search-emoji-tags.tool.ts    # Look up emoji short codes
     resources/definitions/
       ntfy-topic.resource.ts            # ntfy://{topic} snapshot
-      ntfy-emojis.resource.ts           # ntfy://emojis full reference
 ```
 
 ---

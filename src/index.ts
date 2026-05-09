@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
  * @fileoverview ntfy-mcp-server entry point. Registers the four ntfy tools
- * and two resources, and initializes the `EmojiTagService` and `NtfyService`
- * inside `setup()` so the framework's startup banner reports a clean state.
+ * and the topic-snapshot resource, and initializes the `EmojiTagService` and
+ * `NtfyService` inside `setup()` so the framework's startup banner reports
+ * a clean state.
  * @module index
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
 
 import { getServerConfig } from '@/config/server-config.js';
-import { ntfyEmojisResource } from '@/mcp-server/resources/definitions/ntfy-emojis.resource.js';
 import { ntfyTopicResource } from '@/mcp-server/resources/definitions/ntfy-topic.resource.js';
 import { ntfyFetchMessages } from '@/mcp-server/tools/definitions/ntfy-fetch-messages.tool.js';
 import { ntfyManageMessage } from '@/mcp-server/tools/definitions/ntfy-manage-message.tool.js';
@@ -20,7 +20,7 @@ import { initNtfyService } from '@/services/ntfy/ntfy-service.js';
 
 await createApp({
   tools: [ntfyPublishMessage, ntfyManageMessage, ntfyFetchMessages, ntfySearchEmojiTags],
-  resources: [ntfyTopicResource, ntfyEmojisResource],
+  resources: [ntfyTopicResource],
   setup() {
     initEmojiTagService();
     initNtfyService(getServerConfig());
