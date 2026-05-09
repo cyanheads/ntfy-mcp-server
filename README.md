@@ -1,6 +1,6 @@
 <div align="center">
   <h1>ntfy-mcp-server</h1>
-  <p><b>MCP server for ntfy — send push notifications to devices via the ntfy.sh service. STDIO or Streamable HTTP.</b>
+  <p><b>Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.</b>
   <div>4 Tools • 1 Resource</div>
   </p>
 </div>

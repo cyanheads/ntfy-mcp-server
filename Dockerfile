@@ -38,7 +38,7 @@ ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 LABEL org.opencontainers.image.title="ntfy-mcp-server"
-LABEL org.opencontainers.image.description="MCP server for ntfy — send push notifications to devices via the ntfy.sh service."
+LABEL org.opencontainers.image.description="Send, manage, and replay ntfy push notifications via MCP."
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/ntfy-mcp-server"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 

@@ -2,7 +2,7 @@
   "name": "ntfy-mcp-server",
   "version": "2.0.0",
   "mcpName": "io.github.cyanheads/ntfy-mcp-server",
-  "description": "MCP server for ntfy — send push notifications to devices via the ntfy.sh service.",
+  "description": "Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
