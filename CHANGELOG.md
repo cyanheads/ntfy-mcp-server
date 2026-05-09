@@ -2,9 +2,9 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
-## [2.0.0](changelog/2.0.x/2.0.0.md) — 2026-05-08 · ⚠️ Breaking
+## [2.0.0](changelog/2.0.x/2.0.0.md) — 2026-05-09 · ⚠️ Breaking
 
-Major rewrite on @cyanheads/mcp-ts-core. New 4-tool surface (publish, manage, fetch, emoji search), per-topic snapshot resource, env-driven config, retry-aware HTTP client. Breaking changes from 1.x.
+Major rewrite on @cyanheads/mcp-ts-core. New 4-tool surface (publish, manage, fetch, emoji search), topic snapshot resource, multi-server NTFY_SERVERS registry. Breaking changes from 1.x; NTFY_API_KEY accepted as a deprecated alias.
 
 ## [1.0.6](changelog/1.0.x/1.0.6.md) — 2025-05-05
 
