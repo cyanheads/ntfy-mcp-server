@@ -107,25 +107,6 @@ Add the following to your MCP client configuration file. Public ntfy.sh works ou
 }
 ```
 
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "ntfy": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "ntfy-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "NTFY_DEFAULT_TOPIC": "your-topic-name"
-      }
-    }
-  }
-}
-```
-
 Or with Docker:
 
 ```json
