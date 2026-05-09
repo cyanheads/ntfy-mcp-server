@@ -1,7 +1,7 @@
 <div align="center">
   <h1>ntfy-mcp-server</h1>
   <p><b>MCP server for ntfy — send push notifications to devices via the ntfy.sh service. STDIO or Streamable HTTP.</b>
-  <div>4 Tools • 2 Resources</div>
+  <div>4 Tools • 1 Resource</div>
   </p>
 </div>
 
@@ -32,10 +32,10 @@ Four tools covering the ntfy publish/subscribe surface — message lifecycle (pu
 
 Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe.
 
-- All 18 ntfy publish parameters: `title`, `priority` (1–5), `tags`, `click`, `attach`, `icon`, `markdown`, `delay`, `email`, `call`, `cache`, `firebase`
+- Full publish-parameter coverage — `title`, `priority` (1–5), `tags`, `click`, `attach`, `icon`, `filename`, `markdown`, `delay`, `email`, `call`, `cache`, `firebase`
 - Up to three discriminated action buttons (`view`, `broadcast`, `http`, `copy`) per message
 - Update or replace previously-sent messages by passing the original `sequence_id`
-- Per-call `base_url` override that intentionally drops configured auth, so credentials never leak to alternate hosts
+- Per-call `base_url` override that forwards credentials only when the override matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request goes out unauthenticated, so credentials never leak to alternate hosts
 
 ---
 
@@ -51,7 +51,7 @@ Poll cached messages from one or more topics with optional filters. Returns a sn
 
 - Comma-separated multi-topic queries (e.g. `alerts,backups,phil_alerts`)
 - Filter by `since` (duration / timestamp / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, scheduled-only
-- Default window `10m`, capped at 100 messages per response
+- Default window `10m`, default limit 20 messages per response, hard cap 100
 - Long bodies truncated to ~500 chars with `messageTruncated` reporting the dropped count
 
 ---
@@ -82,7 +82,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp
 ntfy-specific:
 
 - Wraps ntfy's HTTP API with retry-aware client (`withRetry` + per-request timeout)
-- Auth header is scoped to the configured `NTFY_BASE_URL` — per-call `base_url` overrides go out unauthenticated to avoid leaking credentials to arbitrary hosts
+- Per-server scoped auth — credentials are bound to each registered base URL (`NTFY_BASE_URL` or per-entry under `NTFY_SERVERS`); per-call `base_url` overrides forward auth only when the override matches a registered server, and go out unauthenticated otherwise
 - Bundled emoji-tag reference, regenerated from upstream `docs/ntfy/emojis.md` via `scripts/build-emoji-tags.ts`
 - Mutually-exclusive auth modes (bearer token *or* basic auth) validated at config-load time
 
