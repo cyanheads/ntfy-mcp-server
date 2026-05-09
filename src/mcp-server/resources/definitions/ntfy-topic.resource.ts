@@ -10,7 +10,7 @@ import { resource, z } from '@cyanheads/mcp-ts-core';
 import { forbidden } from '@cyanheads/mcp-ts-core/errors';
 
 import { getServerConfig } from '@/config/server-config.js';
-import { isAuthCode } from '@/services/ntfy/error-classifier.js';
+import { getCode, getMessage, isAuthCode } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage } from '@/services/ntfy/types.js';
 
@@ -45,13 +45,9 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
         { signal: ctx.signal },
       );
     } catch (err) {
-      if (isAuthCode((err as { code?: unknown })?.code)) {
-        const msg =
-          typeof (err as { message?: unknown }).message === 'string'
-            ? (err as { message: string }).message
-            : `Forbidden for topic ${params.topic}`;
+      if (isAuthCode(getCode(err))) {
         throw forbidden(
-          msg,
+          getMessage(err) || `Forbidden for topic ${params.topic}`,
           {
             recovery: {
               hint: 'Try an unprotected topic; if this topic must stay protected, ask the operator to provision ntfy auth credentials.',

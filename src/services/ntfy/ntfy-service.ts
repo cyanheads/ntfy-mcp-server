@@ -20,8 +20,6 @@ import type {
   NtfyPublishResponse,
 } from './types.js';
 
-const DEFAULT_OPERATION = 'NtfyService';
-
 /**
  * Raw `fetch` with a timeout AbortController. Bypasses the framework's
  * `fetchWithTimeout` because that helper throws `ServiceUnavailable` on every
@@ -111,14 +109,12 @@ export class NtfyService {
     const url = `${base}/`;
 
     // `cache` / `firebase` are wire-level headers, not JSON body fields.
+    const { cache, firebase, ...jsonBody } = body;
     const extraHeaders: Record<string, string> = {
       'Content-Type': 'application/json',
     };
-    if (body.cache === false) extraHeaders['X-Cache'] = 'no';
-    if (body.firebase === false) extraHeaders['X-Firebase'] = 'no';
-    const { cache: _c, firebase: _f, ...jsonBody } = body;
-    void _c;
-    void _f;
+    if (cache === false) extraHeaders['X-Cache'] = 'no';
+    if (firebase === false) extraHeaders['X-Firebase'] = 'no';
 
     return await this.run(
       async (signal) => {
@@ -236,7 +232,7 @@ export class NtfyService {
     return await withRetry(() => fn(externalSignal), {
       maxRetries: this.cfg.maxRetries,
       baseDelayMs: 500,
-      operation: operation || DEFAULT_OPERATION,
+      operation,
       ...(externalSignal ? { signal: externalSignal } : {}),
     });
   }

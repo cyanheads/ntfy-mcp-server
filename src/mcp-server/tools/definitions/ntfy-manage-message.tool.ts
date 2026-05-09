@@ -17,6 +17,7 @@ import {
   isNotFoundCode,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
+import type { NtfyManageResponse } from '@/services/ntfy/types.js';
 
 const TOPIC_REGEX = /^[a-zA-Z0-9_-]+$/;
 const SEQUENCE_ID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -95,7 +96,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       });
     }
 
-    let response: Awaited<ReturnType<ReturnType<typeof getNtfyService>['manage']>>;
+    let response: NtfyManageResponse;
     try {
       response = await getNtfyService().manage(topic, input.sequence_id, input.operation, {
         baseUrl: input.base_url,
