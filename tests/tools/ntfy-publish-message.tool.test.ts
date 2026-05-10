@@ -1,11 +1,13 @@
 /**
  * @fileoverview Tests for `ntfy_publish_message` — happy path with mocked
- * upstream, default-topic resolution, format-rendering, and contract error
- * mapping for forbidden / rate-limit / payload-too-large / unverified-contact.
+ * upstream, default-topic resolution, format-rendering, scheduled-flag
+ * synthesis, base_url override, and the full contract error mapping
+ * (forbidden / rate-limit / payload-too-large / unverified-contact /
+ * upstream-unreachable / generic rethrow).
  * @module tests/tools/ntfy-publish-message.tool
  */
 
-import { forbidden, invalidParams, rateLimited } from '@cyanheads/mcp-ts-core/errors';
+import { forbidden, invalidParams, notFound, rateLimited } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -195,5 +197,113 @@ describe('ntfyPublishMessage handler', () => {
     expect(text).toContain('warning');
     expect(text).toContain('flower.jpg');
     expect(text).toContain('seq_1');
+  });
+
+  it('synthesizes `scheduled: true` when delay is set, even if upstream omits it', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockResolvedValue({
+      id: 'mid_43',
+      time: 1700000000,
+      topic: 'alerts',
+    });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'later',
+      delay: '30m',
+    });
+    const result = await ntfyPublishMessage.handler(input, ctx);
+    expect(result.scheduled).toBe(true);
+  });
+
+  it('preserves upstream `scheduled: true` when delay is not set', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockResolvedValue({
+      id: 'mid_44',
+      time: 1700000000,
+      topic: 'alerts',
+      scheduled: true,
+    });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'queued' });
+    const result = await ntfyPublishMessage.handler(input, ctx);
+    expect(result.scheduled).toBe(true);
+  });
+
+  it('omits `scheduled` from the output when neither delay nor upstream flag is set', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockResolvedValue({
+      id: 'mid_45',
+      time: 1700000000,
+      topic: 'alerts',
+    });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'now' });
+    const result = await ntfyPublishMessage.handler(input, ctx);
+    expect(result.scheduled).toBeUndefined();
+  });
+
+  it('forwards `base_url` (trailing-slash-normalized) to the service', async () => {
+    const svc = freshService();
+    const publish = vi.spyOn(svc, 'publish').mockResolvedValue({
+      id: 'mid_46',
+      time: 1700000000,
+      topic: 'alerts',
+    });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'hi',
+      base_url: 'https://other.example.com/',
+    });
+    const result = await ntfyPublishMessage.handler(input, ctx);
+    expect(publish.mock.calls[0]?.[1]).toMatchObject({ baseUrl: 'https://other.example.com' });
+    expect(result.url).toBe('https://other.example.com/alerts');
+  });
+
+  it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockRejectedValue(
+      new Error('connection refused (failed after 3 attempts)'),
+    );
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'x' });
+    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'upstream_unreachable' },
+    });
+  });
+
+  it('rethrows unclassified errors (not auth/rate/invalid/unreachable) for the framework auto-classifier', async () => {
+    const svc = freshService();
+    // NotFound is not in the publish contract — it must not be silently
+    // rebadged; re-throw lets the auto-classifier bubble it correctly.
+    vi.spyOn(svc, 'publish').mockRejectedValue(notFound('vanished'));
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'x' });
+    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('vanished'),
+    });
+    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.not.toMatchObject({
+      data: expect.objectContaining({ reason: expect.any(String) }),
+    });
+  });
+
+  it('renders the scheduled banner and actions list in format()', () => {
+    const blocks = ntfyPublishMessage.format!({
+      id: 'mid_99',
+      time: 1700000000,
+      topic: 'alerts',
+      url: 'https://ntfy.test/alerts',
+      scheduled: true,
+      actions: [
+        { action: 'view', label: 'Open dashboard', url: 'https://example.com/dashboard' },
+        { action: 'http', label: 'Acknowledge', url: 'https://example.com/ack', method: 'POST' },
+      ],
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Scheduled');
+    expect(text).toContain('Actions:');
+    expect(text).toContain('Open dashboard');
+    expect(text).toContain('Acknowledge');
   });
 });

@@ -1,11 +1,12 @@
 /**
  * @fileoverview Tests for `ntfy_manage_message` — clear and delete dispatch,
- * reason mapping for not_found / forbidden_topic, default-topic resolution,
- * and format() rendering.
+ * reason mapping (not_found / forbidden_topic / upstream_unreachable / generic
+ * rethrow), default-topic resolution, missing-topic ValidationError,
+ * base_url override, and format() rendering for both operations.
  * @module tests/tools/ntfy-manage-message.tool
  */
 
-import { forbidden, notFound } from '@cyanheads/mcp-ts-core/errors';
+import { forbidden, invalidParams, notFound } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -133,5 +134,96 @@ describe('ntfyManageMessage handler', () => {
     expect(text).toContain('alerts');
     expect(text).toContain('seq_1');
     expect(text).toContain('1700000000');
+  });
+
+  it('dispatches the `delete` operation distinctly from `clear`', async () => {
+    const svc = freshService();
+    const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
+      id: 'evt_2',
+      time: 1700000000,
+      event: 'message_delete',
+      topic: 'alerts',
+      sequence_id: 'seq_2',
+    });
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_2',
+      operation: 'delete',
+    });
+    const result = await ntfyManageMessage.handler(input, ctx);
+    expect(manage).toHaveBeenCalledWith('alerts', 'seq_2', 'delete', expect.objectContaining({}));
+    expect(result.operation).toBe('delete');
+  });
+
+  it('renders the `CLEARED` banner for clear operations', () => {
+    const blocks = ntfyManageMessage.format!({
+      event_id: 'evt_3',
+      topic: 'alerts',
+      sequence_id: 'seq_3',
+      operation: 'clear',
+      time: '2023-11-14T22:13:20.000Z',
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('CLEARED');
+    expect(text).toContain('Operation: clear');
+  });
+
+  it('throws ValidationError when neither topic nor NTFY_DEFAULT_TOPIC is set', async () => {
+    freshService();
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const input = ntfyManageMessage.input.parse({
+      sequence_id: 'seq_x',
+      operation: 'clear',
+    });
+    await expect(ntfyManageMessage.handler(input, ctx)).rejects.toThrow(/Topic is required/);
+  });
+
+  it('forwards `base_url` (trailing-slash-normalized) to the service', async () => {
+    const svc = freshService();
+    const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
+      id: 'evt_4',
+      time: 1700000000,
+      event: 'message_delete',
+      topic: 'alerts',
+      sequence_id: 'seq_4',
+    });
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_4',
+      operation: 'delete',
+      base_url: 'https://other.example.com/',
+    });
+    await ntfyManageMessage.handler(input, ctx);
+    expect(manage.mock.calls[0]?.[3]).toMatchObject({ baseUrl: 'https://other.example.com' });
+  });
+
+  it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'manage').mockRejectedValue(new Error('econnreset (failed after 3 attempts)'));
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_x',
+      operation: 'clear',
+    });
+    await expect(ntfyManageMessage.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'upstream_unreachable' },
+    });
+  });
+
+  it('rethrows unclassified errors so the framework auto-classifier handles them', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'manage').mockRejectedValue(invalidParams('weird upstream complaint'));
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_x',
+      operation: 'clear',
+    });
+    await expect(ntfyManageMessage.handler(input, ctx)).rejects.not.toMatchObject({
+      data: expect.objectContaining({ reason: expect.any(String) }),
+    });
   });
 });

@@ -1,12 +1,14 @@
 /**
  * @fileoverview Tests for server-config — covers both env-var shapes:
  * (1) NTFY_SERVERS JSON registry, (2) single-server shorthand. Validates
- * mutual exclusion of token vs basic auth, trailing-slash stripping, and the
- * precedence of NTFY_SERVERS over the shorthand vars when both are set.
+ * mutual exclusion of token vs basic auth, trailing-slash stripping, the
+ * precedence of NTFY_SERVERS over the shorthand vars when both are set, the
+ * deprecated NTFY_API_KEY alias, defaultTopic / numeric-coercion validation,
+ * and the memoization behavior of `getServerConfig` / `resetServerConfig`.
  * @module tests/config/server-config
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getServerConfig, resetServerConfig } from '@/config/server-config.js';
 
@@ -15,6 +17,7 @@ const KEYS = [
   'NTFY_BASE_URL',
   'NTFY_DEFAULT_TOPIC',
   'NTFY_AUTH_TOKEN',
+  'NTFY_API_KEY',
   'NTFY_AUTH_USERNAME',
   'NTFY_AUTH_PASSWORD',
   'NTFY_REQUEST_TIMEOUT_MS',
@@ -29,6 +32,7 @@ describe('getServerConfig', () => {
   afterEach(() => {
     for (const k of KEYS) delete process.env[k];
     resetServerConfig();
+    vi.restoreAllMocks();
   });
 
   describe('single-server shorthand', () => {
@@ -134,6 +138,84 @@ describe('getServerConfig', () => {
         { baseUrl: 'https://ntfy.sh', authUsername: 'u' },
       ]);
       expect(() => getServerConfig()).toThrow(/Basic auth requires both/i);
+    });
+  });
+
+  describe('NTFY_API_KEY (deprecated alias)', () => {
+    it('promotes NTFY_API_KEY into authToken when NTFY_AUTH_TOKEN is unset', () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      process.env.NTFY_API_KEY = 'tk_legacy';
+      const cfg = getServerConfig();
+      expect(cfg.servers[0]?.authToken).toBe('tk_legacy');
+      expect(stderr).toHaveBeenCalled();
+      const writes = stderr.mock.calls.map((c) => String(c[0]));
+      expect(writes.some((w) => /NTFY_API_KEY is deprecated/i.test(w))).toBe(true);
+    });
+
+    it('NTFY_AUTH_TOKEN takes precedence over NTFY_API_KEY without warning', () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      process.env.NTFY_AUTH_TOKEN = 'tk_new';
+      process.env.NTFY_API_KEY = 'tk_legacy';
+      const cfg = getServerConfig();
+      expect(cfg.servers[0]?.authToken).toBe('tk_new');
+      const warned = stderr.mock.calls
+        .map((c) => String(c[0]))
+        .some((w) => /NTFY_API_KEY is deprecated/i.test(w));
+      expect(warned).toBe(false);
+    });
+  });
+
+  describe('default topic and numeric coercion', () => {
+    it('rejects a default topic with disallowed characters', () => {
+      process.env.NTFY_DEFAULT_TOPIC = 'has spaces';
+      expect(() => getServerConfig()).toThrow();
+    });
+
+    it('rejects a default topic longer than 64 chars', () => {
+      process.env.NTFY_DEFAULT_TOPIC = 'a'.repeat(65);
+      expect(() => getServerConfig()).toThrow();
+    });
+
+    it('accepts a valid default topic', () => {
+      process.env.NTFY_DEFAULT_TOPIC = 'my_default-topic';
+      const cfg = getServerConfig();
+      expect(cfg.defaultTopic).toBe('my_default-topic');
+    });
+
+    it('coerces NTFY_REQUEST_TIMEOUT_MS / NTFY_MAX_RETRIES from strings', () => {
+      process.env.NTFY_REQUEST_TIMEOUT_MS = '5000';
+      process.env.NTFY_MAX_RETRIES = '7';
+      const cfg = getServerConfig();
+      expect(cfg.requestTimeoutMs).toBe(5000);
+      expect(cfg.maxRetries).toBe(7);
+    });
+
+    it('rejects a non-positive request timeout', () => {
+      process.env.NTFY_REQUEST_TIMEOUT_MS = '0';
+      expect(() => getServerConfig()).toThrow();
+    });
+
+    it('rejects a negative max-retries value', () => {
+      process.env.NTFY_MAX_RETRIES = '-1';
+      expect(() => getServerConfig()).toThrow();
+    });
+  });
+
+  describe('memoization', () => {
+    it('caches the parsed config across calls', () => {
+      const a = getServerConfig();
+      const b = getServerConfig();
+      expect(a).toBe(b);
+    });
+
+    it('resetServerConfig forces re-parse on the next call', () => {
+      const before = getServerConfig();
+      expect(before.servers[0]?.baseUrl).toBe('https://ntfy.sh');
+      resetServerConfig();
+      process.env.NTFY_BASE_URL = 'https://later.example.com';
+      const after = getServerConfig();
+      expect(after.servers[0]?.baseUrl).toBe('https://later.example.com');
+      expect(after).not.toBe(before);
     });
   });
 });

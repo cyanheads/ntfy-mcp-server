@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-05-09 03:21:28
+Generated on: 2026-05-10 07:53:56
 
 ```text
 ntfy-mcp-server/
@@ -138,6 +138,9 @@ ntfy-mcp-server/
 │   ├── resources/
 │   │   └── ntfy-topic.resource.test.ts
 │   ├── services/
+│   │   ├── ntfy/
+│   │   │   ├── error-classifier.test.ts
+│   │   │   └── ntfy-service.test.ts
 │   │   └── emoji-tag-service.test.ts
 │   └── tools/
 │       ├── ntfy-fetch-messages.tool.test.ts

@@ -1,11 +1,13 @@
 /**
  * @fileoverview Tests for `ntfy_fetch_messages` — open/keepalive filtering,
  * client-side limit truncation, message-body truncation, sparse upstream
- * payloads (per checklist), error mapping, and format() rendering.
+ * payloads (per checklist), error mapping (forbidden / invalid_since /
+ * upstream_unreachable / generic rethrow), default-topic resolution,
+ * base_url override, and format() rendering.
  * @module tests/tools/ntfy-fetch-messages.tool
  */
 
-import { forbidden, invalidParams } from '@cyanheads/mcp-ts-core/errors';
+import { forbidden, invalidParams, notFound } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -203,5 +205,67 @@ describe('ntfyFetchMessages handler', () => {
     expect(text).toContain('10m');
     expect(text).toContain('never-matches-xyz');
     expect(text.toLowerCase()).toContain('try');
+  });
+
+  it('applies the default `since` of `10m` when omitted', async () => {
+    const svc = freshService();
+    const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts' });
+    const result = await ntfyFetchMessages.handler(input, ctx);
+    expect(fetch.mock.calls[0]?.[0].since).toBe('10m');
+    expect(result.since).toBe('10m');
+  });
+
+  it('uses NTFY_DEFAULT_TOPIC when topic is omitted', async () => {
+    process.env.NTFY_DEFAULT_TOPIC = 'fallback';
+    const svc = freshService();
+    const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({});
+    const result = await ntfyFetchMessages.handler(input, ctx);
+    expect(fetch.mock.calls[0]?.[0].topic).toBe('fallback');
+    expect(result.topic).toBe('fallback');
+  });
+
+  it('throws ValidationError when neither topic nor NTFY_DEFAULT_TOPIC is set', async () => {
+    freshService();
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({});
+    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toThrow(/Topic is required/);
+  });
+
+  it('forwards `base_url` (trailing-slash-normalized) to the service', async () => {
+    const svc = freshService();
+    const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({
+      topic: 'alerts',
+      base_url: 'https://other.example.com/',
+    });
+    await ntfyFetchMessages.handler(input, ctx);
+    expect(fetch.mock.calls[0]?.[1]).toMatchObject({ baseUrl: 'https://other.example.com' });
+  });
+
+  it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'fetch').mockRejectedValue(
+      new Error('dns lookup failed (failed after 3 attempts)'),
+    );
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts' });
+    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'upstream_unreachable' },
+    });
+  });
+
+  it('rethrows unclassified errors so the framework auto-classifier handles them', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'fetch').mockRejectedValue(notFound('topic vanished'));
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts' });
+    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.not.toMatchObject({
+      data: expect.objectContaining({ reason: expect.any(String) }),
+    });
   });
 });
