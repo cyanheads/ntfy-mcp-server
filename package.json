@@ -1,11 +1,48 @@
 {
   "name": "ntfy-mcp-server",
-  "version": "1.0.6",
-  "description": "An MCP (Model Context Protocol) server designed to interact with the ntfy push notification service. It enables LLMs and AI agents to send notifications to your devices with extensive customization options.",
-  "main": "dist/index.js",
+  "version": "2.0.0",
+  "mcpName": "io.github.cyanheads/ntfy-mcp-server",
+  "description": "Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "ntfy-mcp-server": "dist/index.js"
+  },
   "files": [
-    "dist"
+    "changelog/",
+    "dist/",
+    "README.md",
+    "LICENSE",
+    "CLAUDE.md",
+    "Dockerfile",
+    "server.json"
+  ],
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "rebuild": "bun run scripts/clean.ts && bun run build",
+    "clean": "bun run scripts/clean.ts",
+    "devcheck": "bun run scripts/devcheck.ts",
+    "tree": "bun run scripts/tree.ts",
+    "format": "biome check --write --unsafe .",
+    "lint:mcp": "bun run scripts/lint-mcp.ts",
+    "changelog:build": "bun run scripts/build-changelog.ts",
+    "changelog:check": "bun run scripts/build-changelog.ts --check",
+    "test": "vitest run",
+    "start": "bun ./dist/index.js",
+    "start:stdio": "MCP_TRANSPORT_TYPE=stdio bun ./dist/index.js",
+    "start:http": "MCP_TRANSPORT_TYPE=http bun ./dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "ntfy",
+    "notifications",
+    "llm",
+    "llm-agent",
+    "ai-agent",
+    "typescript"
   ],
   "repository": {
     "type": "git",
@@ -15,71 +52,37 @@
     "url": "https://github.com/cyanheads/ntfy-mcp-server/issues"
   },
   "homepage": "https://github.com/cyanheads/ntfy-mcp-server#readme",
-  "scripts": {
-    "build": "tsc && node --loader ts-node/esm scripts/make-executable.ts dist/index.js",
-    "clean": "ts-node scripts/clean.ts",
-    "rebuild": "npm run clean && npm run build",
-    "tree": "ts-node scripts/tree.ts",
-    "start": "node dist/index.js",
-    "start:stdio": "MCP_LOG_LEVEL=debug MCP_TRANSPORT_TYPE=stdio node dist/index.js",
-    "start:http": "MCP_LOG_LEVEL=debug MCP_TRANSPORT_TYPE=http node dist/index.js",
-    "watch": "tail -f logs/combined.log",
-    "docs:generate": "typedoc",
-    "fetch-spec": "ts-node --esm scripts/fetch-openapi-spec.ts"
+  "author": "cyanheads <casey@caseyjhand.com> (https://github.com/cyanheads/ntfy-mcp-server#readme)",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/cyanheads"
+    },
+    {
+      "type": "buy_me_a_coffee",
+      "url": "https://www.buymeacoffee.com/cyanheads"
+    }
+  ],
+  "license": "Apache-2.0",
+  "packageManager": "bun@1.3.11",
+  "engines": {
+    "bun": ">=1.3.0",
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.11.0",
-    "@types/jsonwebtoken": "^9.0.9",
-    "@types/node": "^22.15.3",
-    "@types/sanitize-html": "^2.15.0",
-    "@types/validator": "13.15.0",
-    "@types/xss-filters": "^1.2.0",
-    "chrono-node": "^2.8.0",
-    "dotenv": "^16.5.0",
-    "express": "^5.1.0",
-    "ignore": "^7.0.4",
-    "jsonwebtoken": "^9.0.2",
-    "openai": "^4.96.2",
-    "partial-json": "^0.1.7",
-    "path-normalize": "^6.0.13",
-    "sanitize-html": "^2.16.0",
-    "tiktoken": "^1.0.21",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.8.3",
-    "validator": "13.15.0",
-    "winston": "^3.17.0",
-    "winston-daily-rotate-file": "^5.0.0",
-    "xss-filters": "^1.2.7",
-    "yargs": "^17.7.2",
-    "zod": "^3.24.3"
+    "@cyanheads/mcp-ts-core": "^0.8.20",
+    "pino-pretty": "^13.1.3"
   },
-  "keywords": [
-    "ntfy",
-    "notifications",
-    "push-notifications",
-    "MCP",
-    "model-context-protocol",
-    "LLM",
-    "AI-integration",
-    "server",
-    "typescript",
-    "claude",
-    "messaging",
-    "template",
-    "client",
-    "sdk",
-    "http",
-    "sse",
-    "jwt",
-    "authentication"
-  ],
-  "author": "Casey Hand @cyanheads",
-  "license": "Apache-2.0",
   "devDependencies": {
-    "@types/express": "^5.0.1",
-    "@types/js-yaml": "^4.0.9",
-    "axios": "^1.9.0",
-    "js-yaml": "^4.1.0",
-    "typedoc": "^0.28.3"
+    "@biomejs/biome": "^2.4.14",
+    "@types/node": "^25.6.2",
+    "depcheck": "^1.4.7",
+    "ignore": "^7.0.5",
+    "tsc-alias": "^1.8.17",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5"
   }
 }

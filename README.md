@@ -1,484 +1,258 @@
-# Ntfy MCP Server
+<div align="center">
+  <h1>ntfy-mcp-server</h1>
+  <p><b>Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.</b>
+  <div>4 Tools • 1 Resource</div>
+  </p>
+</div>
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.8.3-blue.svg)](https://www.typescriptlang.org/)
-[![Model Context Protocol](https://img.shields.io/badge/MCP-1.10.2-green.svg)](https://modelcontextprotocol.io/)
-[![Version](https://img.shields.io/badge/Version-1.0.6-blue.svg)](https://github.com/cyanheads/ntfy-mcp-server/releases)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Status](https://img.shields.io/badge/Status-Stable-green.svg)](https://github.com/cyanheads/ntfy-mcp-server)
-[![GitHub](https://img.shields.io/github/stars/cyanheads/ntfy-mcp-server?style=social)](https://github.com/cyanheads/ntfy-mcp-server)
+<div align="center">
 
-An MCP (Model Context Protocol) server designed to interact with the [ntfy](https://ntfy.sh/) push notification service. It enables LLMs and AI agents to send notifications to your devices with extensive customization options.
+[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.0.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
 
-## Table of Contents
+[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
-- [Overview](#overview)
-- [Features](#features)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Project Structure](#project-structure)
-- [Tools](#tools)
-- [Resources](#resources)
-- [Use Cases](#use-cases)
-- [Available Scripts](#available-scripts)
-- [Contributing](#contributing)
-- [License](#license)
-
-## Overview
-
-This server implements the Model Context Protocol (MCP), enabling standardized communication between LLMs and external systems. Specifically, it provides an interface to the ntfy push notification service.
-
-[Ntfy](https://ntfy.sh/) is a simple HTTP-based pub-sub notification service that allows you to send notifications to your phone or desktop via simple HTTP requests. With this MCP server, LLM agents like Claude can send notifications to you through ntfy without needing direct HTTP access.
-
-```
-┌───────────┐      ┌───────────┐      ┌───────────┐      ┌─────────┐
-│ LLM Agent │ ────▶│ Ntfy MCP  │ ────▶│ Ntfy      │ ────▶│ Your    │
-│ (Claude)  │      │ Server    │      │ Service   │      │ Devices │
-└───────────┘      └───────────┘      └───────────┘      └─────────┘
-```
-
-## Features
-
-- **MCP Server Implementation:** Built using the `@modelcontextprotocol/sdk` for seamless integration with LLM agents.
-- **Ntfy Integration:** Provides a tool (`send_ntfy`) to send notifications with support for:
-  - Message prioritization (1-5 levels)
-  - Emoji tags
-  - Clickable actions and buttons
-  - File attachments
-  - Delayed delivery
-  - Markdown formatting
-- **Resource Exposure:** Exposes the configured default ntfy topic as an MCP resource.
-- **TypeScript:** Modern, type-safe codebase with comprehensive type definitions.
-- **Structured Logging:** Uses `winston` and `winston-daily-rotate-file` for detailed and rotatable logs.
-- **Configuration Management:** Uses `dotenv` for easy environment-based configuration.
-- **Utility Scripts:** Includes scripts for cleaning build artifacts and generating directory structure documentation.
-- **Error Handling & Security:** Implements robust error handling, input sanitization (`sanitize-html`), and security filters (`xss-filters`).
-
-## Quick Start
-
-1. **Prerequisites:**
-
-   - Node.js (v16+)
-   - npm or yarn
-   - An MCP-compatible client (Claude Desktop, Cline, etc.)
-
-2. **Install and Run:**
-
-   ```bash
-   # Option 1: Install via npm
-   npm install -g ntfy-mcp-server
-
-   # Option 2: Clone repository and build
-   git clone https://github.com/cyanheads/ntfy-mcp-server.git
-   cd ntfy-mcp-server
-   npm install
-   npm run build
-
-   # Create .env file (optional but recommended)
-   cp .env.example .env
-   # Edit .env to set NTFY_DEFAULT_TOPIC
-
-   # Start the server
-   npm start
-   ```
-
-3. **Add to MCP Client Settings:** Add the server to your MCP client settings file (see [Configuration](#configuration))
-
-4. **Use the tool:** Once connected, you can use the `send_ntfy` tool to send notifications.
-
-## Installation
-
-### Option 1: NPM Package (Recommended)
-
-1. **Install the package globally:**
-
-   ```bash
-   npm install -g ntfy-mcp-server
-   ```
-
-   This will install the server globally, making it available as a command-line tool.
-
-2. **Or install locally in your project:**
-
-   ```bash
-   npm install ntfy-mcp-server
-   ```
-
-   When installed locally, you can run it via npx or from node.
-
-### Option 2: From Source
-
-1. **Clone the repository:**
-
-   ```bash
-   git clone https://github.com/cyanheads/ntfy-mcp-server.git
-   cd ntfy-mcp-server
-   ```
-
-2. **Install dependencies:**
-
-   ```bash
-   npm install
-   ```
-
-3. **Build the project:**
-   ```bash
-   npm run build
-   ```
-
-## Configuration
-
-### Environment Variables
-
-Create a `.env` file in the project root based on `.env.example`:
-
-```bash
-# Ntfy Configuration
-NTFY_BASE_URL=https://ntfy.sh  # Optional: Base URL of your ntfy instance
-NTFY_DEFAULT_TOPIC=your_default_topic # Optional: Default topic if none specified in requests
-
-# Application Configuration
-LOG_LEVEL=info # Optional: Logging level (debug, info, warn, error)
-NODE_ENV=development # Optional: Environment (development, production)
-```
-
-### MCP Client Settings
-
-#### For Cline VSCode Extension
-
-Add the following configuration to your Cline MCP settings file (usually located at `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` on macOS):
-
-##### If installed globally:
-
-```json
-{
-  "mcpServers": {
-    "ntfy": {
-      "command": "ntfy-mcp-server",
-      "env": {
-        "NTFY_BASE_URL": "https://ntfy.sh",
-        "NTFY_DEFAULT_TOPIC": "your_default_topic",
-        "LOG_LEVEL": "info",
-        "NODE_ENV": "production"
-      }
-    }
-  }
-}
-```
-
-##### If installed from source:
-
-```json
-{
-  "mcpServers": {
-    "ntfy": {
-      "command": "node",
-      "args": ["/path/to/ntfy-mcp-server/dist/index.js"],
-      "env": {
-        "NTFY_BASE_URL": "https://ntfy.sh",
-        "NTFY_DEFAULT_TOPIC": "your_default_topic",
-        "LOG_LEVEL": "info",
-        "NODE_ENV": "production"
-      }
-    }
-  }
-}
-```
-
-#### For Claude Desktop App
-
-Add the following configuration to your Claude Desktop config file (usually located at `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
-
-##### If installed globally:
-
-```json
-{
-  "mcpServers": {
-    "ntfy": {
-      "command": "ntfy-mcp-server",
-      "env": {
-        "NTFY_BASE_URL": "https://ntfy.sh",
-        "NTFY_DEFAULT_TOPIC": "your_default_topic",
-        "LOG_LEVEL": "info",
-        "NODE_ENV": "production"
-      }
-    }
-  }
-}
-```
-
-##### If installed from source:
-
-```json
-{
-  "mcpServers": {
-    "ntfy": {
-      "command": "node",
-      "args": ["/path/to/ntfy-mcp-server/dist/index.js"],
-      "env": {
-        "NTFY_BASE_URL": "https://ntfy.sh",
-        "NTFY_DEFAULT_TOPIC": "your_default_topic",
-        "LOG_LEVEL": "info",
-        "NODE_ENV": "production"
-      }
-    }
-  }
-}
-```
-
-_For source installation, replace `/path/to/ntfy-mcp-server/dist/index.js` with the actual absolute path to the built server file._
-_Adjust `env` variables as needed for your setup._
-
-### Ntfy Setup
-
-1. **Install the ntfy app** on your devices from [ntfy.sh](https://ntfy.sh/app) or the app stores
-2. **Subscribe to your topic** in the app
-3. **Use the same topic** in your MCP server configuration
-
-## Project Structure
-
-```
-.
-├── .env.example            # Example environment variables
-├── .gitignore              # Git ignore patterns
-├── LICENSE                 # Project license (Apache-2.0)
-├── package.json            # Project metadata and dependencies
-├── tsconfig.json           # TypeScript compiler configuration
-├── docs/
-│   └── tree.md             # Auto-generated directory structure
-├── logs/                   # Runtime logs (created automatically)
-├── scripts/                # Utility scripts
-│   ├── clean.ts            # Cleans build artifacts and logs
-│   └── tree.ts             # Generates the docs/tree.md file
-└── src/                    # Source code
-    ├── index.ts            # Main server entry point
-    ├── config/             # Configuration loading
-    ├── mcp-server/         # MCP server logic, tools, and resources
-    │   ├── resources/      # MCP resource implementations
-    │   ├── tools/          # MCP tool implementations
-    │   └── utils/          # MCP-specific utilities
-    ├── services/           # External service integrations (ntfy)
-    ├── types-global/       # Global type definitions
-    └── utils/              # General utility functions
-```
-
-## Tools
-
-### `send_ntfy`
-
-Sends a notification message via the ntfy service.
-
-#### Key Arguments:
-
-| Parameter    | Type     | Required | Description                                                                  |
-| ------------ | -------- | -------- | ---------------------------------------------------------------------------- |
-| `topic`      | string   | Yes      | The ntfy topic to publish to.                                                |
-| `message`    | string   | Yes      | The main content of the notification (max 4096 bytes).                       |
-| `title`      | string   | No       | Notification title (max 250 bytes).                                          |
-| `tags`       | string[] | No       | Emojis or keywords for categorization (e.g., `["warning", "robot"]`). Max 5. |
-| `priority`   | integer  | No       | Message priority: 1=min, 2=low, 3=default, 4=high, 5=max.                    |
-| `click`      | string   | No       | URL to open when the notification is clicked.                                |
-| `actions`    | array    | No       | Action buttons (view, http, broadcast). Max 3.                               |
-| `attachment` | object   | No       | URL and name of an attachment.                                               |
-| `email`      | string   | No       | Email address to forward the notification to.                                |
-| `delay`      | string   | No       | Delay delivery (e.g., `30m`, `1h`, `tomorrow`).                              |
-| `cache`      | string   | No       | Cache duration (e.g., `10m`, `1h`, `1d`).                                    |
-| `firebase`   | string   | No       | Firebase Cloud Messaging (FCM) topic to forward to.                          |
-| `id`         | string   | No       | Unique ID for the message.                                                   |
-| `expires`    | string   | No       | Message expiration (e.g., `10m`, `1h`, `1d`).                                |
-| `markdown`   | boolean  | No       | Set to `true` to enable markdown formatting in the message.                  |
-| `baseUrl`    | string   | No       | Override the default ntfy server URL for this request.                       |
-
-#### Example Usage:
-
-```javascript
-// Basic notification
-{
-  "topic": "alerts",
-  "message": "The task has completed successfully."
-}
-
-// Advanced notification
-{
-  "topic": "alerts",
-  "title": "System Alert",
-  "message": "CPU usage has exceeded 90% for 5 minutes.",
-  "tags": ["warning", "computer"],
-  "priority": 4,
-  "click": "https://server-dashboard.example.com",
-  "actions": [
-    {
-      "id": "view",
-      "label": "View Details",
-      "action": "view",
-      "url": "https://server-dashboard.example.com/cpu"
-    },
-    {
-      "id": "restart",
-      "label": "Restart Service",
-      "action": "http",
-      "url": "https://api.example.com/restart-service",
-      "method": "POST",
-      "headers": {
-        "Authorization": "Bearer token123"
-      }
-    }
-  ],
-  "markdown": true
-}
-```
-
-#### Example Response:
-
-```json
-{
-  "success": true,
-  "id": "5ZFY362156Sa",
-  "topic": "ATLAS",
-  "time": 1743064235,
-  "expires": 1743496235,
-  "message": "This is a test message from the README verification process",
-  "title": "README Testing"
-}
-```
-
-## Resources
-
-### Direct Resources
-
-#### `ntfy://default`
-
-- **Description:** Returns the default ntfy topic configured in the server's environment variables (`NTFY_DEFAULT_TOPIC`).
-- **Usage:** Useful for clients to discover the primary topic without needing prior configuration.
-- **Example:** An LLM agent can access this resource to automatically use the default topic when sending notifications.
-- **Example Response:**
-  ```json
-  {
-    "defaultTopic": "ATLAS",
-    "timestamp": "2025-03-27T08:30:25.619Z",
-    "requestUri": "ntfy://default",
-    "requestId": "0da963d0-30e0-4dbc-bb77-4bf2dee14484"
-  }
-  ```
-
-### Resource Templates
-
-#### `ntfy://{topic}`
-
-- **Description:** Returns information about a specific ntfy topic.
-- **Parameters:** `topic` - The name of the ntfy topic.
-- **Usage:** For querying information about topics other than the default.
-- **Example Response:**
-  ```json
-  {
-    "topic": "ATLAS",
-    "timestamp": "2025-03-27T08:30:30.038Z",
-    "requestUri": "ntfy://ATLAS",
-    "requestId": "31baf1df-278f-4fdb-860d-019f156a72b0"
-  }
-  ```
-
-## Use Cases
-
-1. **Long-running Task Notifications** - Get notified when tasks like database backups, code generation, or data processing complete.
-2. **Scheduled Reminders** - Set delayed notifications for future events or reminders.
-3. **Alert Systems** - Set up critical alerts for monitoring systems or important events.
-4. **Mobile Notifications from LLMs** - Allow LLMs to send notifications directly to your phone.
-5. **Multi-step Process Updates** - Receive updates as different stages of a complex process complete.
-
-### Usage Examples
-
-#### Basic Notification
-
-```
-<use_mcp_tool>
-<server_name>ntfy-mcp-server</server_name>
-<tool_name>send_ntfy</tool_name>
-<arguments>
-{
-  "topic": "updates",
-  "title": "Task Completed",
-  "message": "Your requested data analysis has finished",
-  "tags": ["check"]
-}
-</arguments>
-</use_mcp_tool>
-```
-
-#### Rich Notification with Actions
-
-```
-<use_mcp_tool>
-<server_name>ntfy-mcp-server</server_name>
-<tool_name>send_ntfy</tool_name>
-<arguments>
-{
-  "topic": "alerts",
-  "title": "Critical Error Detected",
-  "message": "The application has encountered a critical error.\n\n**Error Code**: E123\n\n**Details**: Database connection failed",
-  "tags": ["warning", "skull"],
-  "priority": 5,
-  "actions": [
-    {
-      "id": "view",
-      "label": "View Logs",
-      "action": "view",
-      "url": "https://logs.example.com"
-    },
-    {
-      "id": "restart",
-      "label": "Restart Service",
-      "action": "http",
-      "url": "https://api.example.com/restart",
-      "method": "POST"
-    }
-  ],
-  "markdown": true
-}
-</arguments>
-</use_mcp_tool>
-```
-
-## Available Scripts
-
-- `npm run build`: Compiles the TypeScript source code to JavaScript in the `dist/` directory.
-- `npm run clean`: Removes the `dist/` directory and cleans the contents of the `logs/` directory.
-- `npm run rebuild`: Runs `clean` and then `build`.
-- `npm run tree`: Generates a directory tree representation in `docs/tree.md`.
-- `npm start`: Runs the compiled server from the `dist/` directory using Node.js.
-- `npm run watch`: Tails the combined log file (`logs/combined.log`) for real-time monitoring.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests or open issues to improve the project.
-
-1.  Fork the repository.
-2.  Create a feature branch (`git checkout -b feature/your-feature`).
-3.  Commit your changes (`git commit -m 'Add some feature'`).
-4.  Push to the branch (`git push origin feature/your-feature`).
-5.  Create a new Pull Request.
-
-For bugs and feature requests, please create an issue on the repository.
-
-### Development Best Practices
-
-- Follow TypeScript best practices and maintain strong typing
-- Write tests for new functionality
-- Keep dependencies up to date
-- Follow the existing code style and patterns
-
-## License
-
-This project is licensed under the Apache-2.0 License. See the [LICENSE](LICENSE) file for details.
-
-## Acknowledgements
-
-- [ntfy.sh](https://ntfy.sh/) for providing the notification service
-- [Model Context Protocol](https://modelcontextprotocol.io/) for enabling LLM-to-tool connections
-- All contributors and users of this project
+</div>
 
 ---
 
-<div align="center">
-Built with the Model Context Protocol
-</div>
+## Tools
+
+Four tools covering the ntfy publish/subscribe surface — message lifecycle (publish, manage, fetch) plus an emoji-tag lookup that feeds the publish tool's `tags` field:
+
+| Tool Name | Description |
+|:----------|:------------|
+| `ntfy_publish_message` | Send or update a push notification on an ntfy topic. |
+| `ntfy_manage_message` | Clear or delete a previously-sent notification by `sequence_id`. |
+| `ntfy_fetch_messages` | Poll cached messages from one or more topics with optional filters. |
+| `ntfy_search_emoji_tags` | Look up ntfy emoji tag short codes for use in `tags`. |
+
+---
+
+### `ntfy_publish_message`
+
+Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe.
+
+- Full publish-parameter coverage — `title`, `priority` (1–5), `tags`, `click`, `attach`, `icon`, `filename`, `markdown`, `delay`, `email`, `call`, `cache`, `firebase`
+- Up to three discriminated action buttons (`view`, `broadcast`, `http`, `copy`) per message
+- Update or replace previously-sent messages by passing the original `sequence_id`
+- Per-call `base_url` override that forwards credentials only when the override matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request goes out unauthenticated, so credentials never leak to alternate hosts
+
+---
+
+### `ntfy_manage_message`
+
+Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only — the original message stays in cache, and a `message_clear` / `message_delete` event is emitted to subscribers. Idempotent.
+
+---
+
+### `ntfy_fetch_messages`
+
+Poll cached messages from one or more topics with optional filters. Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity.
+
+- Comma-separated multi-topic queries (e.g. `alerts,backups,phil_alerts`)
+- Filter by `since` (duration / timestamp / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, scheduled-only
+- Default window `10m`, default limit 20 messages per response, hard cap 100
+- Long bodies truncated to ~500 chars with `messageTruncated` reporting the dropped count
+
+---
+
+### `ntfy_search_emoji_tags`
+
+Substring search over the bundled ntfy emoji-tag reference. Returns the `tag` strings ready to plug into `ntfy_publish_message`'s `tags` field. Without a query, returns the first slice of the full reference.
+
+## Resources and prompts
+
+| Type | Name | Description |
+|:---|:---|:---|
+| Resource | `ntfy://{topic}` | Snapshot of a topic — last 20 messages from the past 1 hour, plus the topic's browser URL. |
+
+`ntfy_fetch_messages` covers the same topic data with custom windows and filters when the resource's fixed defaults aren't enough.
+
+## Features
+
+Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
+
+- Declarative tool and resource definitions — single file per primitive, framework handles registration and validation
+- Typed error contracts via `ctx.fail(reason, …)` plus framework error factories (`forbidden`, `notFound`, `validationError`, …)
+- Pluggable auth: `none`, `jwt`, `oauth`
+- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
+- Structured logging with optional OpenTelemetry tracing
+- STDIO and Streamable HTTP transports
+
+ntfy-specific:
+
+- Wraps ntfy's HTTP API with retry-aware client (`withRetry` + per-request timeout)
+- Per-server scoped auth — credentials are bound to each registered base URL (`NTFY_BASE_URL` or per-entry under `NTFY_SERVERS`); per-call `base_url` overrides forward auth only when the override matches a registered server, and go out unauthenticated otherwise
+- Bundled emoji-tag reference, regenerated from upstream `docs/ntfy/emojis.md` via `scripts/build-emoji-tags.ts`
+- Mutually-exclusive auth modes (bearer token *or* basic auth) validated at config-load time
+
+## Getting started
+
+Add the following to your MCP client configuration file. Public ntfy.sh works out of the box without an account; for protected topics, generate an access token at <https://ntfy.sh/account>.
+
+```json
+{
+  "mcpServers": {
+    "ntfy": {
+      "type": "stdio",
+      "command": "bunx",
+      "args": ["ntfy-mcp-server@latest"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "MCP_LOG_LEVEL": "info",
+        "NTFY_DEFAULT_TOPIC": "your-topic-name"
+      }
+    }
+  }
+}
+```
+
+Or with Docker:
+
+```json
+{
+  "mcpServers": {
+    "ntfy": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "MCP_TRANSPORT_TYPE=stdio",
+        "-e", "NTFY_DEFAULT_TOPIC=your-topic-name",
+        "ghcr.io/cyanheads/ntfy-mcp-server:latest"
+      ]
+    }
+  }
+}
+```
+
+For Streamable HTTP, set the transport and start the server:
+
+```sh
+MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 NTFY_DEFAULT_TOPIC=your-topic bun run start:http
+# Server listens at http://127.0.0.1:3010/mcp
+```
+
+### Prerequisites
+
+- [Bun v1.3.11](https://bun.sh/) or higher (or Node.js v24+).
+- A topic name on an ntfy server. Public `ntfy.sh` requires no account; self-hosted instances and protected topics may need a bearer token or basic-auth credentials.
+
+### Installation
+
+1. **Clone the repository:**
+
+```sh
+git clone https://github.com/cyanheads/ntfy-mcp-server.git
+```
+
+2. **Navigate into the directory:**
+
+```sh
+cd ntfy-mcp-server
+```
+
+3. **Install dependencies:**
+
+```sh
+bun install
+```
+
+4. **Configure environment:**
+
+```sh
+cp .env.example .env
+# edit .env and set NTFY_DEFAULT_TOPIC (and auth, if needed)
+```
+
+## Configuration
+
+| Variable | Description | Default |
+|:---------|:------------|:--------|
+| `NTFY_SERVERS` | JSON array of `{ baseUrl, authToken? \| authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Use this when you need more than one authenticated server in a single process; it takes precedence over the single-server vars below. | — |
+| `NTFY_BASE_URL` | Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when `NTFY_SERVERS` is unset. | `https://ntfy.sh` |
+| `NTFY_DEFAULT_TOPIC` | Topic used when a tool call omits `topic`. | — |
+| `NTFY_AUTH_TOKEN` | Bearer access token (`tk_…`) for the single-server shorthand. Mutually exclusive with `NTFY_AUTH_USERNAME` / `NTFY_AUTH_PASSWORD`. | — |
+| `NTFY_AUTH_USERNAME` | Basic-auth username for the single-server shorthand — required together with `NTFY_AUTH_PASSWORD`. | — |
+| `NTFY_AUTH_PASSWORD` | Basic-auth password for the single-server shorthand — required together with `NTFY_AUTH_USERNAME`. | — |
+| `NTFY_REQUEST_TIMEOUT_MS` | Per-request HTTP timeout in milliseconds. | `15000` |
+| `NTFY_MAX_RETRIES` | Max retry attempts for transient upstream failures (5xx, network, 429). | `3` |
+| `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
+| `MCP_SESSION_MODE` | HTTP session model: `stateless`, `stateful`, or `auto`. | `auto` |
+| `MCP_HTTP_HOST` | HTTP host. | `127.0.0.1` |
+| `MCP_HTTP_PORT` | HTTP port. | `3010` |
+| `MCP_HTTP_ENDPOINT_PATH` | HTTP endpoint path. | `/mcp` |
+| `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
+| `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
+| `LOGS_DIR` | Directory for file-based logs (Node only; ignored on Workers). | `./logs` |
+| `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry) (spans, metrics, completion logs). | `false` |
+
+See [`.env.example`](./.env.example) for the full list of optional overrides.
+
+## Running the server
+
+### Local development
+
+- **Build and run:**
+
+  ```sh
+  # One-time build
+  bun run rebuild
+
+  # Run the built server
+  bun run start:stdio
+  # or
+  bun run start:http
+  ```
+
+- **Run checks and tests:**
+
+  ```sh
+  bun run devcheck     # Lint, format, typecheck, security, changelog sync
+  bun run test         # Vitest test suite
+  bun run lint:mcp     # Validate MCP definitions against spec
+  ```
+
+### Docker
+
+```sh
+docker build -t ntfy-mcp-server .
+docker run --rm -e NTFY_DEFAULT_TOPIC=your-topic -p 3010:3010 ntfy-mcp-server
+```
+
+The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/ntfy-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+
+## Project structure
+
+| Directory | Purpose |
+|:----------|:--------|
+| `src/index.ts` | `createApp()` entry point — registers tools and resources, initializes services. |
+| `src/config` | Server-specific environment variable parsing (`NTFY_*`) with Zod. |
+| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
+| `src/mcp-server/resources` | Resource definitions (`*.resource.ts`). |
+| `src/services/ntfy` | ntfy HTTP client, types, and error classifier. |
+| `src/services/emoji-tags` | Bundled emoji short-code reference and lookup service. |
+| `docs/ntfy` | Mirrored upstream ntfy API docs (pinned commit in `SOURCES.md`). |
+| `tests/` | Unit and integration tests mirroring `src/`. |
+
+## Development guide
+
+See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rules. The short version:
+
+- Handlers throw, framework catches — no `try/catch` in tool logic
+- Use `ctx.log` for request-scoped logging, `ctx.state` for tenant-scoped storage
+- Wrap external API calls: validate raw → normalize to domain type → return output schema; never fabricate missing fields
+- Per-tool `errors[]` contracts stay inline — repetition is intended for locality
+
+## Contributing
+
+Issues and pull requests are welcome. Run checks and tests before submitting:
+
+```sh
+bun run devcheck
+bun run test
+```
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) for details.

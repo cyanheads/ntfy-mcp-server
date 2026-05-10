@@ -1,102 +1,91 @@
-#!/usr/bin/env node
-
 /**
- * Clean Script
- * ============
- * 
- * Description:
- *   A utility script to clean build artifacts and temporary directories from your project.
- *   By default, it removes the 'dist' and 'logs' directories if they exist.
- * 
- * Usage:
- *   - Add to package.json: "clean": "ts-node --esm scripts/clean.ts" (or similar)
- *   - Often used in rebuild scripts: "rebuild": "ts-node --esm scripts/clean.ts && npm run build"
- *   - Can be used with arguments to specify custom directories: ts-node --esm scripts/clean.ts temp coverage
- * 
- * Platform compatibility:
- *   - Works on all platforms (Windows, macOS, Linux) using Node.js path normalization
+ * @fileoverview Utility script to clean build artifacts and temporary directories.
+ * @module scripts/clean
+ *   By default, it removes the 'dist' and 'logs' directories.
+ *   Custom directories can be specified as command-line arguments.
+ *   Works on all platforms using Node.js path normalization.
+ *
+ * @example
+ * // Default directories (dist, logs):
+ * // bun run scripts/clean.ts
+ *
+ * // Custom directories:
+ * // bun run scripts/clean.ts temp coverage
  */
+import { readdir, rm } from 'node:fs/promises';
+import { resolve, sep } from 'node:path';
 
-import { rm, access } from 'fs/promises';
-import { join } from 'path';
-
-/**
- * Interface for clean operation result
- */
 interface CleanResult {
   dir: string;
-  status: 'success' | 'skipped';
   reason?: string;
+  status: 'cleaned' | 'skipped' | 'error';
 }
 
 /**
- * Check if a directory exists without using fs.Stats
+ * Validates that a resolved path stays within the project root.
+ * Rejects absolute paths, '..' traversal, and paths that escape cwd.
  */
-async function directoryExists(dirPath: string): Promise<boolean> {
-  try {
-    await access(dirPath);
-    return true;
-  } catch {
-    return false;
+function validatePath(dir: string, root: string): string {
+  if (!dir || dir.trim() === '') {
+    throw new Error('Empty directory name not allowed');
   }
+  if (/^[a-zA-Z]:/.test(dir) || dir.startsWith('/') || dir.startsWith('\\')) {
+    throw new Error(`Absolute paths not allowed: ${dir}`);
+  }
+  if (dir.split(/[/\\]/).includes('..')) {
+    throw new Error(`Path traversal not allowed: ${dir}`);
+  }
+  const resolved = resolve(root, dir);
+  if (!resolved.startsWith(root + sep)) {
+    throw new Error(`Path escapes project root: ${dir}`);
+  }
+  return resolved;
 }
 
-/**
- * Main clean function
- */
 const clean = async (): Promise<void> => {
   try {
-    // Default directories to clean
-    let dirsToClean: string[] = ['dist', 'logs'];
-    
-    // If directories are specified as command line arguments, use those instead
+    const root = process.cwd();
     const args = process.argv.slice(2);
-    if (args.length > 0) {
-      dirsToClean = args;
-    }
-    
+    const buildInfoFiles = (await readdir(root)).filter((f) => f.endsWith('.tsbuildinfo'));
+    const dirsToClean = [...new Set(args.length > 0 ? args : ['dist', 'logs', ...buildInfoFiles])];
+
     console.log(`Cleaning directories: ${dirsToClean.join(', ')}`);
 
-    // Process each directory
-    const results = await Promise.allSettled(
-      dirsToClean.map(async (dir): Promise<CleanResult> => {  
-        const dirPath = join(process.cwd(), dir);
-        
+    const results = await Promise.all(
+      dirsToClean.map(async (dir): Promise<CleanResult> => {
         try {
-          // Check if directory exists before attempting to remove it
-          const exists = await directoryExists(dirPath);
-          
-          if (!exists) {
+          const dirPath = validatePath(dir, root);
+          await rm(dirPath, { recursive: true });
+          return { dir, status: 'cleaned' };
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
             return { dir, status: 'skipped', reason: 'does not exist' };
           }
-          
-          // Remove directory if it exists
-          await rm(dirPath, { recursive: true, force: true });
-          return { dir, status: 'success' };
-        } catch (error) {
-          throw error;
+          const message = error instanceof Error ? error.message : String(error);
+          return { dir, status: 'error', reason: message };
         }
-      })
+      }),
     );
 
-    // Report results
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        const { dir, status, reason } = result.value;
-        if (status === 'success') {
-          console.log(`✓ Successfully cleaned ${dir} directory`);
-        } else {
-          console.log(`- ${dir} directory ${reason}, skipping cleanup`);
-        }
+    let hasErrors = false;
+    for (const { dir, status, reason } of results) {
+      if (status === 'cleaned') {
+        console.log(`  ✓ ${dir}`);
+      } else if (status === 'skipped') {
+        console.log(`  - ${dir} (${reason})`);
       } else {
-        console.error(`× Error cleaning directory: ${result.reason}`);
+        console.error(`  ✗ ${dir}: ${reason}`);
+        hasErrors = true;
       }
     }
-  } catch (error) {
-    console.error('× Error during cleanup:', error instanceof Error ? error.message : error);
+
+    if (hasErrors) {
+      process.exit(1);
+    }
+  } catch (error: unknown) {
+    console.error('Clean script failed:', error instanceof Error ? error.message : error);
     process.exit(1);
   }
 };
 
-// Execute the clean function
-clean();
+void clean();

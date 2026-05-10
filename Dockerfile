@@ -1,87 +1,98 @@
-# ---- Builder Stage ----
-# Use the official Node.js image as a parent image for building
-FROM node:22-slim AS builder
+# ==============================================================================
+# Build Stage
+#
+# This stage installs all dependencies (including dev), builds the TypeScript
+# source code into JavaScript, and prepares the production assets.
+# ==============================================================================
+FROM oven/bun:1.3 AS build
 
-# Set working directory in the container
-WORKDIR /app
+WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json (or npm-shrinkwrap.json)
-COPY package.json package-lock.json* ./
+# Copy dependency manifests for optimized layer caching
+COPY package.json bun.lock ./
 
-# Install dependencies needed for build (including devDependencies)
-RUN npm install --production=false
+# Install all dependencies (including dev dependencies for building)
+RUN bun install --frozen-lockfile
 
-# Copy the rest of the application source code
+# Copy the rest of the source code
 COPY . .
 
-# Build the TypeScript application
-RUN npm run build
-
-# Remove development dependencies after build
-RUN npm prune --production
+# Build the application
+RUN bun run build
 
 
-# ---- Final Stage ----
-# Use the Debian base image specified in the example
-FROM debian:bullseye-slim
+# ==============================================================================
+# Production Stage
+#
+# This stage creates a minimal, optimized, and secure image for running the
+# application. It uses a slim base image and only includes production
+# dependencies and build artifacts.
+# ==============================================================================
+FROM oven/bun:1.3-slim AS production
 
-# Define build arguments for environment variables with defaults matching the original Dockerfile
-ARG NTFY_BASE_URL=https://ntfy.sh
-ARG NTFY_DEFAULT_TOPIC=ATLAS
-ARG LOG_FILE_DIR=/app/logs
-ARG NTFY_API_KEY=placeholder_api_key_for_testing
+WORKDIR /usr/src/app
 
-# Set environment variables
-# Use noninteractive frontend for apt commands
-# Set PATH to include the user's local bin directory
-# Set Node environment to production
-# Pass through build arguments
-ENV DEBIAN_FRONTEND=noninteractive \
-    PATH="/home/service-user/.local/bin:${PATH}" \
-    NODE_ENV=production \
-    NTFY_BASE_URL=${NTFY_BASE_URL} \
-    NTFY_DEFAULT_TOPIC=${NTFY_DEFAULT_TOPIC} \
-    LOG_FILE_DIR=${LOG_FILE_DIR} \
-    NTFY_API_KEY=placeholder_api_key_for_testing
+# Set the environment to production for performance and to ensure only
+# production dependencies are installed.
+ENV NODE_ENV=production
 
-# Install necessary packages: curl (for NodeSource script), wget, software-properties-common, nodejs, and mcp-proxy
-# Create user/group and directories
-# Clean up apt cache and temporary files
-RUN groupadd --system --gid 1987 service-user && \
-    useradd --system --uid 1987 --gid service-user -m service-user && \
-    mkdir -p /home/service-user/.local/bin /app ${LOG_FILE_DIR} && \
-    chown -R service-user:service-user /home/service-user /app ${LOG_FILE_DIR} && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends curl wget software-properties-common ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    # Install Node.js v22 using NodeSource script (as per example)
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    # Install mcp-proxy globally
-    npm install -g mcp-proxy@2.10.6 && \
-    npm cache clean --force && \
-    # Clean up downloaded packages and lists
-    apt-get purge -y --auto-remove curl wget software-properties-common && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+LABEL org.opencontainers.image.title="ntfy-mcp-server"
+LABEL org.opencontainers.image.description="Send, manage, and replay ntfy push notifications via MCP."
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/ntfy-mcp-server"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-# Set working directory
-WORKDIR /app
+# Copy dependency manifests
+COPY package.json bun.lock ./
 
-# Copy necessary artifacts from builder stage
-# Copy package.json for runtime identification
-COPY --from=builder --chown=service-user:service-user /app/package.json ./package.json
-# Copy production node_modules
-COPY --from=builder --chown=service-user:service-user /app/node_modules ./node_modules
-# Copy the built application code (dist directory)
-COPY --from=builder --chown=service-user:service-user /app/dist ./dist
+# Install only production dependencies, ignoring any lifecycle scripts (like 'prepare')
+# that are not needed in the final production image.
+RUN bun install --production --frozen-lockfile --ignore-scripts
+
+# Conditionally install OpenTelemetry optional peer dependencies (Tier 3).
+# These are not bundled by default to keep the base image lean. Enable at build time
+# with: docker build --build-arg OTEL_ENABLED=true
+ARG OTEL_ENABLED=true
+RUN if [ "$OTEL_ENABLED" = "true" ]; then \
+      bun add @hono/otel \
+        @opentelemetry/instrumentation-http \
+        @opentelemetry/exporter-metrics-otlp-http \
+        @opentelemetry/exporter-trace-otlp-http \
+        @opentelemetry/instrumentation-pino \
+        @opentelemetry/resources \
+        @opentelemetry/sdk-metrics \
+        @opentelemetry/sdk-node \
+        @opentelemetry/sdk-trace-node \
+        @opentelemetry/semantic-conventions; \
+    fi
+
+# Copy the compiled application code from the build stage
+COPY --from=build /usr/src/app/dist ./dist
+
+# The 'oven/bun' image already provides a non-root user named 'bun'.
+# We will use this existing user for enhanced security.
+
+# Create and set permissions for the log directory, assigning ownership to the 'bun' user.
+RUN mkdir -p /var/log/ntfy-mcp-server && chown -R bun:bun /var/log/ntfy-mcp-server
 
 # Switch to the non-root user
-USER service-user
+USER bun
 
-# Expose port if necessary (uncomment if needed)
-# EXPOSE 3000
+# Define an argument for the port, allowing it to be overridden at build time.
+# The `PORT` variable is often injected by cloud environments at runtime.
+ARG PORT
 
-# Define the command to run the application using mcp-proxy and the built JS file
-# This retains the correct command from the original Dockerfile
-CMD ["mcp-proxy", "node", "dist/index.js"]
+# Set runtime environment variables
+# Note: PORT is an automatic variable in many cloud environments (e.g., Cloud Run)
+ENV MCP_HTTP_PORT=${PORT:-3010}
+ENV MCP_HTTP_HOST="0.0.0.0"
+ENV MCP_TRANSPORT_TYPE="http"
+ENV MCP_SESSION_MODE="stateless"
+ENV MCP_LOG_LEVEL="info"
+ENV LOGS_DIR="/var/log/ntfy-mcp-server"
+
+# Expose the port the server listens on
+EXPOSE ${MCP_HTTP_PORT}
+
+# The command to start the server
+CMD ["bun", "run", "dist/index.js"]

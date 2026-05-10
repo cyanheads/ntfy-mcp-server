@@ -1,178 +1,145 @@
 /**
- * Types for the ntfy service
+ * @fileoverview Shared types for the ntfy upstream — action discriminated
+ * union, message envelope, attachment, and request/response shapes used by
+ * `NtfyService`. Mirrors the upstream JSON formats documented in
+ * `docs/ntfy/publish.md` and `docs/ntfy/subscribe/api.md`.
+ * @module services/ntfy/types
  */
 
-/**
- * Message event types from ntfy
- */
-export type NtfyEventType = 'open' | 'message' | 'keepalive' | 'poll_request';
+export type Priority = 1 | 2 | 3 | 4 | 5;
 
-/**
- * Message priority levels
- * - 1: min priority
- * - 2: low priority
- * - 3: default priority
- * - 4: high priority
- * - 5: max priority
- */
-export type NtfyPriority = 1 | 2 | 3 | 4 | 5;
+export type MessageEvent = 'message' | 'message_clear' | 'message_delete' | 'poll_request';
 
-/**
- * Subscription format types
- */
-export type NtfySubscriptionFormat = 'json' | 'sse' | 'raw' | 'ws';
-
-/**
- * Attachment information
- */
 export interface NtfyAttachment {
-  /** Name of the attachment */
+  expires?: number;
   name: string;
-  /** URL of the attachment */
-  url: string;
-  /** Mime type of the attachment (only defined if attachment was uploaded to ntfy server) */
-  type?: string;
-  /** Size of the attachment in bytes (only defined if attachment was uploaded to ntfy server) */
   size?: number;
-  /** Attachment expiry date as Unix time stamp (only defined if attachment was uploaded to ntfy server) */
-  expires?: number;
+  type?: string;
+  url: string;
 }
 
-/**
- * Action button definition
- */
-export interface NtfyAction {
-  /** Action identifier */
-  id: string;
-  /** Label for the action button */
-  label: string;
-  /** Action type (e.g., view, broadcast, http) */
-  action: string;
-  /** URL or data for the action */
-  url?: string;
-  /** HTTP method for http actions */
-  method?: string;
-  /** Additional headers for http actions */
-  headers?: Record<string, string>;
-  /** Body for http actions */
-  body?: string;
-  /** Clear notification after action */
+export interface ViewAction {
+  action: 'view';
   clear?: boolean;
+  label: string;
+  url: string;
 }
 
-/**
- * Base message interface with common fields for all message types
- */
-export interface NtfyBaseMessage {
-  /** Randomly chosen message identifier */
-  id: string;
-  /** Message date time, as Unix time stamp */
-  time: number;
-  /** Message type */
-  event: NtfyEventType;
-  /** Comma-separated list of topics the message is associated with */
-  topic: string;
-  /** Unix time stamp indicating when the message will be deleted */
-  expires?: number;
+export interface BroadcastAction {
+  action: 'broadcast';
+  clear?: boolean;
+  extras?: Record<string, string>;
+  intent?: string;
+  label: string;
 }
 
-/**
- * Regular notification message
- */
-export interface NtfyNotificationMessage extends NtfyBaseMessage {
-  event: 'message';
-  /** Message body */
-  message: string;
-  /** Message title */
-  title?: string;
-  /** List of tags that may or not map to emojis */
-  tags?: string[];
-  /** Message priority with 1=min, 3=default and 5=max */
-  priority?: NtfyPriority;
-  /** Website opened when notification is clicked */
-  click?: string;
-  /** Action buttons that can be displayed in the notification */
-  actions?: NtfyAction[];
-  /** Details about an attachment */
-  attachment?: NtfyAttachment;
-}
-
-/**
- * Connection open message
- */
-export interface NtfyOpenMessage extends NtfyBaseMessage {
-  event: 'open';
-}
-
-/**
- * Keepalive message to maintain connection
- */
-export interface NtfyKeepaliveMessage extends NtfyBaseMessage {
-  event: 'keepalive';
-}
-
-/**
- * Poll request message
- */
-export interface NtfyPollRequestMessage extends NtfyBaseMessage {
-  event: 'poll_request';
-}
-
-/**
- * Union of all message types
- */
-export type NtfyMessage = 
-  | NtfyNotificationMessage 
-  | NtfyOpenMessage 
-  | NtfyKeepaliveMessage 
-  | NtfyPollRequestMessage;
-
-/**
- * Options for subscribing to ntfy topics
- */
-export interface NtfySubscriptionOptions {
-  /** Whether to poll for messages instead of maintaining a connection */
-  poll?: boolean;
-  /** Return cached messages since timestamp, duration or message ID */
-  since?: string | number;
-  /** Include scheduled/delayed messages */
-  scheduled?: boolean;
-  /** Filter by message ID */
-  id?: string;
-  /** Filter by message content */
-  message?: string;
-  /** Filter by title */
-  title?: string;
-  /** Filter by priority (comma-separated list) */
-  priority?: string;
-  /** Filter by tags (comma-separated list) */
-  tags?: string;
-  /** Base URL for the ntfy server */
-  baseUrl?: string;
-  /** Authentication token or credentials */
-  auth?: string;
-  /** Basic auth username */
-  username?: string;
-  /** Basic auth password */
-  password?: string;
-  /** Additional headers to include in requests */
+export interface HttpAction {
+  action: 'http';
+  body?: string;
+  clear?: boolean;
   headers?: Record<string, string>;
+  label: string;
+  method?: string;
+  url: string;
+}
+
+export interface CopyAction {
+  action: 'copy';
+  clear?: boolean;
+  label: string;
+  value: string;
+}
+
+export type NtfyAction = ViewAction | BroadcastAction | HttpAction | CopyAction;
+
+/** Shape returned by the upstream `POST /` publish call. */
+export interface NtfyPublishResponse {
+  actions?: NtfyAction[];
+  attachment?: NtfyAttachment;
+  click?: string;
+  expires?: number;
+  id: string;
+  message?: string;
+  priority?: Priority;
+  scheduled?: boolean;
+  sequence_id?: string;
+  tags?: string[];
+  time: number;
+  title?: string;
+  topic: string;
 }
 
 /**
- * Subscription event handlers
+ * Single line from a `<topic>/json?poll=1` response. The `event` set is wider
+ * than `NtfyPublishResponse` because polls can include clear / delete / poll
+ * markers in addition to plain messages.
  */
-export interface NtfySubscriptionHandlers {
-  /** Called when a message is received */
-  onMessage?: (message: NtfyNotificationMessage) => void;
-  /** Called when the connection is opened */
-  onOpen?: (message: NtfyOpenMessage) => void;
-  /** Called when a keepalive message is received */
-  onKeepalive?: (message: NtfyKeepaliveMessage) => void;
-  /** Called when an error occurs */
-  onError?: (error: Error) => void;
-  /** Called when the connection is closed */
-  onClose?: () => void;
-  /** Called when any message is received (regardless of type) */
-  onAnyMessage?: (message: NtfyMessage) => void;
+export interface NtfyMessage {
+  actions?: NtfyAction[];
+  attachment?: NtfyAttachment;
+  click?: string;
+  event: MessageEvent | 'open' | 'keepalive';
+  expires?: number;
+  id: string;
+  message?: string;
+  priority?: Priority;
+  sequence_id?: string;
+  tags?: string[];
+  time: number;
+  title?: string;
+  topic: string;
+}
+
+export interface NtfyPublishRequest {
+  actions?: NtfyAction[] | undefined;
+  attach?: string | undefined;
+  /** When `false`, `X-Cache: no` is sent as a header (not a body field). */
+  cache?: boolean | undefined;
+  call?: string | undefined;
+  click?: string | undefined;
+  delay?: string | undefined;
+  email?: string | undefined;
+  filename?: string | undefined;
+  /** When `false`, `X-Firebase: no` is sent as a header (not a body field). */
+  firebase?: boolean | undefined;
+  icon?: string | undefined;
+  markdown?: boolean | undefined;
+  message?: string | undefined;
+  priority?: Priority | undefined;
+  sequence_id?: string | undefined;
+  tags?: string[] | undefined;
+  title?: string | undefined;
+  topic: string;
+}
+
+export interface NtfyFetchParams {
+  id?: string | undefined;
+  message?: string | undefined;
+  priority?: Priority[] | undefined;
+  scheduled?: boolean | undefined;
+  since?: string | undefined;
+  tags?: string[] | undefined;
+  title?: string | undefined;
+  /** One topic or comma-separated list. */
+  topic: string;
+}
+
+export type ManageOperation = 'clear' | 'delete';
+
+export interface NtfyManageResponse {
+  event: 'message_clear' | 'message_delete';
+  id: string;
+  sequence_id: string;
+  time: number;
+  topic: string;
+}
+
+export interface NtfyCallOptions {
+  /**
+   * Per-call override of the configured base URL. When set to anything other
+   * than the configured `NTFY_BASE_URL`, configured auth credentials are not
+   * forwarded — see the design doc for rationale.
+   */
+  baseUrl?: string | undefined;
+  signal?: AbortSignal | undefined;
 }

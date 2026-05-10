@@ -1,0 +1,224 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.cyanheads/ntfy-mcp-server",
+  "description": "Send, manage, and replay ntfy push notifications via MCP.",
+  "repository": {
+    "url": "https://github.com/cyanheads/ntfy-mcp-server",
+    "source": "github"
+  },
+  "version": "2.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "ntfy-mcp-server",
+      "runtimeHint": "bun",
+      "version": "2.0.0",
+      "packageArguments": [
+        { "type": "positional", "value": "run" },
+        { "type": "positional", "value": "start:stdio" }
+      ],
+      "environmentVariables": [
+        {
+          "name": "NTFY_SERVERS",
+          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_BASE_URL",
+          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when NTFY_SERVERS is unset.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://ntfy.sh"
+        },
+        {
+          "name": "NTFY_DEFAULT_TOPIC",
+          "description": "Topic used when a tool call omits `topic`. Treat the topic name as a secret — anyone who knows it can publish or subscribe.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_TOKEN",
+          "description": "Bearer access token (`tk_…`) for the single-server shorthand. Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_USERNAME",
+          "description": "Basic-auth username for the single-server shorthand — must be set together with NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_PASSWORD",
+          "description": "Basic-auth password for the single-server shorthand — must be set together with NTFY_AUTH_USERNAME.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_REQUEST_TIMEOUT_MS",
+          "description": "Per-request HTTP timeout in milliseconds.",
+          "format": "string",
+          "isRequired": false,
+          "default": "15000"
+        },
+        {
+          "name": "NTFY_MAX_RETRIES",
+          "description": "Max retry attempts for transient upstream failures (5xx, network, 429).",
+          "format": "string",
+          "isRequired": false,
+          "default": "3"
+        },
+        {
+          "name": "MCP_LOG_LEVEL",
+          "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
+          "format": "string",
+          "isRequired": false,
+          "default": "info"
+        },
+        {
+          "name": "LOGS_DIR",
+          "description": "Directory for file-based logs (Node only; ignored on Workers).",
+          "format": "string",
+          "isRequired": false,
+          "default": "./logs"
+        },
+        {
+          "name": "OTEL_ENABLED",
+          "description": "Enable OpenTelemetry instrumentation (spans, metrics, completion logs).",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "ntfy-mcp-server",
+      "runtimeHint": "bun",
+      "version": "2.0.0",
+      "packageArguments": [
+        { "type": "positional", "value": "run" },
+        { "type": "positional", "value": "start:http" }
+      ],
+      "environmentVariables": [
+        {
+          "name": "NTFY_SERVERS",
+          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_BASE_URL",
+          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when NTFY_SERVERS is unset.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://ntfy.sh"
+        },
+        {
+          "name": "NTFY_DEFAULT_TOPIC",
+          "description": "Topic used when a tool call omits `topic`. Treat the topic name as a secret — anyone who knows it can publish or subscribe.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_TOKEN",
+          "description": "Bearer access token (`tk_…`) for the single-server shorthand. Mutually exclusive with NTFY_AUTH_USERNAME / NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_USERNAME",
+          "description": "Basic-auth username for the single-server shorthand — must be set together with NTFY_AUTH_PASSWORD.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_AUTH_PASSWORD",
+          "description": "Basic-auth password for the single-server shorthand — must be set together with NTFY_AUTH_USERNAME.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "NTFY_REQUEST_TIMEOUT_MS",
+          "description": "Per-request HTTP timeout in milliseconds.",
+          "format": "string",
+          "isRequired": false,
+          "default": "15000"
+        },
+        {
+          "name": "NTFY_MAX_RETRIES",
+          "description": "Max retry attempts for transient upstream failures (5xx, network, 429).",
+          "format": "string",
+          "isRequired": false,
+          "default": "3"
+        },
+        {
+          "name": "MCP_SESSION_MODE",
+          "description": "HTTP session model: 'stateless', 'stateful', or 'auto'.",
+          "format": "string",
+          "isRequired": false,
+          "default": "auto"
+        },
+        {
+          "name": "MCP_HTTP_HOST",
+          "description": "The hostname for the HTTP server.",
+          "format": "string",
+          "isRequired": false,
+          "default": "127.0.0.1"
+        },
+        {
+          "name": "MCP_HTTP_PORT",
+          "description": "The port to run the HTTP server on.",
+          "format": "string",
+          "isRequired": false,
+          "default": "3010"
+        },
+        {
+          "name": "MCP_HTTP_ENDPOINT_PATH",
+          "description": "The endpoint path for the MCP server.",
+          "format": "string",
+          "isRequired": false,
+          "default": "/mcp"
+        },
+        {
+          "name": "MCP_AUTH_MODE",
+          "description": "Authentication mode to use: 'none', 'jwt', or 'oauth'.",
+          "format": "string",
+          "isRequired": false,
+          "default": "none"
+        },
+        {
+          "name": "MCP_LOG_LEVEL",
+          "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
+          "format": "string",
+          "isRequired": false,
+          "default": "info"
+        },
+        {
+          "name": "LOGS_DIR",
+          "description": "Directory for file-based logs (Node only; ignored on Workers).",
+          "format": "string",
+          "isRequired": false,
+          "default": "./logs"
+        },
+        {
+          "name": "OTEL_ENABLED",
+          "description": "Enable OpenTelemetry instrumentation (spans, metrics, completion logs).",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        }
+      ],
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://127.0.0.1:3010/mcp"
+      }
+    }
+  ]
+}
