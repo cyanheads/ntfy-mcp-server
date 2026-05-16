@@ -43,10 +43,10 @@ const InputSchema = z.object({
       'What to do: `clear` marks the notification read & dismisses it (subscribers see `message_clear`); `delete` removes it from the drawer (subscribers see `message_delete`). Safe to re-issue — the original message stays in cache, but a fresh event is emitted to subscribers each call.',
     ),
   base_url: z
-    .url()
+    .string()
     .optional()
     .describe(
-      'Override the configured `NTFY_BASE_URL` for this call. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override the configured `NTFY_BASE_URL` for this call (absolute URL). When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
     ),
 });
 

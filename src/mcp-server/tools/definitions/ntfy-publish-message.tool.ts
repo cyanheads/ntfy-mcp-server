@@ -65,7 +65,7 @@ const HttpActionSchema = z
   .object({
     action: z.literal('http').describe('Discriminator — must be `http`.'),
     label: z.string().min(1).max(64).describe('Button label shown in the notification.'),
-    url: z.url().describe('URL the HTTP request is sent to.'),
+    url: z.string().describe('Absolute URL the HTTP request is sent to.'),
     method: z.string().optional().describe('HTTP method — defaults to POST when omitted.'),
     headers: z
       .record(z.string(), z.string())
@@ -152,15 +152,15 @@ const InputSchema = z.object({
     .optional()
     .describe('URL opened when the notification is tapped — http(s), mailto:, geo:, ntfy://, etc.'),
   attach: z
-    .url()
+    .string()
     .optional()
     .describe(
-      'External URL to attach. ntfy fetches it on the recipient device — host the file somewhere reachable first; no local file uploads.',
+      'External attachment URL (absolute). ntfy fetches it on the recipient device — host the file somewhere reachable first; no local file uploads.',
     ),
   icon: z
-    .url()
+    .string()
     .optional()
-    .describe('JPEG/PNG icon URL shown next to the message body. Cached for 24h.'),
+    .describe('Absolute JPEG/PNG icon URL shown next to the message body. Cached for 24h.'),
   filename: z
     .string()
     .optional()
@@ -214,10 +214,10 @@ const InputSchema = z.object({
       'Set false to skip Firebase Cloud Messaging. Delays Android delivery up to 15 min unless the recipient enabled instant delivery. Sent as `X-Firebase: no`.',
     ),
   base_url: z
-    .url()
+    .string()
     .optional()
     .describe(
-      'Override the configured `NTFY_BASE_URL` for this call. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override the configured `NTFY_BASE_URL` for this call (absolute URL). When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
     ),
 });
 

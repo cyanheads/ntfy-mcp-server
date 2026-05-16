@@ -134,10 +134,10 @@ const InputSchema = z.object({
       'Client-side cap on returned messages. Default 20, max 100. Tool sets `truncated: true` when more remain.',
     ),
   base_url: z
-    .url()
+    .string()
     .optional()
     .describe(
-      'Override `NTFY_BASE_URL` for this call. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override `NTFY_BASE_URL` for this call (absolute URL). When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
     ),
 });
 

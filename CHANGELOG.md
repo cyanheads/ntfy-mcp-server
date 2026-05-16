@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.0.1](changelog/2.0.x/2.0.1.md) — 2026-05-16
+
+Adopts @cyanheads/mcp-ts-core ^0.9.1: URL string fields drop `format: uri` for OpenAI/Gemini portability, server `instructions` field added, devcheck `bun outdated` parser fixed.
+
 ## [2.0.0](changelog/2.0.x/2.0.0.md) — 2026-05-09 · ⚠️ Breaking
 
 Major rewrite on @cyanheads/mcp-ts-core. New 4-tool surface (publish, manage, fetch, emoji search), topic snapshot resource, multi-server NTFY_SERVERS registry. Breaking changes from 1.x; NTFY_API_KEY accepted as a deprecated alias.

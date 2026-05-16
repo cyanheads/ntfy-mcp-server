@@ -21,6 +21,8 @@ import { initNtfyService } from '@/services/ntfy/ntfy-service.js';
 await createApp({
   tools: [ntfyPublishMessage, ntfyManageMessage, ntfyFetchMessages, ntfySearchEmojiTags],
   resources: [ntfyTopicResource],
+  instructions:
+    'Use the ntfy_* tools to publish and manage push notifications via ntfy, a pub/sub notification service. Messages live on topics (arbitrary string channels) and get a server-assigned `sequence_id` reusable to update or replace them later. Typical flow: `ntfy_publish_message` → `ntfy_fetch_messages` to poll cached history → `ntfy_manage_message` to clear or delete by `sequence_id`. Use `ntfy_search_emoji_tags` to look up short codes for `tags`. Topic names act as access tokens — treat them as secrets.',
   setup() {
     initEmojiTagService();
     initNtfyService(getServerConfig());
