@@ -28,6 +28,7 @@
     "lint:mcp": "bun run scripts/lint-mcp.ts",
     "changelog:build": "bun run scripts/build-changelog.ts",
     "changelog:check": "bun run scripts/build-changelog.ts --check",
+    "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish",
     "test": "vitest run",
     "start": "bun ./dist/index.js",
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio bun ./dist/index.js",
