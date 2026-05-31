@@ -1,7 +1,10 @@
 /**
  * @fileoverview `ntfy_search_emoji_tags` — substring search across the bundled
  * ntfy emoji short-code reference. Returns tag → emoji rows the agent can plug
- * into `ntfy_publish_message`'s `tags` field.
+ * into `ntfy_publish_message`'s `tags` field. The parsed query, true match
+ * total, truncation flag, and empty-result guidance ride the `enrichment` block
+ * so they reach both `structuredContent` and `content[]` without a `format()`
+ * entry.
  * @module mcp-server/tools/definitions/ntfy-search-emoji-tags.tool
  */
 
@@ -29,10 +32,6 @@ const InputSchema = z.object({
 });
 
 const OutputSchema = z.object({
-  query: z
-    .string()
-    .optional()
-    .describe('Echo of the input query; absent when no query was supplied.'),
   matches: z
     .array(
       z
@@ -47,8 +46,6 @@ const OutputSchema = z.object({
         .describe('A single tag → emoji pairing.'),
     )
     .describe('Tag → emoji rows in the order they appear in the upstream reference.'),
-  total: z.number().describe('Total matches before truncation.'),
-  truncated: z.boolean().describe('True when more matches existed than `limit` allowed.'),
 });
 
 export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
@@ -58,26 +55,47 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
   input: InputSchema,
   output: OutputSchema,
 
-  handler(input) {
-    return { query: input.query, ...getEmojiTagService().search(input.query, input.limit) };
+  // Agent-facing success-path context — the parsed query, the true match total,
+  // the truncation flag, and empty-result guidance. Merged into structuredContent
+  // and mirrored into a content[] trailer; never authored into format().
+  enrichment: {
+    effectiveQuery: z
+      .string()
+      .optional()
+      .describe('The query as the server parsed it; absent when browsing the default set.'),
+    totalCount: z.number().describe('Total matches before truncation to `limit`.'),
+    truncated: z.boolean().describe('True when more matches existed than `limit` allowed.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance when no tags matched — echoes the query and suggests a shorter substring or the default set.',
+      ),
+  },
+
+  handler(input, ctx) {
+    const { matches, total, truncated } = getEmojiTagService().search(input.query, input.limit);
+
+    if (input.query) ctx.enrich.echo(input.query);
+    ctx.enrich.total(total);
+    ctx.enrich({ truncated });
+    if (matches.length === 0) {
+      ctx.enrich.notice(
+        input.query
+          ? `No emoji tags matched query \`${input.query}\`. Try a shorter substring or omit the query to browse the curated default set.`
+          : 'The default reference is empty — this should not happen; report it.',
+      );
+    }
+
+    return { matches };
   },
 
   format(result) {
     if (result.matches.length === 0) {
-      const tail = result.query
-        ? ` query \`${result.query}\`. Try a shorter substring or omit the query to browse the curated default set.`
-        : '. The default reference is empty — this should not happen; report it.';
-      return [
-        {
-          type: 'text',
-          text: `No emoji tags matched${tail}`,
-        },
-      ];
+      return [{ type: 'text', text: 'No emoji tags matched.' }];
     }
     const header = '| Tag | Emoji |\n|:----|:------|';
     const rows = result.matches.map((m) => `| \`${m.tag}\` | ${m.emoji} |`);
-    const queryLine = result.query ? `_Query: \`${result.query}\`._\n` : '';
-    const footer = `\n${queryLine}_${result.total} total match${result.total === 1 ? '' : 'es'} (truncated: ${result.truncated})._`;
-    return [{ type: 'text', text: `${header}\n${rows.join('\n')}${footer}` }];
+    return [{ type: 'text', text: `${header}\n${rows.join('\n')}` }];
   },
 });

@@ -313,14 +313,14 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     },
     {
       reason: 'payload_too_large',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Message body or attachment exceeds server limits.',
       recovery:
         'Shorten the message (≤4096 bytes plain) or host the long content as an external URL via `attach`.',
     },
     {
       reason: 'unverified_contact',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: '`email`/`call` set but the authenticated user has no verified address/number, or auth is missing.',
       recovery:
         'Drop the `email`/`call` field and resend; if forwarding is essential, ask the operator to verify the address or number in the ntfy account settings.',

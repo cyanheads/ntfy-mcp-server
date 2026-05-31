@@ -1,10 +1,11 @@
 /**
  * @fileoverview Tests for `ntfy_search_emoji_tags` — service wiring, default
- * limit, format-rendering of an empty result.
+ * limit, enrichment (query echo, total, truncation, empty-result notice), and
+ * format-rendering of matches.
  * @module tests/tools/ntfy-search-emoji-tags.tool
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ntfySearchEmojiTags } from '@/mcp-server/tools/definitions/ntfy-search-emoji-tags.tool.js';
@@ -22,50 +23,56 @@ describe('ntfySearchEmojiTags handler', () => {
     resetEmojiTagService();
   });
 
-  it('returns matches that contain the query substring', async () => {
+  it('returns matches containing the query substring and echoes the parsed query + total', async () => {
     const ctx = createMockContext();
     const input = ntfySearchEmojiTags.input.parse({ query: 'warning', limit: 5 });
     const result = await ntfySearchEmojiTags.handler(input, ctx);
     expect(result.matches.some((m) => m.tag === 'warning')).toBe(true);
     expect(result.matches.length).toBeLessThanOrEqual(5);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.effectiveQuery).toBe('warning');
+    expect(typeof enrichment.totalCount).toBe('number');
+    expect(typeof enrichment.truncated).toBe('boolean');
   });
 
-  it('returns the leading slice when no query is provided', async () => {
+  it('returns the leading slice and flags truncation when no query is provided', async () => {
     const ctx = createMockContext();
     const input = ntfySearchEmojiTags.input.parse({});
     const result = await ntfySearchEmojiTags.handler(input, ctx);
     expect(result.matches.length).toBe(25);
-    expect(result.truncated).toBe(true);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.effectiveQuery).toBeUndefined();
   });
 
-  it('renders an empty-state message that echoes the query and offers a recovery hint', () => {
-    const blocks = ntfySearchEmojiTags.format!({
-      query: 'zzznevermatchz',
-      matches: [],
-      total: 0,
-      truncated: false,
-    });
+  it('populates a notice that echoes the query and offers a recovery hint when nothing matched', async () => {
+    const ctx = createMockContext();
+    const input = ntfySearchEmojiTags.input.parse({ query: 'zzznevermatchz' });
+    const result = await ntfySearchEmojiTags.handler(input, ctx);
+    expect(result.matches).toHaveLength(0);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toContain('zzznevermatchz');
+    expect(String(enrichment.notice).toLowerCase()).toContain('shorter');
+  });
+
+  it('renders an empty matches set without rows', () => {
+    const blocks = ntfySearchEmojiTags.format!({ matches: [] });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('No emoji tags matched');
-    expect(text).toContain('zzznevermatchz');
-    expect(text.toLowerCase()).toContain('shorter');
   });
 
-  it('renders rows + total + truncated state when there are matches', () => {
+  it('renders tag → emoji rows when there are matches', () => {
     const blocks = ntfySearchEmojiTags.format!({
-      query: 'celebrate',
       matches: [
         { tag: 'warning', emoji: '⚠️' },
         { tag: 'tada', emoji: '🎉' },
       ],
-      total: 7,
-      truncated: true,
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('warning');
     expect(text).toContain('tada');
-    expect(text).toContain('7 total matches');
-    expect(text).toContain('truncated: true');
-    expect(text).toContain('celebrate');
   });
 });

@@ -2,7 +2,10 @@
  * @fileoverview `ntfy_fetch_messages` — polls cached messages from one or more
  * ntfy topics with optional filters. Single round-trip via the upstream
  * `<topic>/json?poll=1` endpoint; the response is parsed line-by-line and
- * filtered to drop transport frames (`open`, `keepalive`).
+ * filtered to drop transport frames (`open`, `keepalive`). The resolved
+ * topic/since, returned count, truncation flag, active filters, and
+ * empty/truncated guidance ride the `enrichment` block so they reach both
+ * `structuredContent` and `content[]` without a `format()` entry.
  * @module mcp-server/tools/definitions/ntfy-fetch-messages.tool
  */
 
@@ -131,7 +134,7 @@ const InputSchema = z.object({
     .max(MAX_LIMIT)
     .default(DEFAULT_LIMIT)
     .describe(
-      'Client-side cap on returned messages. Default 20, max 100. Tool sets `truncated: true` when more remain.',
+      'Client-side cap on returned messages. Default 20, max 100. Sets the `truncated` enrichment flag when more remain.',
     ),
   base_url: z
     .string()
@@ -192,47 +195,37 @@ const MessageSchema = z
   })
   .describe('A single cached ntfy message envelope.');
 
+const FilterEchoSchema = z
+  .object({
+    priority: z
+      .array(PrioritySchema.describe('Single priority value (1=min, 5=max).'))
+      .optional()
+      .describe('Echo of the input priority filter; absent when not set.'),
+    tags: z
+      .array(z.string())
+      .optional()
+      .describe('Echo of the input tag filter; absent when not set.'),
+    id: z.string().optional().describe('Echo of the input id filter; absent when not set.'),
+    title: z.string().optional().describe('Echo of the input title filter; absent when not set.'),
+    message: z
+      .string()
+      .optional()
+      .describe('Echo of the input message filter; absent when not set.'),
+  })
+  .describe('Echo of the active filter inputs the server applied.');
+
 const OutputSchema = z.object({
-  topic: z
-    .string()
-    .describe(
-      'Echo of the resolved topic (or comma-separated list) — useful when `NTFY_DEFAULT_TOPIC` was used and the input omitted `topic`.',
-    ),
-  since: z.string().describe('Echo of the resolved `since` value (input or default `10m`).'),
   messages: z
     .array(MessageSchema)
     .describe(
       'Cached messages matching the filters, oldest-first (chronological order from ntfy).',
     ),
-  count: z.number().describe('Number of messages returned in this response.'),
-  truncated: z
-    .boolean()
-    .describe(
-      'True when the server returned more messages than `limit` and the tail was dropped — refetch with a tighter `since` or use `id` to target a specific message.',
-    ),
-  filters: z
-    .object({
-      priority: z
-        .array(PrioritySchema.describe('Single priority value (1=min, 5=max).'))
-        .optional()
-        .describe('Echo of the input priority filter; absent when not set.'),
-      tags: z
-        .array(z.string())
-        .optional()
-        .describe('Echo of the input tag filter; absent when not set.'),
-      id: z.string().optional().describe('Echo of the input id filter; absent when not set.'),
-      title: z.string().optional().describe('Echo of the input title filter; absent when not set.'),
-      message: z
-        .string()
-        .optional()
-        .describe('Echo of the input message filter; absent when not set.'),
-    })
-    .describe('Echo of the active filter inputs — useful for explaining empty results.'),
 });
 
 type Input = z.infer<typeof InputSchema>;
 type Output = z.infer<typeof OutputSchema>;
 type OutputMessage = Output['messages'][number];
+type FilterEcho = z.infer<typeof FilterEchoSchema>;
 
 function priorityLabel(p?: Priority): string {
   switch (p) {
@@ -281,12 +274,54 @@ function shapeMessage(raw: NtfyMessage): OutputMessage {
   };
 }
 
+function filterSummary(f: FilterEcho | undefined): string {
+  if (!f) return 'none';
+  const parts: string[] = [];
+  if (f.id) parts.push(`id=\`${f.id}\``);
+  if (f.title) parts.push(`title=\`${f.title}\``);
+  if (f.message) parts.push(`message=\`${f.message}\``);
+  if (f.priority?.length) parts.push(`priority=[${f.priority.join(',')}]`);
+  if (f.tags?.length) parts.push(`tags=[${f.tags.map((t) => `\`${t}\``).join(',')}]`);
+  return parts.length ? parts.join(', ') : 'none';
+}
+
 export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
   description:
     'Poll cached messages from one or more ntfy topics with optional filters. Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity. Multiple topics are passed as a comma-separated list. Long bodies are truncated client-side to keep responses bounded; pass the message `id` back as `since` to fetch from that point.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
+
+  // Agent-facing success-path context — the resolved topic/since, the returned
+  // count, the truncation flag, the active filters, and empty/truncated guidance.
+  // Merged into structuredContent and mirrored into a content[] trailer.
+  enrichment: {
+    topic: z
+      .string()
+      .describe(
+        'Echo of the resolved topic (or comma-separated list) — useful when `NTFY_DEFAULT_TOPIC` filled in for an omitted `topic`.',
+      ),
+    since: z.string().describe('Echo of the resolved `since` value (input or default `10m`).'),
+    count: z.number().describe('Number of messages returned in this response.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when more messages matched than `limit` and the tail was dropped — refetch with a tighter `since` or target a specific message by `id`.',
+      ),
+    appliedFilters: FilterEchoSchema.optional().describe(
+      'Active filter inputs the server applied; absent when no filters were set.',
+    ),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance when the result is empty or truncated — echoes the criteria and suggests how to broaden or paginate.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    appliedFilters: { render: (f) => `**Filters:** ${filterSummary(f)}` },
+  },
 
   errors: [
     {
@@ -298,7 +333,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     },
     {
       reason: 'invalid_since',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: '`since` value could not be parsed by ntfy (bad duration, malformed timestamp, or unknown message ID).',
       recovery:
         'Use one of: `all`, `latest`, a duration like `10m` / `2h` / `1d`, a Unix timestamp (seconds), or a known message ID.',
@@ -373,61 +408,48 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       truncated,
     });
 
-    return {
-      topic,
-      since: input.since,
-      messages: slice.map(shapeMessage),
-      count: slice.length,
-      truncated,
-      filters: {
-        priority: input.priority,
-        tags: input.tags,
-        id: input.id,
-        title: input.title,
-        message: input.message,
-      },
+    ctx.enrich({ topic, since: input.since, count: slice.length, truncated });
+
+    const activeFilters: FilterEcho = {
+      priority: input.priority,
+      tags: input.tags,
+      id: input.id,
+      title: input.title,
+      message: input.message,
     };
+    const hasFilters =
+      Boolean(input.id || input.title || input.message) ||
+      Boolean(input.priority?.length) ||
+      Boolean(input.tags?.length);
+    if (hasFilters) ctx.enrich({ appliedFilters: activeFilters });
+
+    if (slice.length === 0) {
+      ctx.enrich.notice(
+        `No messages on topic \`${topic}\` (since \`${input.since}\`)${
+          hasFilters ? ` with filters ${filterSummary(activeFilters)}` : ''
+        }. Try a wider \`since\` window${hasFilters ? ', drop filters,' : ''} or verify the topic name.`,
+      );
+    } else if (truncated) {
+      ctx.enrich.notice(
+        'More messages matched than the limit allowed; refetch with a tighter `since` window or pass a message `id` to target a specific one.',
+      );
+    }
+
+    return { messages: slice.map(shapeMessage) };
   },
 
   format(result) {
-    const filterParts: string[] = [];
-    if (result.filters.id) filterParts.push(`id=\`${result.filters.id}\``);
-    if (result.filters.title) filterParts.push(`title=\`${result.filters.title}\``);
-    if (result.filters.message) filterParts.push(`message=\`${result.filters.message}\``);
-    if (result.filters.priority?.length) {
-      filterParts.push(`priority=[${result.filters.priority.join(',')}]`);
+    if (result.messages.length === 0) {
+      return [{ type: 'text', text: 'No messages matched the query.' }];
     }
-    if (result.filters.tags?.length) {
-      filterParts.push(`tags=[${result.filters.tags.map((t) => `\`${t}\``).join(',')}]`);
-    }
-    const filterSummary = filterParts.length ? ` filtering by ${filterParts.join(', ')}` : '';
-    const criteria = `topic \`${result.topic}\` (since \`${result.since}\`)${filterSummary}`;
 
-    if (result.count === 0) {
-      const hint = filterParts.length
-        ? 'Try a wider `since` window, drop filters, or check that the topic is correct.'
-        : 'Try a wider `since` window or check that the topic is correct.';
-      return [
-        {
-          type: 'text',
-          text: `**0** messages on ${criteria}. ${hint}`,
-        },
+    const blocks = result.messages.map((m) => {
+      const lines: string[] = [
+        `### \`${m.id}\` — \`${m.event}\` on \`${m.topic}\``,
+        `Time: ${m.time}`,
       ];
-    }
-
-    const lines: string[] = [
-      `**${result.count}** message${result.count === 1 ? '' : 's'} on ${criteria} (truncated: ${result.truncated})`,
-    ];
-    for (const m of result.messages) {
-      lines.push('');
-      lines.push(`### \`${m.id}\` — \`${m.event}\` on \`${m.topic}\``);
-      lines.push(`Time: ${m.time}`);
-      if (m.expires) {
-        lines.push(`Cache expires: ${m.expires}`);
-      }
-      if (m.sequence_id) {
-        lines.push(`References sequence: \`${m.sequence_id}\``);
-      }
+      if (m.expires) lines.push(`Cache expires: ${m.expires}`);
+      if (m.sequence_id) lines.push(`References sequence: \`${m.sequence_id}\``);
       if (m.title) lines.push(`Title: ${m.title}`);
       if (m.priority !== undefined) {
         lines.push(`Priority: ${m.priority} (${priorityLabel(m.priority)})`);
@@ -448,25 +470,20 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
         lines.push(`Attachment: [${a.name}](${a.url})${suffix}`);
       }
       if (m.actions?.length) {
-        lines.push(`Actions:`);
+        lines.push('Actions:');
         for (const a of m.actions) {
           lines.push(`- \`\`\`json\n${JSON.stringify(a)}\n\`\`\``);
         }
       }
       if (m.message !== undefined) {
-        lines.push('');
-        lines.push(m.message);
+        lines.push('', m.message);
         if (m.messageTruncated !== undefined) {
           lines.push(`_(${m.messageTruncated} chars more)_`);
         }
       }
-    }
-    if (result.truncated) {
-      lines.push(
-        '',
-        `_…and more matched than the limit allowed; refetch with a tighter \`since\` or use \`id\` to target a specific message._`,
-      );
-    }
-    return [{ type: 'text', text: lines.join('\n') }];
+      return lines.join('\n');
+    });
+
+    return [{ type: 'text', text: blocks.join('\n\n') }];
   },
 });

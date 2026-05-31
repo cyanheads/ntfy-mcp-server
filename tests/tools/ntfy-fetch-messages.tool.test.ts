@@ -3,12 +3,13 @@
  * client-side limit truncation, message-body truncation, sparse upstream
  * payloads (per checklist), error mapping (forbidden / invalid_since /
  * upstream_unreachable / generic rethrow), default-topic resolution,
- * base_url override, and format() rendering.
+ * base_url override, enrichment (topic/since/count/truncated/filters/notice),
+ * and format() rendering.
  * @module tests/tools/ntfy-fetch-messages.tool
  */
 
 import { forbidden, invalidParams, notFound } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
@@ -48,7 +49,7 @@ describe('ntfyFetchMessages handler', () => {
     vi.restoreAllMocks();
   });
 
-  it('drops `open` and `keepalive` frames and respects the limit', async () => {
+  it('drops `open` and `keepalive` frames and enriches count + truncated', async () => {
     const svc = freshService();
     const upstream: NtfyMessage[] = [
       { id: 'a', time: 1, event: 'open', topic: 'alerts' },
@@ -65,8 +66,7 @@ describe('ntfyFetchMessages handler', () => {
 
     expect(result.messages).toHaveLength(2);
     expect(result.messages.map((m) => m.id)).toEqual(['b', 'd']);
-    expect(result.count).toBe(2);
-    expect(result.truncated).toBe(true);
+    expect(getEnrichment(ctx)).toMatchObject({ count: 2, truncated: true });
   });
 
   it('truncates long message bodies to 500 chars and reports the dropped count', async () => {
@@ -109,7 +109,7 @@ describe('ntfyFetchMessages handler', () => {
     });
   });
 
-  it('forwards filter args to the service', async () => {
+  it('forwards filter args to the service and echoes them as appliedFilters', async () => {
     const svc = freshService();
     const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([]);
     const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
@@ -126,6 +126,11 @@ describe('ntfyFetchMessages handler', () => {
       topic: 'alerts',
       since: '2h',
       scheduled: true,
+      priority: [4, 5],
+      tags: ['warning'],
+      title: 'Backup',
+    });
+    expect(getEnrichment(ctx).appliedFilters).toMatchObject({
       priority: [4, 5],
       tags: ['warning'],
       title: 'Backup',
@@ -155,14 +160,12 @@ describe('ntfyFetchMessages handler', () => {
     });
   });
 
-  it('renders message bodies and truncation note in format()', () => {
+  it('renders message bodies and details in format()', () => {
     const blocks = ntfyFetchMessages.format!({
-      topic: 'alerts',
-      since: '10m',
       messages: [
         {
           id: 'm1',
-          time: 1700000000,
+          time: '2023-11-14T22:13:20.000Z',
           event: 'message',
           topic: 'alerts',
           title: 'Backup failed',
@@ -173,13 +176,10 @@ describe('ntfyFetchMessages handler', () => {
           click: 'https://example.com',
           attachment: { name: 'log.txt', url: 'https://example.com/log.txt' },
           actions: [{ action: 'view', label: 'Open', url: 'https://example.com' }],
-          expires: 1700001000,
+          expires: '2023-11-14T22:30:00.000Z',
           sequence_id: 'seq_1',
         },
       ],
-      count: 1,
-      truncated: true,
-      filters: {},
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('Backup failed');
@@ -187,24 +187,25 @@ describe('ntfyFetchMessages handler', () => {
     expect(text).toContain('200 chars more');
     expect(text).toContain('log.txt');
     expect(text).toContain('seq_1');
-    expect(text).toContain('and more');
   });
 
-  it('echoes the resolved topic, since, and active filters in the empty-result message', () => {
-    const blocks = ntfyFetchMessages.format!({
+  it('enriches resolved topic/since/active filters and a notice on an empty result', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'fetch').mockResolvedValue([]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({
       topic: 'alerts',
       since: '10m',
-      messages: [],
-      count: 0,
-      truncated: false,
-      filters: { title: 'never-matches-xyz' },
+      title: 'never-matches-xyz',
     });
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('0');
-    expect(text).toContain('alerts');
-    expect(text).toContain('10m');
-    expect(text).toContain('never-matches-xyz');
-    expect(text.toLowerCase()).toContain('try');
+    const result = await ntfyFetchMessages.handler(input, ctx);
+    expect(result.messages).toHaveLength(0);
+
+    const e = getEnrichment(ctx);
+    expect(e).toMatchObject({ topic: 'alerts', since: '10m', count: 0, truncated: false });
+    expect(e.appliedFilters).toMatchObject({ title: 'never-matches-xyz' });
+    expect(e.notice).toContain('never-matches-xyz');
+    expect(String(e.notice).toLowerCase()).toContain('try');
   });
 
   it('applies the default `since` of `10m` when omitted', async () => {
@@ -212,9 +213,9 @@ describe('ntfyFetchMessages handler', () => {
     const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([]);
     const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
     const input = ntfyFetchMessages.input.parse({ topic: 'alerts' });
-    const result = await ntfyFetchMessages.handler(input, ctx);
+    await ntfyFetchMessages.handler(input, ctx);
     expect(fetch.mock.calls[0]?.[0].since).toBe('10m');
-    expect(result.since).toBe('10m');
+    expect(getEnrichment(ctx).since).toBe('10m');
   });
 
   it('uses NTFY_DEFAULT_TOPIC when topic is omitted', async () => {
@@ -223,9 +224,9 @@ describe('ntfyFetchMessages handler', () => {
     const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([]);
     const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
     const input = ntfyFetchMessages.input.parse({});
-    const result = await ntfyFetchMessages.handler(input, ctx);
+    await ntfyFetchMessages.handler(input, ctx);
     expect(fetch.mock.calls[0]?.[0].topic).toBe('fallback');
-    expect(result.topic).toBe('fallback');
+    expect(getEnrichment(ctx).topic).toBe('fallback');
   });
 
   it('throws ValidationError when neither topic nor NTFY_DEFAULT_TOPIC is set', async () => {
