@@ -1,8 +1,8 @@
 # Developer Protocol
 
 **Server:** ntfy-mcp-server
-**Version:** 2.0.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.1`
+**Version:** 2.1.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.16`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
 **Zod:** ^4.4.3
@@ -65,19 +65,30 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
       tag: z.string().describe('Short code.'),
       emoji: z.string().describe('Rendered Unicode emoji.'),
     })).describe('Tag → emoji rows.'),
-    total: z.number().describe('Total matches before truncation.'),
-    truncated: z.boolean().describe('True when more matches existed than `limit`.'),
   }),
+  // Agent-facing meta (parsed query, true total, truncation, empty-result
+  // notice) rides `enrichment` — both client surfaces, no `format()` entry.
+  enrichment: {
+    effectiveQuery: z.string().optional().describe('Query as the server parsed it.'),
+    totalCount: z.number().describe('Total matches before truncation.'),
+    truncated: z.boolean().describe('True when more matched than `limit`.'),
+    notice: z.string().optional().describe('Guidance when nothing matched.'),
+  },
 
-  handler(input) {
-    return getEmojiTagService().search(input.query, input.limit);
+  handler(input, ctx) {
+    const { matches, total, truncated } = getEmojiTagService().search(input.query, input.limit);
+    if (input.query) ctx.enrich.echo(input.query);
+    ctx.enrich.total(total);
+    ctx.enrich({ truncated });
+    if (matches.length === 0) ctx.enrich.notice('No tags matched — try a shorter substring.');
+    return { matches };
   },
 
   format: (result) => [{
     type: 'text',
     text: result.matches.length === 0
-      ? `No emoji tags matched (total: ${result.total}).`
-      : `${result.matches.map(m => `| \`${m.tag}\` | ${m.emoji} |`).join('\n')}`,
+      ? 'No emoji tags matched.'
+      : result.matches.map(m => `| \`${m.tag}\` | ${m.emoji} |`).join('\n'),
   }],
 });
 ```
@@ -207,6 +218,7 @@ Handlers receive a unified `ctx` object. Key properties this server uses today (
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. |
 | `ctx.signal` | `AbortSignal` forwarded into `NtfyService` calls so client cancellations propagate to upstream HTTP. |
 | `ctx.fail(reason, ...)` | Throw a typed contract failure declared in the tool's `errors[]` array. Pair with `ctx.recoveryFor(reason)` to attach the declared `recovery` hint to the wire payload. |
+| `ctx.enrich(...)` | Accumulate agent-facing success-path context (empty-result notices, query/filter echo, pagination totals) declared in a tool's `enrichment` block — reaches both `structuredContent` and `content[]`. Helpers: `.notice()`, `.total()`, `.echo()`. |
 | `ctx.requestId` | Unique request ID. Surfaces in logs and error payloads. |
 
 ---
@@ -312,10 +324,11 @@ Available skills:
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
 | `tool-defs-analysis` | Read-only audit of tool/resource/prompt definition language across the surface |
 | `security-pass` | Audit server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
+| `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
+| `git-wrapup` | Land working-tree changes as a versioned commit + annotated tag — version bump, changelog, verify, tag. Local only. |
 | `release-and-publish` | Run final verification, push commits/tags, publish to npm/MCP Registry/GHCR |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
-| `migrate-mcp-ts-template` | Migrate a legacy `mcp-ts-template` fork to `@cyanheads/mcp-ts-core` (one-shot) |
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
 | `report-issue-local` | File a bug or feature request against this server's own repo via `gh` CLI |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
@@ -364,7 +377,7 @@ Each per-version file opens with YAML frontmatter:
 
 ```markdown
 ---
-summary: "One-line headline, ≤250 chars"  # required — powers the rollup index
+summary: "One-line headline, ≤350 chars"  # required — powers the rollup index
 breaking: false                            # optional — true flags breaking changes
 security: false                            # optional — true flags security fixes
 ---
@@ -400,6 +413,7 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] `ctx.log` for logging, `ctx.signal` forwarded to upstream HTTP calls
 - [ ] Handlers throw on failure — `ctx.fail()` for declared contract reasons, error factories or plain `Error` for everything else; no defensive try/catch (the only `try`/`catch` in this codebase translates upstream errors into contract reasons before re-throwing)
 - [ ] `format()` renders all data the LLM needs — different clients forward different surfaces (Claude Code → `structuredContent`, Claude Desktop → `content[]`); both must carry the same data
+- [ ] Agent-facing meta (empty-result notices, query/filter echo, pagination totals) lives in an `enrichment` block populated via `ctx.enrich(...)`, not in `output` or `format()`-only text; enrichment keys disjoint from `output`
 - [ ] ntfy-specific: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
 - [ ] ntfy-specific: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] ntfy-specific: tests include at least one sparse payload case with omitted upstream fields

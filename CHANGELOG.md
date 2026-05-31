@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.1.0](changelog/2.1.x/2.1.0.md) — 2026-05-30
+
+Enrichment channel on read tools, error-code refinement, MCPB bundling, plugin manifests, framework ^0.9.16, and dev-dep bumps.
+
 ## [2.0.1](changelog/2.0.x/2.0.1.md) — 2026-05-16
 
 Adopts @cyanheads/mcp-ts-core ^0.9.1: URL string fields drop `format: uri` for OpenAI/Gemini portability, server `instructions` field added, devcheck `bun outdated` parser fixed.

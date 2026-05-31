@@ -1,10 +1,15 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-05-10 07:53:56
+Generated on: 2026-05-31 03:45:35
 
 ```text
 ntfy-mcp-server/
 ├── .claude/
+├── .claude-plugin/
+│   └── plugin.json
+├── .codex-plugin/
+│   ├── mcp.json
+│   └── plugin.json
 ├── .github/
 │   ├── ISSUE_TEMPLATE/
 │   │   ├── bug_report.yml
@@ -17,6 +22,7 @@ ntfy-mcp-server/
 ├── changelog/
 │   ├── 1.0.x/
 │   ├── 2.0.x/
+│   ├── 2.1.x/
 │   └── template.md
 ├── docs/
 │   ├── ntfy/
@@ -38,6 +44,8 @@ ntfy-mcp-server/
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
+│   ├── lint-packaging.ts
+│   ├── list-skills.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
 ├── skills/
@@ -83,13 +91,15 @@ ntfy-mcp-server/
 │   │   └── SKILL.md
 │   ├── api-workers/
 │   │   └── SKILL.md
+│   ├── code-simplifier/
+│   │   └── SKILL.md
 │   ├── design-mcp-server/
 │   │   └── SKILL.md
 │   ├── field-test/
 │   │   └── SKILL.md
-│   ├── maintenance/
+│   ├── git-wrapup/
 │   │   └── SKILL.md
-│   ├── migrate-mcp-ts-template/
+│   ├── maintenance/
 │   │   └── SKILL.md
 │   ├── polish-docs-meta/
 │   │   ├── references/
@@ -150,6 +160,8 @@ ntfy-mcp-server/
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
+├── .mcpbignore
+├── AGENTS.md
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
@@ -158,6 +170,7 @@ ntfy-mcp-server/
 ├── devcheck.config.json
 ├── Dockerfile
 ├── LICENSE
+├── manifest.json
 ├── package.json
 ├── README.md
 ├── server.json

@@ -1,0 +1,20 @@
+{
+  "name": "ntfy-mcp-server",
+  "version": "2.1.0",
+  "description": "Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/ntfy-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/ntfy-mcp-server",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "ntfy-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "ntfy-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
