@@ -19,6 +19,14 @@ breaking: false
 # `## Security` section below. Flagged as `Security` in the rollup so
 # users can triage upgrade urgency at a glance.
 security: false
+
+# Optional free-form notes for maintenance agents processing this release.
+# Not rendered in CHANGELOG — consumed by agents running `maintenance` on
+# downstream servers. Use for adoption instructions that don't fit the
+# human-facing sections: new files to create, fields to populate, one-time
+# migration steps. Omit the field entirely when there's nothing to say.
+# agent-notes: |
+#   <instructions for downstream maintenance agents>
 ---
 
 # <version> — YYYY-MM-DD
@@ -35,7 +43,7 @@ security: false
   name the symbol, state what changed, stop. Use a second sentence only when
   it carries weight. If a bullet feels long, it is.
 
-  Cut: mechanism walkthroughs (those belong in JSDoc, AGENTS.md, or the
+  Cut: mechanism walkthroughs (those belong in JSDoc, CLAUDE.md/AGENTS.md, or the
   relevant skill), ceremonial framings ("This release introduces…",
   backwards-compat paragraphs), file-by-file test enumerations, internal
   implementation notes. Prefer code/symbol names over English re-explanations.
@@ -66,6 +74,32 @@ security: false
   Never speculate on a future number — `#42` for an upcoming PR silently
   resolves to whatever real item already owns 42, and timeline previews pull
   in that unrelated item's metadata.
+
+  TAG ANNOTATIONS — the annotated tag body renders as the GitHub Release body
+  via `gh release create --notes-from-tag`. The tag is a derivative of this
+  changelog entry — a condensed, scannable version, not a copy. Format:
+
+    <theme — omit version number, GitHub prepends it>
+                                                          ← blank line
+    <1-2 sentence context: what this release does>
+                                                          ← blank line
+    Dependency bumps:                                     ← section header
+                                                          ← blank line
+    - `@cyanheads/mcp-ts-core` ^0.9.1 → ^0.9.6          ← bullet
+                                                          ← blank line
+    Changed:                                              ← only sections with entries
+                                                          ← blank line
+    - `format()` output includes `query` in text mode
+                                                          ← blank line
+    Added:
+                                                          ← blank line
+    - `manifest.json` scaffolded for MCPB bundle support
+    - Install badges (Claude Desktop, Cursor, VS Code)
+                                                          ← blank line
+    <N> tests pass; `bun run devcheck` clean.             ← footer
+
+  Never a flat comma-separated string. Always structured markdown with
+  sections. The tag must scan well as a rendered GitHub Release page.
 -->
 
 ## Added
