@@ -8,7 +8,7 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { forbidden } from '@cyanheads/mcp-ts-core/errors';
-
+import { shapeNtfyMessage } from '@/mcp-server/utils/ntfy-message-shape.js';
 import { getCode, getMessage, isAuthCode } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage } from '@/services/ntfy/types.js';
@@ -66,7 +66,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
       url: `${service.baseUrl}/${params.topic}`,
       baseUrl: service.baseUrl,
       since: SNAPSHOT_SINCE,
-      messages: slice,
+      messages: slice.map(shapeNtfyMessage),
       count: slice.length,
       truncated,
     };
