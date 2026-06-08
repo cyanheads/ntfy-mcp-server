@@ -343,11 +343,11 @@ describe('NtfyService.fetch request shape', () => {
     expect(url.searchParams.get('message')).toBe('disk full');
   });
 
-  it('URL-encodes the topic segment for comma-separated lists', async () => {
+  it('preserves comma-separated topics as separate ntfy subscriptions', async () => {
     const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
     const { calls } = captureFetch(ndjsonResponder(''));
     await svc.fetch({ topic: 'alerts,backups' });
-    expect(calls[0]?.url).toContain('/alerts%2Cbackups/json');
+    expect(new URL(calls[0]?.url ?? '').pathname).toBe('/alerts,backups/json');
   });
 
   it('parses NDJSON line-by-line, skipping malformed and blank lines', async () => {

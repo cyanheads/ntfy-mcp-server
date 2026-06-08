@@ -53,6 +53,10 @@ function trimTrailingSlash(url: string): string {
   return url.replace(/\/+$/, '');
 }
 
+function encodeTopicList(topic: string): string {
+  return topic.split(',').map(encodeURIComponent).join(',');
+}
+
 function buildAuthHeader(entry: NtfyServerEntry): string | undefined {
   if (entry.authToken) return `Bearer ${entry.authToken}`;
   if (entry.authUsername && entry.authPassword) {
@@ -202,7 +206,7 @@ export class NtfyService {
     if (params.title) search.set('title', params.title);
     if (params.message) search.set('message', params.message);
 
-    const url = `${base}/${encodeURIComponent(params.topic)}/json?${search.toString()}`;
+    const url = `${base}/${encodeTopicList(params.topic)}/json?${search.toString()}`;
 
     return await this.run(
       async (signal) => {
