@@ -51,18 +51,29 @@ describe('ntfyTopicResource handler', () => {
     const svc = freshService();
     vi.spyOn(svc, 'fetch').mockResolvedValue([
       { id: 'a', time: 1, event: 'open', topic: 'alerts' },
-      { id: 'b', time: 2, event: 'message', topic: 'alerts', message: 'hi' },
+      {
+        id: 'b',
+        time: 2,
+        expires: 3602,
+        event: 'message',
+        topic: 'alerts',
+        message: 'hi',
+      },
     ]);
     const ctx = createMockContext({ uri: new URL('ntfy://alerts') });
     const result = (await ntfyTopicResource.handler({ topic: 'alerts' }, ctx)) as {
       topic: string;
       url: string;
-      messages: unknown[];
+      messages: Array<{ time: string; expires?: string }>;
       count: number;
     };
     expect(result.topic).toBe('alerts');
     expect(result.url).toBe('https://ntfy.test/alerts');
     expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toMatchObject({
+      time: '1970-01-01T00:00:02.000Z',
+      expires: '1970-01-01T01:00:02.000Z',
+    });
     expect(result.count).toBe(1);
   });
 

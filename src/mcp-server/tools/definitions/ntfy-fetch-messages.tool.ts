@@ -13,6 +13,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 
 import { getServerConfig } from '@/config/server-config.js';
+import { MESSAGE_TRUNCATE_AT, shapeNtfyMessage } from '@/mcp-server/shared/ntfy-message.js';
 import {
   getCode,
   getMessage,
@@ -24,7 +25,6 @@ import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage, Priority } from '@/services/ntfy/types.js';
 
 const TOPIC_LIST_REGEX = /^[a-zA-Z0-9_-]+(?:,[a-zA-Z0-9_-]+)*$/;
-const MESSAGE_TRUNCATE_AT = 500;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
@@ -224,7 +224,6 @@ const OutputSchema = z.object({
 
 type Input = z.infer<typeof InputSchema>;
 type Output = z.infer<typeof OutputSchema>;
-type OutputMessage = Output['messages'][number];
 type FilterEcho = z.infer<typeof FilterEchoSchema>;
 
 function priorityLabel(p?: Priority): string {
@@ -240,38 +239,6 @@ function priorityLabel(p?: Priority): string {
     default:
       return 'default';
   }
-}
-
-function truncateMessage(body: string | undefined): {
-  message?: string;
-  messageTruncated?: number;
-} {
-  if (body === undefined) return {};
-  if (body.length <= MESSAGE_TRUNCATE_AT) return { message: body };
-  return {
-    message: body.slice(0, MESSAGE_TRUNCATE_AT),
-    messageTruncated: body.length - MESSAGE_TRUNCATE_AT,
-  };
-}
-
-function shapeMessage(raw: NtfyMessage): OutputMessage {
-  const truncation = truncateMessage(raw.message);
-  return {
-    id: raw.id,
-    time: new Date(raw.time * 1000).toISOString(),
-    event: raw.event as OutputMessage['event'],
-    topic: raw.topic,
-    expires: raw.expires !== undefined ? new Date(raw.expires * 1000).toISOString() : undefined,
-    sequence_id: raw.sequence_id,
-    title: raw.title,
-    message: truncation.message,
-    messageTruncated: truncation.messageTruncated,
-    priority: raw.priority,
-    tags: raw.tags,
-    click: raw.click,
-    actions: raw.actions as OutputMessage['actions'],
-    attachment: raw.attachment,
-  };
 }
 
 function filterSummary(f: FilterEcho | undefined): string {
@@ -435,7 +402,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       );
     }
 
-    return { messages: slice.map(shapeMessage) };
+    return { messages: slice.map(shapeNtfyMessage) };
   },
 
   format(result) {
