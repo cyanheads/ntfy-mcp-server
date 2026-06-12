@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.1.1](changelog/2.1.x/2.1.1.md) — 2026-06-11
+
+Adopt @cyanheads/mcp-ts-core ^0.10.6 — server identity pair, MCPB bundle cleaner, root-anchored .mcpbignore, plus dep bumps and identity-consistency fixes.
+
 ## [2.1.0](changelog/2.1.x/2.1.0.md) — 2026-05-30
 
 Enrichment channel on read tools, error-code refinement, MCPB bundling, plugin manifests, framework ^0.9.16, and dev-dep bumps.

@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "ntfy-mcp-server",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
