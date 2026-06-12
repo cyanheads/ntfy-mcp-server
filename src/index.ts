@@ -19,6 +19,8 @@ import { initEmojiTagService } from '@/services/emoji-tags/emoji-tag-service.js'
 import { initNtfyService } from '@/services/ntfy/ntfy-service.js';
 
 await createApp({
+  name: 'ntfy-mcp-server',
+  title: 'ntfy-mcp-server',
   tools: [ntfyPublishMessage, ntfyManageMessage, ntfyFetchMessages, ntfySearchEmojiTags],
   resources: [ntfyTopicResource],
   instructions:
