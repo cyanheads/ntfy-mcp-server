@@ -1,7 +1,7 @@
 /**
  * @fileoverview In-memory emoji-tag lookup service. Backed by the generated
  * table at `data.generated.ts`; supports substring search with a configurable
- * limit and exposes the original Markdown reference for the resource handler.
+ * limit and offset, plus direct tag → emoji lookup.
  * @module services/emoji-tags/emoji-tag-service
  */
 
@@ -28,18 +28,26 @@ export class EmojiTagService {
     this.byTag = new Map(entries);
   }
 
-  search(query: string | undefined, limit: number): EmojiSearchResult {
+  /**
+   * Substring search over the tag names in doc order.
+   *
+   * @param query - Case-insensitive substring; empty/omitted matches everything.
+   * @param limit - Rows to return from `offset`.
+   * @param offset - Rows to skip, so callers can page past `limit`.
+   */
+  search(query: string | undefined, limit: number, offset = 0): EmojiSearchResult {
     const needle = query?.trim().toLowerCase() ?? '';
     const all =
       needle.length === 0
         ? this.entries
         : this.entries.filter(([tag]) => tag.toLowerCase().includes(needle));
     const total = all.length;
-    const sliced = all.slice(0, Math.max(0, limit));
+    const start = Math.max(0, offset);
+    const sliced = all.slice(start, start + Math.max(0, limit));
     return {
       matches: sliced.map(([tag, emoji]) => ({ tag, emoji })),
       total,
-      truncated: total > sliced.length,
+      truncated: total > start + sliced.length,
     };
   }
 

@@ -1,10 +1,10 @@
 /**
  * @fileoverview `ntfy_search_emoji_tags` — substring search across the bundled
  * ntfy emoji short-code reference. Returns tag → emoji rows the agent can plug
- * into `ntfy_publish_message`'s `tags` field. The parsed query, true match
- * total, truncation flag, and empty-result guidance ride the `enrichment` block
- * so they reach both `structuredContent` and `content[]` without a `format()`
- * entry.
+ * into `ntfy_publish_message`'s `tags` field, paged by `limit`/`offset`. The
+ * parsed query, true match total, truncation flag, and empty-result or
+ * next-page guidance ride the `enrichment` block so they reach both
+ * `structuredContent` and `content[]` without a `format()` entry.
  * @module mcp-server/tools/definitions/ntfy-search-emoji-tags.tool
  */
 
@@ -20,7 +20,7 @@ const InputSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Substring to match against emoji tag names (case-insensitive). Omit to browse the curated default set.',
+      'Substring to match against emoji tag names (case-insensitive). Omit to list the reference from the start in its documented order.',
     ),
   limit: z
     .number()
@@ -29,6 +29,14 @@ const InputSchema = z.object({
     .max(MAX_LIMIT)
     .default(DEFAULT_LIMIT)
     .describe('Maximum number of matches to return. Default 25, max 200.'),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe(
+      'Number of matches to skip before returning `limit` rows. Use it with `totalCount` to page past the `limit` cap — the reference holds far more tags than one call can return.',
+    ),
 });
 
 const OutputSchema = z.object({
@@ -50,7 +58,7 @@ const OutputSchema = z.object({
 
 export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
   description:
-    "Look up ntfy emoji tag short codes. Use the returned `tag` strings in `ntfy_publish_message`'s `tags` field to render emojis on the recipient's device. Without a query, returns the first slice of the full reference; pass a substring (e.g., `warning`, `tada`, `cd`) to filter.",
+    "Look up ntfy emoji tag short codes. Use the returned `tag` strings in `ntfy_publish_message`'s `tags` field to render emojis on the recipient's device. Without a query, returns the first slice of the full reference; pass a substring (e.g., `warning`, `tada`, `cd`) to filter, and `offset` to page through matches beyond `limit`.",
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: InputSchema,
   output: OutputSchema,
@@ -62,28 +70,41 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
     effectiveQuery: z
       .string()
       .optional()
-      .describe('The query as the server parsed it; absent when browsing the default set.'),
-    totalCount: z.number().describe('Total matches before truncation to `limit`.'),
-    truncated: z.boolean().describe('True when more matches existed than `limit` allowed.'),
+      .describe('The query as the server parsed it; absent when no query was given.'),
+    totalCount: z.number().describe('Total matches before `limit`/`offset` were applied.'),
+    truncated: z
+      .boolean()
+      .describe('True when matches remain past this page — advance with `offset` to reach them.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no tags matched — echoes the query and suggests a shorter substring or the default set.',
+        'Guidance when no tags matched or matches remain unseen — echoes the query and names the next `offset` or a shorter substring.',
       ),
   },
 
   handler(input, ctx) {
-    const { matches, total, truncated } = getEmojiTagService().search(input.query, input.limit);
+    const { matches, total, truncated } = getEmojiTagService().search(
+      input.query,
+      input.limit,
+      input.offset,
+    );
 
     if (input.query) ctx.enrich.echo(input.query);
     ctx.enrich.total(total);
     ctx.enrich({ truncated });
     if (matches.length === 0) {
       ctx.enrich.notice(
-        input.query
-          ? `No emoji tags matched query \`${input.query}\`. Try a shorter substring or omit the query to browse the curated default set.`
-          : 'The default reference is empty — this should not happen; report it.',
+        input.offset >= total && total > 0
+          ? `\`offset\` ${input.offset} is past the last of ${total} matches — lower it to page back into range.`
+          : input.query
+            ? `No emoji tags matched query \`${input.query}\`. Try a shorter substring or omit the query to list the reference from the start.`
+            : 'The bundled reference is empty — this should not happen; report it.',
+      );
+    } else if (truncated) {
+      const next = input.offset + matches.length;
+      ctx.enrich.notice(
+        `Showing matches ${input.offset + 1}–${next} of ${total}. Pass \`offset: ${next}\` (same \`query\`) for the next page, or narrow the query.`,
       );
     }
 

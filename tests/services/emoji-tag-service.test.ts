@@ -1,8 +1,8 @@
 /**
  * @fileoverview Tests for the EmojiTagService — substring search, ordering,
- * truncation flag, direct lookup, edge-case query inputs (empty / whitespace /
- * zero-limit), the `size` getter, and the module-level init/get/reset
- * accessors that the framework wiring relies on.
+ * offset paging, truncation flag, direct lookup, edge-case query inputs (empty /
+ * whitespace / zero-limit / out-of-range offset), the `size` getter, and the
+ * module-level init/get/reset accessors that the framework wiring relies on.
  * @module tests/services/emoji-tag-service
  */
 
@@ -17,7 +17,7 @@ import {
 } from '@/services/emoji-tags/emoji-tag-service.js';
 
 describe('EmojiTagService', () => {
-  it('returns the curated default set when no query is given', () => {
+  it('returns the leading entries in doc order when no query is given', () => {
     const svc = new EmojiTagService([
       ['grinning', '😀'],
       ['smile', '😄'],
@@ -53,6 +53,57 @@ describe('EmojiTagService', () => {
     expect(result.matches).toHaveLength(10);
     expect(result.total).toBe(50);
     expect(result.truncated).toBe(true);
+  });
+
+  it('pages through every match with offset, ending with truncated=false', () => {
+    const svc = new EmojiTagService(
+      Array.from({ length: 5 }, (_, i) => [`alert_${i}`, '⚠️'] as const),
+    );
+
+    const first = svc.search('alert', 2, 0);
+    expect(first.matches.map((m) => m.tag)).toEqual(['alert_0', 'alert_1']);
+    expect(first.total).toBe(5);
+    expect(first.truncated).toBe(true);
+
+    const second = svc.search('alert', 2, 2);
+    expect(second.matches.map((m) => m.tag)).toEqual(['alert_2', 'alert_3']);
+    expect(second.truncated).toBe(true);
+
+    const last = svc.search('alert', 2, 4);
+    expect(last.matches.map((m) => m.tag)).toEqual(['alert_4']);
+    expect(last.total).toBe(5);
+    expect(last.truncated).toBe(false);
+  });
+
+  it('reaches entries past the limit cap that no query narrows to', () => {
+    const svc = new EmojiTagService(
+      Array.from({ length: 500 }, (_, i) => [`tag_${i}`, '⚠️'] as const),
+    );
+    const page = svc.search(undefined, 200, 400);
+    expect(page.matches).toHaveLength(100);
+    expect(page.matches[0]?.tag).toBe('tag_400');
+    expect(page.matches.at(-1)?.tag).toBe('tag_499');
+    expect(page.total).toBe(500);
+    expect(page.truncated).toBe(false);
+  });
+
+  it('returns nothing with truncated=false when offset lands past the last match', () => {
+    const svc = new EmojiTagService([
+      ['grinning', '😀'],
+      ['smile', '😄'],
+    ]);
+    const result = svc.search(undefined, 25, 10);
+    expect(result.matches).toEqual([]);
+    expect(result.total).toBe(2);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('defaults offset to 0 when omitted', () => {
+    const svc = new EmojiTagService([
+      ['grinning', '😀'],
+      ['smile', '😄'],
+    ]);
+    expect(svc.search(undefined, 1).matches).toEqual([{ tag: 'grinning', emoji: '😀' }]);
   });
 
   it('returns an empty result with truncated=false when nothing matches', () => {

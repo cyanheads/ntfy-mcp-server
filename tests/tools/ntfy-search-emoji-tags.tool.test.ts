@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tests for `ntfy_search_emoji_tags` — service wiring, default
- * limit, enrichment (query echo, total, truncation, empty-result notice), and
- * format-rendering of matches.
+ * limit, offset paging past the limit cap, enrichment (query echo, total,
+ * truncation, next-page and empty-result notices), and format-rendering of
+ * matches.
  * @module tests/tools/ntfy-search-emoji-tags.tool
  */
 
@@ -45,6 +46,62 @@ describe('ntfySearchEmojiTags handler', () => {
     const enrichment = getEnrichment(ctx);
     expect(enrichment.truncated).toBe(true);
     expect(enrichment.effectiveQuery).toBeUndefined();
+  });
+
+  it('reaches rows past the limit cap via offset and never repeats a row across pages', async () => {
+    const firstCtx = createMockContext();
+    const first = await ntfySearchEmojiTags.handler(
+      ntfySearchEmojiTags.input.parse({ limit: 200 }),
+      firstCtx,
+    );
+    const secondCtx = createMockContext();
+    const second = await ntfySearchEmojiTags.handler(
+      ntfySearchEmojiTags.input.parse({ limit: 200, offset: 200 }),
+      secondCtx,
+    );
+
+    expect(first.matches).toHaveLength(200);
+    expect(second.matches).toHaveLength(200);
+    const overlap = new Set(first.matches.map((m) => m.tag));
+    expect(second.matches.some((m) => overlap.has(m.tag))).toBe(false);
+    expect(getEnrichment(secondCtx).totalCount).toBe(getEnrichment(firstCtx).totalCount);
+  });
+
+  it('defaults offset to 0, so an unpaged call starts at the first row', async () => {
+    const ctx = createMockContext();
+    const input = ntfySearchEmojiTags.input.parse({ limit: 3 });
+    expect(input.offset).toBe(0);
+    const result = await ntfySearchEmojiTags.handler(input, ctx);
+    const offsetCtx = createMockContext();
+    const offsetResult = await ntfySearchEmojiTags.handler(
+      ntfySearchEmojiTags.input.parse({ limit: 3, offset: 0 }),
+      offsetCtx,
+    );
+    expect(result.matches).toEqual(offsetResult.matches);
+  });
+
+  it('names the next offset in the notice when matches remain past the page', async () => {
+    const ctx = createMockContext();
+    const input = ntfySearchEmojiTags.input.parse({ query: 'a', limit: 10, offset: 20 });
+    const result = await ntfySearchEmojiTags.handler(input, ctx);
+    expect(result.matches).toHaveLength(10);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.notice).toContain('offset: 30');
+    expect(enrichment.notice).toContain('21–30');
+  });
+
+  it('flags an offset past the last match and tells the caller to page back', async () => {
+    const ctx = createMockContext();
+    const input = ntfySearchEmojiTags.input.parse({ query: 'warning', offset: 5000 });
+    const result = await ntfySearchEmojiTags.handler(input, ctx);
+    expect(result.matches).toHaveLength(0);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(false);
+    expect(enrichment.notice).toContain('5000');
+    expect(String(enrichment.notice).toLowerCase()).toContain('lower it');
   });
 
   it('populates a notice that echoes the query and offers a recovery hint when nothing matched', async () => {
