@@ -159,10 +159,10 @@ No multi-call workflows — every tool maps to a single upstream HTTP request. T
 ```ts
 {
   id: string;                 // server-assigned message ID — use as sequence_id to update later
-  time: number;               // Unix seconds when ntfy accepted the message (not delivery time)
+  time: string;               // ISO 8601 — when ntfy accepted the message on an immediate publish; the scheduled delivery time (in the future) when `delay` was set
   topic: string;              // topic the message was published to
   url: string;                // human-readable topic URL (e.g., "https://ntfy.sh/mytopic"); SYNTHESIZED by the tool from `${baseUrl}/${topic}` — ntfy does not return this in its response
-  expires?: number;           // Unix seconds when the message ages out of server cache; ABSENT when published with cache: false
+  expires?: string;           // ISO 8601 when the message ages out of server cache; ABSENT when published with cache: false
   sequence_id?: string;       // ABSENT on a fresh publish; PRESENT only when the call updated an earlier message and the input sequence_id differed from the new id
   scheduled?: boolean;        // true ONLY when `delay` was set and the message is queued for later delivery; ABSENT/false on immediate publishes
   title?: string;             // echo of input title; ABSENT when not set (recipient defaults to the topic URL)
@@ -221,10 +221,10 @@ Single round trip — no streaming.
 {
   messages: Array<{
     id: string;                   // message ID — pass back as `since` to paginate or as `sequence_id` to manage
-    time: number;                 // Unix seconds when ntfy accepted the message
+    time: string;                 // ISO 8601 timestamp when ntfy accepted the message
     event: 'message' | 'message_clear' | 'message_delete' | 'poll_request';
     topic: string;                // matching topic (one of the requested topics on multi-topic queries)
-    expires?: number;             // Unix seconds when the message ages out of cache; ABSENT when published with cache: false
+    expires?: string;             // ISO 8601 when the message ages out of cache; ABSENT when published with cache: false
     sequence_id?: string;         // PRESENT on update / clear / delete events pointing back to the original message; ABSENT on initial publishes
     title?: string;               // ABSENT when no title was set (recipient clients fall back to the topic URL)
     message?: string;             // ABSENT on clear/delete events; truncated to ~500 chars when the body is longer, unless the call pinned one message via `id`
@@ -235,12 +235,12 @@ Single round trip — no streaming.
     actions?: Action[];           // same shape as the publish input's `actions`; ABSENT when none
     attachment?: { name: string; url: string; type?: string; size?: number; expires?: number };  // ABSENT when no attachment
   }>;
-  count: number;                  // number of messages returned in this response
-  truncated: boolean;             // true when more messages matched than `limit`; the newest `limit` were kept and the older head dropped — raise `limit`, use a tighter `since`, or use `id` to target a specific message
 }
 ```
 
-The tool filters out `open` and `keepalive` events client-side (they're connection-level frames, not notification data). `format()` renders a compact list — id, event type, title, priority badge, tag chips, and the (possibly truncated) message body — with `(N chars more)` suffix on truncated messages and an `…and X more` footer when `truncated` is true. Every output field above appears in the rendered text.
+**Enrichment** (merged into `structuredContent` and mirrored as a `content[]` trailer, never authored into `format()`): `topic` and `since` echo the resolved values (useful when `NTFY_DEFAULT_TOPIC` or the `10m` default filled in), `appliedFilters` echoes the active filter inputs (absent when none were set), `count` is the number of messages returned, `truncated` is true when more matched than `limit` — the newest `limit` were kept and the older head dropped, so widen `limit`, use a tighter `since`, or target a specific message by `id` — and `notice` carries guidance on empty or truncated results.
+
+The tool filters out `open` and `keepalive` events client-side (they're connection-level frames, not notification data). `format()` renders a compact list — id, event type, title, priority badge, tag chips, and the (possibly truncated) message body — with a `(N chars more)` suffix on truncated messages. Every output field above appears in the rendered text.
 
 **Errors:**
 
@@ -253,9 +253,11 @@ The tool filters out `open` and `keepalive` events client-side (they're connecti
 
 Inputs: `query?: string` (substring match against tag name), `limit?: number` (default 25, max 200), `offset?: number` (default 0 — pages through matches past the `limit` cap; the reference holds far more tags than one call returns).
 
-Output: `{ matches: Array<{ tag: string; emoji: string }>, total: number, truncated: boolean }`. The bundled `docs/ntfy/emojis.md` is a flat tag→emoji list — no aliases or categories to surface.
+Output: `{ matches: Array<{ tag: string; emoji: string }> }`. The bundled `docs/ntfy/emojis.md` is a flat tag→emoji list — no aliases or categories to surface.
 
-`format()` renders a Markdown table of `tag` → `emoji` rows, with a footer noting `total` matches and any `truncated` overflow.
+**Enrichment:** `effectiveQuery` (the query as parsed, absent when none was given), `totalCount` (matches before `limit`/`offset`), `truncated` (matches remain past this page — advance with `offset`), and `notice` (guidance when nothing matched or matches remain unseen).
+
+`format()` renders a Markdown table of `tag` → `emoji` rows — header plus rows, no footer.
 
 No domain failure modes — input validation and out-of-the-box errors only.
 
