@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-07-30 01:10:27
+Generated on: 2026-07-30 03:19:52
 
 ```text
 ntfy-mcp-server/
@@ -26,6 +26,7 @@ ntfy-mcp-server/
 │   ├── 2.0.x/
 │   ├── 2.1.x/
 │   ├── 2.2.x/
+│   ├── 2.3.x/
 │   └── template.md
 ├── docs/
 │   ├── ntfy/
@@ -148,16 +149,19 @@ ntfy-mcp-server/
 │   │   │   └── definitions/
 │   │   │       └── ntfy-topic.resource.ts
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── ntfy-fetch-messages.tool.ts
-│   │           ├── ntfy-manage-message.tool.ts
-│   │           ├── ntfy-publish-message.tool.ts
-│   │           └── ntfy-search-emoji-tags.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── ntfy-fetch-messages.tool.ts
+│   │       │   ├── ntfy-manage-message.tool.ts
+│   │       │   ├── ntfy-publish-message.tool.ts
+│   │       │   └── ntfy-search-emoji-tags.tool.ts
+│   │       └── utils/
+│   │           └── confirm-action.ts
 │   ├── services/
 │   │   ├── emoji-tags/
 │   │   │   ├── data.generated.ts
 │   │   │   └── emoji-tag-service.ts
 │   │   └── ntfy/
+│   │       ├── base-url-guard.ts
 │   │       ├── error-classifier.ts
 │   │       ├── message-shape.ts
 │   │       ├── ntfy-service.ts
@@ -170,6 +174,7 @@ ntfy-mcp-server/
 │   │   └── ntfy-topic.resource.test.ts
 │   ├── services/
 │   │   ├── ntfy/
+│   │   │   ├── base-url-guard.test.ts
 │   │   │   ├── error-classifier.test.ts
 │   │   │   └── ntfy-service.test.ts
 │   │   └── emoji-tag-service.test.ts

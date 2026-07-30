@@ -2,8 +2,10 @@
  * @fileoverview Tests for `NtfyService` — multi-server auth resolution, the
  * request-shape contract for publish/manage/fetch (URL, method, headers,
  * body), NDJSON parsing edge cases, upstream error propagation including the
- * JSON error body folded into the message, and the module-level
- * init/get/reset accessors.
+ * JSON error body folded into the message, the module-level init/get/reset
+ * accessors, and `base_url` override validation — the always-on absolute
+ * http(s) check plus the opt-in private-host guard, its registered-base bypass,
+ * and its redirect refusal.
  * @module tests/services/ntfy/ntfy-service
  */
 
@@ -20,11 +22,12 @@ import {
 
 const PUBLISH_BODY = { topic: 'alerts', message: 'hi' } as const;
 
-function makeConfig(servers: ServerConfig['servers']): ServerConfig {
+function makeConfig(servers: ServerConfig['servers'], blockPrivateHosts = false): ServerConfig {
   return {
     servers,
     requestTimeoutMs: 1000,
     maxRetries: 0,
+    blockPrivateHosts,
   };
 }
 
@@ -33,6 +36,7 @@ interface CapturedCall {
   body: string | undefined;
   headers: Record<string, string>;
   method: string | undefined;
+  redirect: string | undefined;
   url: string;
 }
 
@@ -53,6 +57,7 @@ function captureFetch(
         headers,
         auth: headers.Authorization,
         body: typeof init?.body === 'string' ? init.body : undefined,
+        redirect: init?.redirect,
       };
       calls.push(call);
       return responder(call) as unknown as Response;
@@ -146,6 +151,136 @@ describe('NtfyService multi-server', () => {
     expect(
       () => new NtfyService({ servers: [], requestTimeoutMs: 1000, maxRetries: 0 } as never),
     ).toThrow(/at least one entry/i);
+  });
+});
+
+describe('NtfyService base_url validation (always on)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(['ftp://ntfy.example.com', 'file:///etc/passwd', 'ntfy.example.com', '/alerts'])(
+    'rejects the %j override before any request goes out, with the guard off',
+    async (baseUrl) => {
+      const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+      const { calls } = captureFetch();
+      await expect(svc.publish(PUBLISH_BODY, { baseUrl })).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+      });
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  it('applies the same check on the manage and fetch paths', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    const { calls } = captureFetch();
+    await expect(
+      svc.manage('alerts', 'seq_1', 'clear', { baseUrl: 'ftp://ntfy.example.com' }),
+    ).rejects.toThrow(/unsupported scheme/i);
+    await expect(svc.fetch({ topic: 'alerts' }, { baseUrl: 'not-a-url' })).rejects.toThrow(
+      /not an absolute URL/i,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('leaves the configured base untouched when no override is passed', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    const { calls } = captureFetch();
+    await svc.publish(PUBLISH_BODY);
+    expect(calls[0]?.url).toBe('https://ntfy.test/');
+    expect(calls[0]?.redirect).toBeUndefined();
+  });
+});
+
+describe('NtfyService private-host guard (NTFY_BLOCK_PRIVATE_HOSTS)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('sends a loopback override unchanged while the flag is off', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    const { calls } = captureFetch();
+    await svc.publish(PUBLISH_BODY, { baseUrl: 'http://127.0.0.1:8080' });
+    expect(calls[0]?.url).toBe('http://127.0.0.1:8080/');
+    expect(calls[0]?.redirect).toBeUndefined();
+  });
+
+  it.each([
+    'http://127.0.0.1:8080',
+    'http://169.254.169.254',
+    'http://[::1]:8080',
+    'http://100.68.34.90:8080',
+    'http://2130706433:8080',
+  ])('blocks the unregistered %j override while the flag is on', async (baseUrl) => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }], true));
+    const { calls } = captureFetch();
+    await expect(svc.publish(PUBLISH_BODY, { baseUrl })).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('non-public'),
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('allows a private base that the operator registered', async () => {
+    const svc = new NtfyService(
+      makeConfig([{ baseUrl: 'https://ntfy.test' }, { baseUrl: 'http://192.168.1.10:8080' }], true),
+    );
+    const { calls } = captureFetch();
+    await svc.publish(PUBLISH_BODY, { baseUrl: 'http://192.168.1.10:8080' });
+    expect(calls[0]?.url).toBe('http://192.168.1.10:8080/');
+  });
+
+  it('covers a registered private base with no credentials of its own', async () => {
+    // `authByBase` holds only credentialed entries — the bypass set must not be
+    // sourced from it, or a no-auth LAN server would fail its own guard.
+    const svc = new NtfyService(
+      makeConfig(
+        [{ baseUrl: 'https://ntfy.test', authToken: 'tk_primary' }, { baseUrl: 'http://10.0.0.5' }],
+        true,
+      ),
+    );
+    const { calls } = captureFetch();
+    await svc.publish(PUBLISH_BODY, { baseUrl: 'http://10.0.0.5' });
+    expect(calls[0]?.url).toBe('http://10.0.0.5/');
+    expect(calls[0]?.auth).toBeUndefined();
+  });
+
+  it('allows a private configured default with no override', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'http://192.168.1.10:8080' }], true));
+    const { calls } = captureFetch();
+    await svc.fetch({ topic: 'alerts' });
+    expect(calls[0]?.url.startsWith('http://192.168.1.10:8080/alerts/json')).toBe(true);
+    expect(calls[0]?.redirect).toBeUndefined();
+  });
+
+  it('refuses redirects on a guarded public override', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }], true));
+    const { calls } = captureFetch();
+    await svc.publish(PUBLISH_BODY, { baseUrl: 'https://1.1.1.1' });
+    expect(calls[0]?.redirect).toBe('error');
+  });
+
+  it('names the refused redirect instead of reporting a network fault', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }], true));
+    captureFetch(() => {
+      // The shape both runtimes produce for `redirect: 'error'`: Node nests
+      // "unexpected redirect" under `cause`, Bun words it at the top level.
+      throw new TypeError('fetch failed', { cause: new Error('unexpected redirect') });
+    });
+    await expect(svc.publish(PUBLISH_BODY, { baseUrl: 'https://1.1.1.1' })).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('redirects are not followed'),
+    });
+  });
+
+  it('leaves a genuine transport failure on the guarded path alone', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }], true));
+    captureFetch(() => {
+      throw new TypeError('fetch failed', { cause: new Error('ECONNREFUSED') });
+    });
+    await expect(svc.publish(PUBLISH_BODY, { baseUrl: 'https://1.1.1.1' })).rejects.toThrow(
+      /fetch failed/,
+    );
   });
 });
 

@@ -2,7 +2,8 @@
  * @fileoverview `ntfy_manage_message` — clears or deletes a previously-sent
  * notification by `sequence_id`. Append-only: the original message stays in
  * cache; subscribers receive a `message_clear` or `message_delete` event and
- * update the notification accordingly.
+ * update the notification accordingly. Both operations pass through a
+ * user-confirmation gate when the client supports elicitation.
  * @module mcp-server/tools/definitions/ntfy-manage-message.tool
  */
 
@@ -10,6 +11,12 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 
 import { getServerConfig } from '@/config/server-config.js';
+import { confirmAction } from '@/mcp-server/tools/utils/confirm-action.js';
+import {
+  BASE_URL_HINT,
+  BASE_URL_PATTERN,
+  normalizeBaseOverride,
+} from '@/services/ntfy/base-url-guard.js';
 import {
   getCode,
   getMessage,
@@ -44,9 +51,10 @@ const InputSchema = z.object({
     ),
   base_url: z
     .string()
+    .regex(BASE_URL_PATTERN, BASE_URL_HINT)
     .optional()
     .describe(
-      'Override the configured `NTFY_BASE_URL` for this call (absolute URL). When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override the configured `NTFY_BASE_URL` for this call — an absolute `http(s)://` URL. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
     ),
 });
 
@@ -64,7 +72,7 @@ const OutputSchema = z.object({
 
 export const ntfyManageMessage = tool('ntfy_manage_message', {
   description:
-    'Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only: the original message stays in cache and a `message_clear`/`message_delete` event is emitted to subscribers. Re-issuing the same operation is safe — message state does not change, but a fresh event fires each time. ntfy.sh accepts unknown sequence IDs without error; stricter ntfy variants surface a `not_found` failure.',
+    'Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only: the original message stays in cache and a `message_clear`/`message_delete` event is emitted to subscribers. Re-issuing the same operation is safe — message state does not change, but a fresh event fires each time. ntfy.sh accepts unknown sequence IDs without error; stricter ntfy variants surface a `not_found` failure. Clients that support elicitation prompt the user to confirm the topic, `sequence_id`, and operation first, and the call fails with `consent_declined` if they say no.',
   annotations: {
     destructiveHint: true,
     idempotentHint: true,
@@ -74,6 +82,13 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
   output: OutputSchema,
 
   errors: [
+    {
+      reason: 'consent_declined',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'The user was asked to confirm the clear/delete and declined, cancelled, or answered with a payload that did not parse.',
+      recovery:
+        'Check with the user which message they meant, then reissue the call with the corrected `topic` and `sequence_id` — do not retry the same arguments unchanged.',
+    },
     {
       reason: 'forbidden_topic',
       code: JsonRpcErrorCode.Forbidden,
@@ -109,7 +124,24 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       });
     }
 
-    const overrideBase = input.base_url?.replace(/\/+$/, '');
+    const consent = await confirmAction(
+      ctx,
+      `${input.operation === 'clear' ? 'Clear' : 'Delete'} ntfy notification \`${input.sequence_id}\` on topic \`${topic}\`? Subscribers receive a message_${input.operation} event.`,
+    );
+    if (consent === 'declined') {
+      throw ctx.fail(
+        'consent_declined',
+        `The ${input.operation} of ${input.sequence_id} on topic ${topic} was not confirmed.`,
+        { ...ctx.recoveryFor('consent_declined') },
+      );
+    }
+    if (consent === 'unsupported') {
+      ctx.log.notice('Proceeding without confirmation — client does not support elicitation', {
+        operation: input.operation,
+      });
+    }
+
+    const overrideBase = normalizeBaseOverride(input.base_url);
 
     let response: NtfyManageResponse;
     try {

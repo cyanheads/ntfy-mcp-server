@@ -16,9 +16,15 @@ import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors
 
 import { getServerConfig } from '@/config/server-config.js';
 import {
+  BASE_URL_HINT,
+  BASE_URL_PATTERN,
+  normalizeBaseOverride,
+} from '@/services/ntfy/base-url-guard.js';
+import {
   getCode,
   getMessage,
   isAuthCode,
+  isBaseUrlRejection,
   isInvalidParamsCode,
   isUpstreamUnreachable,
 } from '@/services/ntfy/error-classifier.js';
@@ -150,9 +156,10 @@ const InputSchema = z.object({
     ),
   base_url: z
     .string()
+    .regex(BASE_URL_PATTERN, BASE_URL_HINT)
     .optional()
     .describe(
-      'Override `NTFY_BASE_URL` for this call (absolute URL). When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override `NTFY_BASE_URL` for this call — an absolute `http(s)://` URL. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
     ),
 });
 
@@ -338,7 +345,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       });
     }
 
-    const overrideBase = input.base_url?.replace(/\/+$/, '');
+    const overrideBase = normalizeBaseOverride(input.base_url);
 
     let raw: NtfyMessage[];
     try {
@@ -357,6 +364,9 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
         { baseUrl: overrideBase, signal: ctx.signal },
       );
     } catch (err) {
+      // A locally-rejected `base_url` already carries its own message and hint;
+      // the branches below speak for ntfy, not for this server.
+      if (isBaseUrlRejection(err)) throw err;
       const code = getCode(err);
       const msg = getMessage(err);
       if (isAuthCode(code)) {

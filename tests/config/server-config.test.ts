@@ -4,7 +4,8 @@
  * mutual exclusion of token vs basic auth, trailing-slash stripping, the
  * precedence of NTFY_SERVERS over the shorthand vars when both are set, the
  * deprecated NTFY_API_KEY alias, defaultTopic / numeric-coercion validation,
- * and the memoization behavior of `getServerConfig` / `resetServerConfig`.
+ * the NTFY_BLOCK_PRIVATE_HOSTS boolean flag, and the memoization behavior of
+ * `getServerConfig` / `resetServerConfig`.
  * @module tests/config/server-config
  */
 
@@ -22,6 +23,7 @@ const KEYS = [
   'NTFY_AUTH_PASSWORD',
   'NTFY_REQUEST_TIMEOUT_MS',
   'NTFY_MAX_RETRIES',
+  'NTFY_BLOCK_PRIVATE_HOSTS',
 ] as const;
 
 describe('getServerConfig', () => {
@@ -198,6 +200,32 @@ describe('getServerConfig', () => {
     it('rejects a negative max-retries value', () => {
       process.env.NTFY_MAX_RETRIES = '-1';
       expect(() => getServerConfig()).toThrow();
+    });
+  });
+
+  describe('NTFY_BLOCK_PRIVATE_HOSTS', () => {
+    it('defaults to off so existing deployments are unaffected', () => {
+      expect(getServerConfig().blockPrivateHosts).toBe(false);
+    });
+
+    it.each(['true', '1', 'yes', 'on'])('reads %j as on', (value) => {
+      process.env.NTFY_BLOCK_PRIVATE_HOSTS = value;
+      expect(getServerConfig().blockPrivateHosts).toBe(true);
+    });
+
+    it.each(['false', '0', 'no', 'off'])('reads %j as off', (value) => {
+      process.env.NTFY_BLOCK_PRIVATE_HOSTS = value;
+      expect(getServerConfig().blockPrivateHosts).toBe(false);
+    });
+
+    it('treats an empty value as unset rather than a parse failure', () => {
+      process.env.NTFY_BLOCK_PRIVATE_HOSTS = '';
+      expect(getServerConfig().blockPrivateHosts).toBe(false);
+    });
+
+    it('names the env var when the value is not a recognized boolean', () => {
+      process.env.NTFY_BLOCK_PRIVATE_HOSTS = 'maybe';
+      expect(() => getServerConfig()).toThrow(/NTFY_BLOCK_PRIVATE_HOSTS/);
     });
   });
 

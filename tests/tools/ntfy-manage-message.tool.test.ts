@@ -2,7 +2,10 @@
  * @fileoverview Tests for `ntfy_manage_message` — clear and delete dispatch,
  * reason mapping (not_found / forbidden_topic / upstream_unreachable / generic
  * rethrow), default-topic resolution, missing-topic ValidationError,
- * base_url override, and format() rendering for both operations.
+ * base_url override plus its scheme validation, format() rendering for both
+ * operations, and the consent gate — prompt contents, every declining reply,
+ * the proceed-anyway path on clients without elicitation, and a failing
+ * elicitation call.
  * @module tests/tools/ntfy-manage-message.tool
  */
 
@@ -222,6 +225,40 @@ describe('ntfyManageMessage handler', () => {
     expect(manage.mock.calls[0]?.[3]).toMatchObject({ baseUrl: 'https://other.example.com' });
   });
 
+  it.each(['ftp://ntfy.example.com', 'ntfy.example.com', 'https://ntfy example.com'])(
+    'rejects the %j base_url at the schema boundary',
+    (base_url) => {
+      expect(() =>
+        ntfyManageMessage.input.parse({
+          topic: 'alerts',
+          sequence_id: 'seq_1',
+          operation: 'clear',
+          base_url,
+        }),
+      ).toThrow();
+    },
+  );
+
+  it('treats an empty `base_url` from a form client as no override', async () => {
+    const svc = freshService();
+    const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
+      id: 'evt_5',
+      time: 1700000000,
+      event: 'message_clear',
+      topic: 'alerts',
+      sequence_id: 'seq_5',
+    });
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_5',
+      operation: 'clear',
+      base_url: '',
+    });
+    await ntfyManageMessage.handler(input, ctx);
+    expect(manage.mock.calls[0]?.[3]).toMatchObject({ baseUrl: undefined });
+  });
+
   it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(new Error('econnreset (failed after 3 attempts)'));
@@ -248,5 +285,96 @@ describe('ntfyManageMessage handler', () => {
     await expect(ntfyManageMessage.handler(input, ctx)).rejects.not.toMatchObject({
       data: expect.objectContaining({ reason: expect.any(String) }),
     });
+  });
+});
+
+describe('ntfyManageMessage consent gate', () => {
+  beforeEach(() => {
+    resetServerConfig();
+    resetNtfyService();
+    for (const k of ENV_KEYS) delete process.env[k];
+    process.env.NTFY_BASE_URL = 'https://ntfy.test';
+  });
+  afterEach(() => {
+    for (const k of ENV_KEYS) delete process.env[k];
+    resetServerConfig();
+    resetNtfyService();
+    vi.restoreAllMocks();
+  });
+
+  function stubbedManage() {
+    return vi.spyOn(freshService(), 'manage').mockResolvedValue({
+      id: 'evt_1',
+      time: 1700000000,
+      event: 'message_delete',
+      topic: 'alerts',
+      sequence_id: 'seq_1',
+    });
+  }
+
+  const input = () =>
+    ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_1',
+      operation: 'delete',
+    });
+
+  it('names the topic, sequence_id, and operation in the prompt', async () => {
+    const manage = stubbedManage();
+    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors, elicit });
+
+    await ntfyManageMessage.handler(input(), ctx);
+
+    const prompt = elicit.mock.calls[0]?.[0] as string;
+    expect(prompt).toContain('alerts');
+    expect(prompt).toContain('seq_1');
+    expect(prompt).toMatch(/delete/i);
+    expect(manage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['decline', { action: 'decline' }],
+    ['cancel', { action: 'cancel' }],
+    ['accept with confirm=false', { action: 'accept', content: { confirm: false } }],
+    ['accept with a missing confirm', { action: 'accept', content: {} }],
+    ['accept with a stringified boolean', { action: 'accept', content: { confirm: 'true' } }],
+    ['accept with no content at all', { action: 'accept' }],
+  ])(
+    'fails with `consent_declined` on %s, without touching the upstream',
+    async (_label, reply) => {
+      const manage = stubbedManage();
+      const ctx = createMockContext({
+        errors: ntfyManageMessage.errors,
+        elicit: vi.fn().mockResolvedValue(reply),
+      });
+
+      await expect(ntfyManageMessage.handler(input(), ctx)).rejects.toMatchObject({
+        data: { reason: 'consent_declined' },
+      });
+      expect(manage).not.toHaveBeenCalled();
+    },
+  );
+
+  it('proceeds when the client does not support elicitation', async () => {
+    const manage = stubbedManage();
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    expect(ctx.elicit).toBeUndefined();
+
+    await ntfyManageMessage.handler(input(), ctx);
+    expect(manage).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails the call when an advertised elicitation errors out', async () => {
+    const manage = stubbedManage();
+    const ctx = createMockContext({
+      errors: ntfyManageMessage.errors,
+      elicit: vi.fn().mockRejectedValue(new Error('client transport closed')),
+    });
+
+    await expect(ntfyManageMessage.handler(input(), ctx)).rejects.toThrow(
+      /client transport closed/,
+    );
+    expect(manage).not.toHaveBeenCalled();
   });
 });

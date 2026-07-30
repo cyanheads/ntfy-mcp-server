@@ -3,7 +3,10 @@
  * upstream, default-topic resolution, the priority schema's single-node
  * validation and advertised shape, byte-length message validation,
  * format-rendering (including the scheduled delivery-time label), scheduled-flag
- * synthesis, base_url override, and the full contract error mapping
+ * synthesis, base_url override and its scheme validation, the consent gate
+ * (which inputs prompt, which do not, every declining reply, and the
+ * proceed-anyway path on clients without elicitation), and the full contract
+ * error mapping
  * (forbidden / rate-limit / payload-too-large from a 413 / invalid-attachment /
  * unverified-contact / upstream-unreachable / generic rethrow) with the upstream
  * explanation preserved on the error message.
@@ -18,6 +21,7 @@ import {
   McpError,
   notFound,
   rateLimited,
+  validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -400,6 +404,55 @@ describe('ntfyPublishMessage handler', () => {
     expect(result.url).toBe('https://other.example.com/alerts');
   });
 
+  it('passes a rejected `base_url` through even when it reads like another failure', async () => {
+    const svc = freshService();
+    // The rejection message embeds the URL, and the upstream 4xx classifier
+    // matches on keywords like "email" — a locally-rejected base_url must not
+    // land on `unverified_contact`.
+    vi.spyOn(svc, 'publish').mockRejectedValue(
+      validationError(
+        'base_url host email.internal.example.com resolves to a non-public address (10.0.0.9)',
+        { baseUrlRejected: true, recovery: { hint: 'Target a publicly reachable ntfy server' } },
+      ),
+    );
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'hi',
+      base_url: 'http://email.internal.example.com',
+    });
+    const err = await ntfyPublishMessage.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({ message: expect.stringContaining('non-public address') });
+    expect((err as { data?: { reason?: string } }).data?.reason).toBeUndefined();
+  });
+
+  it.each(['ftp://ntfy.example.com', 'ntfy.example.com', 'https://ntfy example.com'])(
+    'rejects the %j base_url at the schema boundary',
+    (base_url) => {
+      expect(() =>
+        ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'hi', base_url }),
+      ).toThrow();
+    },
+  );
+
+  it('falls back to the configured base when a form client sends an empty `base_url`', async () => {
+    const svc = freshService();
+    const publish = vi.spyOn(svc, 'publish').mockResolvedValue({
+      id: 'mid_47',
+      time: 1700000000,
+      topic: 'alerts',
+    });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'hi',
+      base_url: '',
+    });
+    const result = await ntfyPublishMessage.handler(input, ctx);
+    expect(publish.mock.calls[0]?.[1]).toMatchObject({ baseUrl: undefined });
+    expect(result.url).toBe('https://ntfy.test/alerts');
+  });
+
   it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'publish').mockRejectedValue(
@@ -448,5 +501,142 @@ describe('ntfyPublishMessage handler', () => {
     // the accept time an unscheduled publish reports in the same slot.
     expect(text).toContain('Delivers: 2026-07-28T13:00:13.000Z');
     expect(text).not.toContain('Time:');
+  });
+});
+
+describe('ntfyPublishMessage consent gate', () => {
+  beforeEach(() => {
+    resetServerConfig();
+    resetNtfyService();
+    for (const k of ENV_KEYS) delete process.env[k];
+    process.env.NTFY_BASE_URL = 'https://ntfy.test';
+  });
+  afterEach(() => {
+    for (const k of ENV_KEYS) delete process.env[k];
+    resetServerConfig();
+    resetNtfyService();
+    vi.restoreAllMocks();
+  });
+
+  function stubbedPublish() {
+    return vi.spyOn(freshService(), 'publish').mockResolvedValue({
+      id: 'mid_1',
+      time: 1700000000,
+      topic: 'alerts',
+    });
+  }
+
+  const HTTP_ACTION = {
+    action: 'http',
+    label: 'Acknowledge',
+    url: 'https://example.com/ack',
+    method: 'DELETE',
+  } as const;
+  const BROADCAST_ACTION = { action: 'broadcast', label: 'Run macro' } as const;
+
+  it.each([
+    ['email forwarding', { email: 'ops@example.com' }, 'ops@example.com'],
+    ['a voice call', { call: '+15551234567' }, '+15551234567'],
+    ['a broadcast action', { actions: [BROADCAST_ACTION] }, 'broadcast intent'],
+    ['an http action', { actions: [HTTP_ACTION] }, 'https://example.com/ack'],
+  ])('prompts for %s and names the target', async (_label, extra, expected) => {
+    const publish = stubbedPublish();
+    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
+
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'hi', ...extra });
+    await ntfyPublishMessage.handler(input, ctx);
+
+    expect(elicit).toHaveBeenCalledOnce();
+    const prompt = elicit.mock.calls[0]?.[0] as string;
+    expect(prompt).toContain('alerts');
+    expect(prompt).toContain(expected);
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it('names the method of an http action button', async () => {
+    stubbedPublish();
+    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'hi',
+      actions: [HTTP_ACTION],
+    });
+    await ntfyPublishMessage.handler(input, ctx);
+    expect(elicit.mock.calls[0]?.[0]).toContain('HTTP DELETE');
+  });
+
+  it('lists every side effect when a publish carries more than one', async () => {
+    stubbedPublish();
+    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'hi',
+      email: 'ops@example.com',
+      call: '+15551234567',
+      actions: [HTTP_ACTION],
+    });
+    await ntfyPublishMessage.handler(input, ctx);
+    const prompt = elicit.mock.calls[0]?.[0] as string;
+    expect(prompt).toContain('ops@example.com');
+    expect(prompt).toContain('+15551234567');
+    expect(prompt).toContain('https://example.com/ack');
+  });
+
+  it.each([
+    ['a plain notification', {}],
+    ['a title, tags, and a priority', { title: 'Heads up', tags: ['warning'], priority: 5 }],
+    ['a click URL', { click: 'https://example.com/dashboard' }],
+    ['a view action', { actions: [{ action: 'view', label: 'Open', url: 'https://example.com' }] }],
+    ['a copy action', { actions: [{ action: 'copy', label: 'Copy', value: 'token' }] }],
+  ])('does not prompt for %s', async (_label, extra) => {
+    const publish = stubbedPublish();
+    const elicit = vi.fn();
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
+
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'hi', ...extra });
+    await ntfyPublishMessage.handler(input, ctx);
+
+    expect(elicit).not.toHaveBeenCalled();
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['decline', { action: 'decline' }],
+    ['cancel', { action: 'cancel' }],
+    ['accept with confirm=false', { action: 'accept', content: { confirm: false } }],
+    ['accept with an unparseable payload', { action: 'accept', content: { confirm: 'yes' } }],
+  ])('fails with `consent_declined` on %s, without publishing', async (_label, reply) => {
+    const publish = stubbedPublish();
+    const ctx = createMockContext({
+      errors: ntfyPublishMessage.errors,
+      elicit: vi.fn().mockResolvedValue(reply),
+    });
+
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'hi',
+      email: 'ops@example.com',
+    });
+    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'consent_declined' },
+    });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when the client does not support elicitation', async () => {
+    const publish = stubbedPublish();
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    expect(ctx.elicit).toBeUndefined();
+
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'hi',
+      call: '+15551234567',
+    });
+    await ntfyPublishMessage.handler(input, ctx);
+    expect(publish).toHaveBeenCalledOnce();
   });
 });

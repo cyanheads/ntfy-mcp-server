@@ -92,6 +92,12 @@ const ServerConfigSchema = z.object({
     .describe('Topic used when a tool call omits topic.'),
   requestTimeoutMs: z.coerce.number().int().positive().default(15_000),
   maxRetries: z.coerce.number().int().min(0).default(3),
+  blockPrivateHosts: z
+    .stringbool()
+    .default(false)
+    .describe(
+      'When true, a per-call base_url override that is not a registered server must resolve to a public address, and its redirects are not followed.',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -115,6 +121,7 @@ interface RawEnv {
   NTFY_AUTH_TOKEN?: string | undefined;
   NTFY_AUTH_USERNAME?: string | undefined;
   NTFY_BASE_URL?: string | undefined;
+  NTFY_BLOCK_PRIVATE_HOSTS?: string | undefined;
   NTFY_DEFAULT_TOPIC?: string | undefined;
   NTFY_MAX_RETRIES?: string | undefined;
   NTFY_REQUEST_TIMEOUT_MS?: string | undefined;
@@ -131,6 +138,9 @@ function loadFromEnv(env: RawEnv | NodeJS.ProcessEnv): ServerConfig {
     defaultTopic: env.NTFY_DEFAULT_TOPIC,
     requestTimeoutMs: env.NTFY_REQUEST_TIMEOUT_MS,
     maxRetries: env.NTFY_MAX_RETRIES,
+    // `||` not `??`: an empty-string env var means "unset" here, and
+    // `z.stringbool()` rejects '' rather than falling back to the default.
+    blockPrivateHosts: env.NTFY_BLOCK_PRIVATE_HOSTS || undefined,
   });
 
   if (!result.success) {
@@ -207,6 +217,8 @@ function envVarForSingleServerPath(path: string): string | undefined {
       return 'NTFY_REQUEST_TIMEOUT_MS';
     case 'maxRetries':
       return 'NTFY_MAX_RETRIES';
+    case 'blockPrivateHosts':
+      return 'NTFY_BLOCK_PRIVATE_HOSTS';
     default:
       return;
   }

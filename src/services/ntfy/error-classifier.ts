@@ -55,6 +55,16 @@ export function upstreamErrorDetail(body: string): string | undefined {
   return typeof link === 'string' && link ? `${error} (see ${link})` : error;
 }
 
+/**
+ * True for a `base_url` rejection raised locally — a bad scheme, a non-public
+ * host, a refused redirect, an unresolvable host. These carry codes the upstream
+ * classifiers below also claim, so handlers must let them through untouched
+ * rather than relabel them as a complaint about some other argument.
+ */
+export function isBaseUrlRejection(err: unknown): boolean {
+  return (err as { data?: { baseUrlRejected?: unknown } })?.data?.baseUrlRejected === true;
+}
+
 export function isAuthCode(code: unknown): boolean {
   return code === JsonRpcErrorCode.Forbidden || code === JsonRpcErrorCode.Unauthorized;
 }

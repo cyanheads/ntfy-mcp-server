@@ -1,7 +1,9 @@
 /**
  * @fileoverview `ntfy_publish_message` — sends or updates a push notification
  * on an ntfy topic. Single tool covering all 18 publish parameters; updates
- * ride this tool by setting `sequence_id`.
+ * ride this tool by setting `sequence_id`. Publishes whose side effects leave
+ * the notification drawer (`email`, `call`, `broadcast` / `http` buttons) pass
+ * through a user-confirmation gate when the client supports elicitation.
  * @module mcp-server/tools/definitions/ntfy-publish-message.tool
  */
 
@@ -9,12 +11,19 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 
 import { getServerConfig } from '@/config/server-config.js';
+import { confirmAction } from '@/mcp-server/tools/utils/confirm-action.js';
+import {
+  BASE_URL_HINT,
+  BASE_URL_PATTERN,
+  normalizeBaseOverride,
+} from '@/services/ntfy/base-url-guard.js';
 import {
   classifyInvalidParams,
   getCode,
   getDataStatus,
   getMessage,
   isAuthCode,
+  isBaseUrlRejection,
   isInvalidParamsCode,
   isRateLimitedCode,
   isUpstreamUnreachable,
@@ -231,9 +240,10 @@ const InputSchema = z.object({
     ),
   base_url: z
     .string()
+    .regex(BASE_URL_PATTERN, BASE_URL_HINT)
     .optional()
     .describe(
-      'Override the configured `NTFY_BASE_URL` for this call (absolute URL). When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override the configured `NTFY_BASE_URL` for this call — an absolute `http(s)://` URL. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
     ),
 });
 
@@ -306,14 +316,45 @@ function priorityLabel(p?: number): string {
   }
 }
 
+/**
+ * Describe the parts of a publish that escape the notification drawer: an email
+ * forward, a voice call, an Android broadcast intent, or a button that fires an
+ * HTTP request from the recipient's device. Each phrase names its target so the
+ * confirmation prompt is specific to what will happen, not a generic
+ * "proceed?". A plain notification — or a `view` / `copy` button, which does
+ * nothing until the recipient taps it — returns an empty list and never
+ * prompts.
+ */
+function outOfBandSideEffects(input: Input): string[] {
+  const effects: string[] = [];
+  if (input.email) effects.push(`an email forward to ${input.email}`);
+  if (input.call) effects.push(`a voice call to ${input.call}`);
+  for (const action of input.actions ?? []) {
+    if (action.action === 'broadcast') {
+      effects.push(`an Android broadcast intent (${action.intent ?? 'default intent'})`);
+    }
+    if (action.action === 'http') {
+      effects.push(`an HTTP ${action.method ?? 'POST'} button targeting ${action.url}`);
+    }
+  }
+  return effects;
+}
+
 export const ntfyPublishMessage = tool('ntfy_publish_message', {
   description:
-    'Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`.',
+    'Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`. A publish carrying `email`, `call`, or a `broadcast`/`http` action button reaches beyond the notification drawer, so clients that support elicitation prompt the user to confirm it first and the call fails with `consent_declined` if they say no.',
   annotations: { openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
 
   errors: [
+    {
+      reason: 'consent_declined',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'The publish carried an out-of-band side effect (`email`, `call`, or a `broadcast`/`http` action button), the user was asked to confirm it, and declined, cancelled, or answered with a payload that did not parse.',
+      recovery:
+        'Confirm with the user which recipient or action they intended, or drop `email` / `call` / the action button and publish as a plain notification.',
+    },
     {
       reason: 'forbidden_topic',
       code: JsonRpcErrorCode.Forbidden,
@@ -371,6 +412,24 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       });
     }
 
+    const sideEffects = outOfBandSideEffects(input);
+    if (sideEffects.length > 0) {
+      const consent = await confirmAction(
+        ctx,
+        `Publish to ntfy topic \`${topic}\` with ${sideEffects.join(' and ')}?`,
+      );
+      if (consent === 'declined') {
+        throw ctx.fail('consent_declined', `Publish to ${topic} was not confirmed.`, {
+          ...ctx.recoveryFor('consent_declined'),
+        });
+      }
+      if (consent === 'unsupported') {
+        ctx.log.notice('Proceeding without confirmation — client does not support elicitation', {
+          sideEffects: sideEffects.length,
+        });
+      }
+    }
+
     const requestBody: NtfyPublishRequest = {
       topic,
       message: input.message,
@@ -392,7 +451,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       firebase: input.firebase,
     };
 
-    const overrideBase = input.base_url?.replace(/\/+$/, '');
+    const overrideBase = normalizeBaseOverride(input.base_url);
 
     let response: NtfyPublishResponse;
     try {
@@ -490,6 +549,11 @@ function classifyPublishError(
   ctx: Parameters<typeof ntfyPublishMessage.handler>[1],
   topic: string,
 ): unknown {
+  // A locally-rejected `base_url` already carries its own message and hint; the
+  // branches below speak for ntfy, not for this server, and one of them matches
+  // on keywords that a rejected URL could contain.
+  if (isBaseUrlRejection(err)) return err;
+
   const code = getCode(err);
   const message = getMessage(err);
 

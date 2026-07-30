@@ -5,13 +5,13 @@
  * schema's single-node validation,
  * sparse upstream payloads (per checklist), error mapping (forbidden /
  * invalid_since / upstream_unreachable / generic rethrow), default-topic
- * resolution, base_url override, enrichment
+ * resolution, base_url override and its scheme validation, enrichment
  * (topic/since/count/truncated/filters/notice), and format() rendering.
  * @module tests/tools/ntfy-fetch-messages.tool
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { forbidden, invalidParams, notFound } from '@cyanheads/mcp-ts-core/errors';
+import { forbidden, invalidParams, notFound, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -393,6 +393,40 @@ describe('ntfyFetchMessages handler', () => {
     });
     await ntfyFetchMessages.handler(input, ctx);
     expect(fetch.mock.calls[0]?.[1]).toMatchObject({ baseUrl: 'https://other.example.com' });
+  });
+
+  it.each(['ftp://ntfy.example.com', 'ntfy.example.com', 'https://ntfy example.com'])(
+    'rejects the %j base_url at the schema boundary',
+    (base_url) => {
+      expect(() => ntfyFetchMessages.input.parse({ topic: 'alerts', base_url })).toThrow();
+    },
+  );
+
+  it('treats an empty `base_url` from a form client as no override', async () => {
+    const svc = freshService();
+    const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', base_url: '' });
+    await ntfyFetchMessages.handler(input, ctx);
+    expect(fetch.mock.calls[0]?.[1]).toMatchObject({ baseUrl: undefined });
+  });
+
+  it('passes a rejected `base_url` through instead of blaming `since`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'fetch').mockRejectedValue(
+      validationError('base_url host 169.254.169.254 resolves to a non-public address', {
+        baseUrlRejected: true,
+        recovery: { hint: 'Target a publicly reachable ntfy server' },
+      }),
+    );
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({
+      topic: 'alerts',
+      base_url: 'http://169.254.169.254',
+    });
+    const err = await ntfyFetchMessages.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({ message: expect.stringContaining('non-public address') });
+    expect((err as { data?: { reason?: string } }).data?.reason).toBeUndefined();
   });
 
   it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {

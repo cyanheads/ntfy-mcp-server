@@ -5,13 +5,18 @@
  * registered base URLs — per-call `baseUrl` overrides that match a registered
  * base forward that base's credentials, anything else goes out unauthenticated
  * to avoid leaking credentials to arbitrary hosts the agent picks.
+ *
+ * Overrides are also validated before they are dereferenced: absolute
+ * `http(s)` form always, plus a public-address requirement and a redirect block
+ * when `NTFY_BLOCK_PRIVATE_HOSTS` is on — see `base-url-guard.ts`.
  * @module services/ntfy/ntfy-service
  */
 
-import { McpError } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import type { NtfyServerEntry, ServerConfig } from '@/config/server-config.js';
+import { assertAbsoluteHttpUrl, assertPublicHost, REJECTION_MARKER } from './base-url-guard.js';
 import { getDataBody, upstreamErrorDetail } from './error-classifier.js';
 import type {
   ManageOperation,
@@ -45,6 +50,23 @@ async function timedFetch(
   }
   try {
     return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    // A refused redirect is a deliberate block, not a transient network fault:
+    // name it, and give it a non-retryable code so the retry boundary above
+    // doesn't burn three attempts re-refusing the same hop.
+    if (init.redirect === 'error' && isBlockedRedirect(err)) {
+      throw validationError(
+        `base_url redirected away from ${new URL(url).host}; redirects are not followed for unregistered base URLs while NTFY_BLOCK_PRIVATE_HOSTS is on.`,
+        {
+          ...REJECTION_MARKER,
+          recovery: {
+            hint: 'Pass the final ntfy server URL directly, or ask the operator to register it in `NTFY_SERVERS` / `NTFY_BASE_URL`.',
+          },
+        },
+        { cause: err },
+      );
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
     if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
@@ -84,14 +106,45 @@ async function ntfyHttpError(response: Response, data: Record<string, unknown>):
   return new McpError(err.code, `${err.message.replace(/\.$/, '')}: ${detail}`, err.data);
 }
 
+/**
+ * Recognize the rejection `fetch` raises when `redirect: 'error'` is set and
+ * the upstream answers with a 3xx. The wording differs by runtime (undici
+ * nests `unexpected redirect` under `cause`; Bun words it differently), so the
+ * whole cause chain is scanned for the one word both share. A miss only costs
+ * the clearer message — the redirect is refused either way.
+ */
+function isBlockedRedirect(err: unknown): boolean {
+  for (let cursor: unknown = err; cursor; cursor = (cursor as { cause?: unknown }).cause) {
+    const message = (cursor as { message?: unknown }).message;
+    if (typeof message === 'string' && /redirect/i.test(message)) return true;
+  }
+  return false;
+}
+
+/** Per-call transport decisions derived from the resolved base URL. */
+interface ResolvedBase {
+  authHeader: string | undefined;
+  base: string;
+  /** `'error'` on a guarded override, so a public host cannot 302 to a private one. */
+  redirect: 'error' | undefined;
+}
+
 export class NtfyService {
   private readonly authByBase: Map<string, string>;
   private readonly defaultBase: string;
+  /**
+   * Every configured base, credentialed or not — the SSRF-guard bypass set.
+   * `authByBase` holds only entries that produced an auth header, so a
+   * registered no-auth LAN server would otherwise fail the address check.
+   */
+  private readonly registeredBases: Set<string>;
 
   constructor(private readonly cfg: ServerConfig) {
     this.authByBase = new Map();
+    this.registeredBases = new Set();
     for (const entry of cfg.servers) {
       const base = trimTrailingSlash(entry.baseUrl);
+      this.registeredBases.add(base);
       const header = buildAuthHeader(entry);
       if (header) this.authByBase.set(base, header);
     }
@@ -105,12 +158,30 @@ export class NtfyService {
     return this.defaultBase;
   }
 
-  private resolveBase(override?: string): {
-    base: string;
-    authHeader: string | undefined;
-  } {
-    const base = trimTrailingSlash(override ?? this.defaultBase);
-    return { base, authHeader: this.authByBase.get(base) };
+  /**
+   * Resolve the base URL for one call and decide what the transport may do
+   * with it. A caller-supplied override is validated here — the choke point
+   * every tool and the topic resource shares. Configured bases are the
+   * operator's own choice, URL-validated at config load, so they skip it.
+   */
+  private async resolveBase(override?: string): Promise<ResolvedBase> {
+    if (override === undefined) {
+      return {
+        base: this.defaultBase,
+        authHeader: this.authByBase.get(this.defaultBase),
+        redirect: undefined,
+      };
+    }
+
+    const base = trimTrailingSlash(override);
+    const url = assertAbsoluteHttpUrl(base);
+    const authHeader = this.authByBase.get(base);
+
+    if (!this.cfg.blockPrivateHosts || this.registeredBases.has(base)) {
+      return { base, authHeader, redirect: undefined };
+    }
+    await assertPublicHost(url);
+    return { base, authHeader, redirect: 'error' };
   }
 
   private buildHeaders(
@@ -130,7 +201,7 @@ export class NtfyService {
     body: NtfyPublishRequest,
     opts: NtfyCallOptions = {},
   ): Promise<NtfyPublishResponse> {
-    const { base, authHeader } = this.resolveBase(opts.baseUrl);
+    const { base, authHeader, redirect } = await this.resolveBase(opts.baseUrl);
     const url = `${base}/`;
 
     // `cache` / `firebase` are wire-level headers, not JSON body fields.
@@ -149,6 +220,7 @@ export class NtfyService {
             method: 'POST',
             headers: this.buildHeaders(authHeader, extraHeaders),
             body: JSON.stringify(jsonBody),
+            ...(redirect ? { redirect } : {}),
           },
           this.cfg.requestTimeoutMs,
           signal,
@@ -173,7 +245,7 @@ export class NtfyService {
     operation: ManageOperation,
     opts: NtfyCallOptions = {},
   ): Promise<NtfyManageResponse> {
-    const { base, authHeader } = this.resolveBase(opts.baseUrl);
+    const { base, authHeader, redirect } = await this.resolveBase(opts.baseUrl);
     const path =
       operation === 'clear'
         ? `${base}/${encodeURIComponent(topic)}/${encodeURIComponent(sequenceId)}/clear`
@@ -186,6 +258,7 @@ export class NtfyService {
           {
             method: operation === 'clear' ? 'PUT' : 'DELETE',
             headers: this.buildHeaders(authHeader),
+            ...(redirect ? { redirect } : {}),
           },
           this.cfg.requestTimeoutMs,
           signal,
@@ -206,7 +279,7 @@ export class NtfyService {
    * caller (they're connection-level, not notification data).
    */
   async fetch(params: NtfyFetchParams, opts: NtfyCallOptions = {}): Promise<NtfyMessage[]> {
-    const { base, authHeader } = this.resolveBase(opts.baseUrl);
+    const { base, authHeader, redirect } = await this.resolveBase(opts.baseUrl);
     const search = new URLSearchParams({ poll: '1' });
     if (params.since) search.set('since', params.since);
     if (params.scheduled) search.set('scheduled', '1');
@@ -225,6 +298,7 @@ export class NtfyService {
           {
             method: 'GET',
             headers: this.buildHeaders(authHeader),
+            ...(redirect ? { redirect } : {}),
           },
           this.cfg.requestTimeoutMs,
           signal,
