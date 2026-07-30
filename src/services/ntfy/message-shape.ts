@@ -1,10 +1,10 @@
 /**
  * @fileoverview Normalizes a raw `NtfyMessage` poll envelope into the shape the
  * MCP surfaces hand back: Unix-second timestamps converted to ISO 8601 strings
- * and long bodies truncated to a bounded length. Lives in the service layer so
- * `ntfy_fetch_messages` and the `ntfy://{topic}` resource — peers, not
- * dependents — normalize identically instead of one importing the other's
- * internals.
+ * and long bodies truncated to a bounded length unless the caller opts out.
+ * Lives in the service layer so `ntfy_fetch_messages` and the `ntfy://{topic}`
+ * resource — peers, not dependents — normalize identically instead of one
+ * importing the other's internals.
  * @module services/ntfy/message-shape
  */
 
@@ -33,12 +33,15 @@ export interface ShapedNtfyMessage {
 }
 
 /** Cap a message body at `MESSAGE_TRUNCATE_AT`, reporting the dropped count. */
-function truncateMessage(body: string | undefined): {
+function truncateMessage(
+  body: string | undefined,
+  truncate: boolean,
+): {
   message?: string;
   messageTruncated?: number;
 } {
   if (body === undefined) return {};
-  if (body.length <= MESSAGE_TRUNCATE_AT) return { message: body };
+  if (!truncate || body.length <= MESSAGE_TRUNCATE_AT) return { message: body };
   return {
     message: body.slice(0, MESSAGE_TRUNCATE_AT),
     messageTruncated: body.length - MESSAGE_TRUNCATE_AT,
@@ -48,9 +51,17 @@ function truncateMessage(body: string | undefined): {
 /**
  * Normalize one polled message. Callers filter the connection-level `open` /
  * `keepalive` frames out before shaping, so the narrower `MessageEvent` holds.
+ *
+ * @param raw - The upstream poll envelope.
+ * @param opts.truncateBody - Cap the body at `MESSAGE_TRUNCATE_AT` (default
+ *   `true`). Pass `false` to return the whole body with no `messageTruncated`
+ *   count — only safe where the result set is pinned to a single message.
  */
-export function shapeMessage(raw: NtfyMessage): ShapedNtfyMessage {
-  const truncation = truncateMessage(raw.message);
+export function shapeMessage(
+  raw: NtfyMessage,
+  opts: { truncateBody?: boolean } = {},
+): ShapedNtfyMessage {
+  const truncation = truncateMessage(raw.message, opts.truncateBody !== false);
   return {
     id: raw.id,
     time: new Date(raw.time * 1000).toISOString(),

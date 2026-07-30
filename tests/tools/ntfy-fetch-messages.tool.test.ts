@@ -1,13 +1,16 @@
 /**
  * @fileoverview Tests for `ntfy_fetch_messages` — open/keepalive filtering,
- * client-side limit truncation, message-body truncation, sparse upstream
- * payloads (per checklist), error mapping (forbidden / invalid_since /
- * upstream_unreachable / generic rethrow), default-topic resolution,
- * base_url override, enrichment (topic/since/count/truncated/filters/notice),
- * and format() rendering.
+ * newest-first limit truncation, message-body truncation and the untruncated
+ * single-message (`id`) path plus its empty-`id` fallback, the priority
+ * schema's single-node validation,
+ * sparse upstream payloads (per checklist), error mapping (forbidden /
+ * invalid_since / upstream_unreachable / generic rethrow), default-topic
+ * resolution, base_url override, enrichment
+ * (topic/since/count/truncated/filters/notice), and format() rendering.
  * @module tests/tools/ntfy-fetch-messages.tool
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { forbidden, invalidParams, notFound } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -49,7 +52,7 @@ describe('ntfyFetchMessages handler', () => {
     vi.restoreAllMocks();
   });
 
-  it('drops `open` and `keepalive` frames and enriches count + truncated', async () => {
+  it('drops `open` and `keepalive` frames and keeps the newest messages within `limit`', async () => {
     const svc = freshService();
     const upstream: NtfyMessage[] = [
       { id: 'a', time: 1, event: 'open', topic: 'alerts' },
@@ -65,8 +68,46 @@ describe('ntfyFetchMessages handler', () => {
     const result = await ntfyFetchMessages.handler(input, ctx);
 
     expect(result.messages).toHaveLength(2);
-    expect(result.messages.map((m) => m.id)).toEqual(['b', 'd']);
+    expect(result.messages.map((m) => m.id)).toEqual(['d', 'e']);
     expect(getEnrichment(ctx)).toMatchObject({ count: 2, truncated: true });
+  });
+
+  it('keeps the newest `limit` of a larger window, still oldest-first, and says so in the notice', async () => {
+    const svc = freshService();
+    // ntfy hands back the cache oldest-first; ids ascend with time.
+    const upstream: NtfyMessage[] = Array.from({ length: 24 }, (_, i) => ({
+      id: `m${i + 1}`,
+      time: i + 1,
+      event: 'message' as const,
+      topic: 'alerts',
+      message: `body ${i + 1}`,
+    }));
+    vi.spyOn(svc, 'fetch').mockResolvedValue(upstream);
+
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', since: '1h', limit: 3 });
+    const result = await ntfyFetchMessages.handler(input, ctx);
+
+    expect(result.messages.map((m) => m.id)).toEqual(['m22', 'm23', 'm24']);
+    const e = getEnrichment(ctx);
+    expect(e).toMatchObject({ count: 3, truncated: true });
+    expect(e.notice).toContain('newest 3');
+    expect(e.notice).toContain('24 messages matched');
+  });
+
+  it('returns every message when the window fits inside `limit`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'fetch').mockResolvedValue([
+      { id: 'x', time: 1, event: 'message', topic: 'alerts', message: 'one' },
+      { id: 'y', time: 2, event: 'message', topic: 'alerts', message: 'two' },
+    ]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', limit: 5 });
+    const result = await ntfyFetchMessages.handler(input, ctx);
+
+    expect(result.messages.map((m) => m.id)).toEqual(['x', 'y']);
+    expect(getEnrichment(ctx)).toMatchObject({ truncated: false });
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   it('truncates long message bodies to 500 chars and reports the dropped count', async () => {
@@ -81,6 +122,90 @@ describe('ntfyFetchMessages handler', () => {
 
     expect(result.messages[0]?.message).toHaveLength(500);
     expect(result.messages[0]?.messageTruncated).toBe(200);
+  });
+
+  it('returns the whole body, with no `messageTruncated`, when a single message is pinned by `id`', async () => {
+    const svc = freshService();
+    const longBody = 'b'.repeat(720);
+    const fetch = vi
+      .spyOn(svc, 'fetch')
+      .mockResolvedValue([
+        { id: 'target', time: 1, event: 'message', topic: 'alerts', message: longBody },
+      ]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', id: 'target' });
+    const result = await ntfyFetchMessages.handler(input, ctx);
+
+    expect(fetch.mock.calls[0]?.[0].id).toBe('target');
+    expect(result.messages[0]?.message).toBe(longBody);
+    expect(result.messages[0]?.message).toHaveLength(720);
+    expect(result.messages[0]?.messageTruncated).toBeUndefined();
+  });
+
+  it('still truncates when `id` is absent, so list responses stay bounded', async () => {
+    const svc = freshService();
+    const longBody = 'c'.repeat(720);
+    vi.spyOn(svc, 'fetch').mockResolvedValue([
+      { id: 'listed', time: 1, event: 'message', topic: 'alerts', message: longBody },
+    ]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts' });
+    const result = await ntfyFetchMessages.handler(input, ctx);
+
+    expect(result.messages[0]?.message).toHaveLength(500);
+    expect(result.messages[0]?.messageTruncated).toBe(220);
+  });
+
+  it('treats an empty `id` as no filter, so the list stays capped', async () => {
+    const svc = freshService();
+    const longBody = 'd'.repeat(720);
+    const fetch = vi.spyOn(svc, 'fetch').mockResolvedValue([
+      { id: 'first', time: 1, event: 'message', topic: 'alerts', message: longBody },
+      { id: 'second', time: 2, event: 'message', topic: 'alerts', message: longBody },
+    ]);
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', id: '' });
+    const result = await ntfyFetchMessages.handler(input, ctx);
+
+    // An empty `id` never reaches ntfy as a filter, so the response is a list.
+    expect(fetch.mock.calls[0]?.[0].id).toBe('');
+    expect(result.messages).toHaveLength(2);
+    for (const m of result.messages) {
+      expect(m.message).toHaveLength(500);
+      expect(m.messageTruncated).toBe(220);
+    }
+  });
+
+  it('accepts every in-range priority filter value', () => {
+    const parsed = ntfyFetchMessages.input.safeParse({
+      topic: 'alerts',
+      priority: [1, 2, 3, 4, 5],
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects an out-of-range priority filter with one issue naming the allowed range', () => {
+    const parsed = ntfyFetchMessages.input.safeParse({ topic: 'alerts', priority: [9] });
+    expect(parsed.success).toBe(false);
+    const issues = parsed.error?.issues ?? [];
+    expect(issues).toHaveLength(1);
+    expect(issues[0]?.code).not.toBe('invalid_union');
+    expect(issues[0]?.message).toBe(
+      'Priority must be a whole number from 1 (min) to 5 (max/urgent).',
+    );
+    expect(issues[0]?.path).toEqual(['priority', 0]);
+  });
+
+  it('advertises priority as a single constrained node rather than a five-branch union', () => {
+    const schema = z.toJSONSchema(ntfyFetchMessages.input, { io: 'input' }) as {
+      properties: { priority: { items: Record<string, unknown> } };
+    };
+    expect(schema.properties.priority.items).toMatchObject({
+      type: 'integer',
+      minimum: 1,
+      maximum: 5,
+    });
+    expect(schema.properties.priority.items).not.toHaveProperty('anyOf');
   });
 
   it('preserves missing upstream fields as undefined (sparse payload)', async () => {

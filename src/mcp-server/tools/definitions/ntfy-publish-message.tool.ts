@@ -102,8 +102,18 @@ const ActionSchema = z
     'A single action button. Discriminated by `action` — `view`, `broadcast`, `http`, or `copy`.',
   );
 
+const PRIORITY_ERROR = 'Priority must be a whole number from 1 (min) to 5 (max/urgent).';
+/**
+ * One constrained JSON-Schema node (`{ type: 'integer', minimum: 1, maximum: 5 }`)
+ * rather than a five-branch `anyOf` of consts, so a bad value fails with the
+ * single message above instead of an `invalid_union` dump naming every branch.
+ * The 1–5 domain is enforced here; `Priority` narrows it back at the service
+ * boundary.
+ */
 const PrioritySchema = z
-  .union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5)])
+  .int({ error: PRIORITY_ERROR })
+  .min(1, PRIORITY_ERROR)
+  .max(5, PRIORITY_ERROR)
   .describe(
     'Notification priority — 1=min, 2=low, 3=default, 4=high, 5=max/urgent. Server defaults to 3 when omitted.',
   );
@@ -281,7 +291,7 @@ const OutputSchema = z.object({
 type Input = z.infer<typeof InputSchema>;
 type Output = z.infer<typeof OutputSchema>;
 
-function priorityLabel(p?: Priority): string {
+function priorityLabel(p?: number): string {
   switch (p) {
     case 1:
       return 'min';
@@ -365,7 +375,8 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       topic,
       message: input.message,
       title: input.title,
-      priority: input.priority,
+      // Schema-validated to the 1–5 domain above.
+      priority: input.priority as Priority | undefined,
       tags: input.tags?.length ? input.tags : undefined,
       click: input.click,
       attach: input.attach,

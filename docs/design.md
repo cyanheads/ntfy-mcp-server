@@ -203,14 +203,14 @@ Inputs: `topic`, `sequence_id`, `operation: 'clear' | 'delete'`, `base_url?: str
 **Inputs:**
 
 - `topic: string` — single topic or comma-separated list (e.g., `"alerts"` or `"alerts,backups,phil_alerts"`). Required when `NTFY_DEFAULT_TOPIC` is unset.
-- `since?: string` — defaults to `"10m"` as a tool-level guardrail (ntfy's own default is `"all"`; the tighter window keeps the most common "did my recent notification land?" use case cheap and avoids returning the *oldest* messages first when the cache is large and `limit` truncates). Accepts a duration (`30s`, `10m`, `2h`, `1d`), a Unix timestamp, a message ID, or the keywords `"all"` (every cached message — up to ~12h on ntfy.sh) or `"latest"` (only the most recent message).
+- `since?: string` — defaults to `"10m"` as a tool-level guardrail (ntfy's own default is `"all"`; the tighter window keeps the most common "did my recent notification land?" use case cheap). Accepts a duration (`30s`, `10m`, `2h`, `1d`), a Unix timestamp, a message ID, or the keywords `"all"` (every cached message — up to ~12h on ntfy.sh) or `"latest"` (only the most recent message).
 - `scheduled?: boolean` — default `false`. Set `true` to include delayed/not-yet-delivered messages.
 - `priority?: (1|2|3|4|5)[]` — match any priority in the list (logical **OR**). Empty/omitted matches all priorities.
 - `tags?: string[]` — match all tags in the list (logical **AND**). Empty/omitted matches all messages regardless of tags.
-- `id?: string` — exact-match a single message ID.
+- `id?: string` — exact-match a single message ID. Pinning one message also lifts the ~500-char body cap, so this is the retrieval path for a body the list view cut. `since` still bounds which cached messages are searched, so the retry needs a window wide enough to still include the message. An empty string is no filter at all — the response stays a list and stays capped.
 - `title?: string` — exact-match against the title string.
 - `message?: string` — exact-match against the message body.
-- `limit?: number` — client-side cap on returned messages, default `20`, max `100`. The tool truncates after the limit and sets `truncated: true` so the agent knows more remain.
+- `limit?: number` — client-side cap on returned messages, default `20`, max `100`. When more match, the newest `limit` are kept (still listed oldest-first) and `truncated: true` tells the agent that older ones were dropped.
 - `base_url?: string` — per-call override of `NTFY_BASE_URL`. Same auth-isolation rule as `ntfy_publish_message`.
 
 Single round trip — no streaming.
@@ -227,8 +227,8 @@ Single round trip — no streaming.
     expires?: number;             // Unix seconds when the message ages out of cache; ABSENT when published with cache: false
     sequence_id?: string;         // PRESENT on update / clear / delete events pointing back to the original message; ABSENT on initial publishes
     title?: string;               // ABSENT when no title was set (recipient clients fall back to the topic URL)
-    message?: string;             // ABSENT on clear/delete events; truncated to ~500 chars when the body is longer
-    messageTruncated?: number;    // count of additional chars dropped from `message`; ABSENT when the full body fits
+    message?: string;             // ABSENT on clear/delete events; truncated to ~500 chars when the body is longer, unless the call pinned one message via `id`
+    messageTruncated?: number;    // count of additional chars dropped from `message`; refetch with this message's `id` plus a `since` window covering it for the whole body; ABSENT when the full body fits
     priority?: 1|2|3|4|5;         // ABSENT when the message was sent at the default priority (3)
     tags?: string[];              // ABSENT when no tags were set
     click?: string;               // ABSENT when no click URL was set
@@ -236,7 +236,7 @@ Single round trip — no streaming.
     attachment?: { name: string; url: string; type?: string; size?: number; expires?: number };  // ABSENT when no attachment
   }>;
   count: number;                  // number of messages returned in this response
-  truncated: boolean;             // true when the server returned more messages than `limit` and the tail was dropped — refetch with a tighter `since` or use `id` to target a specific message
+  truncated: boolean;             // true when more messages matched than `limit`; the newest `limit` were kept and the older head dropped — raise `limit`, use a tighter `since`, or use `id` to target a specific message
 }
 ```
 
@@ -251,7 +251,7 @@ The tool filters out `open` and `keepalive` events client-side (they're connecti
 
 ### `ntfy_search_emoji_tags`
 
-Inputs: `query?: string` (substring match against tag name), `limit?: number` (default 25, max 200).
+Inputs: `query?: string` (substring match against tag name), `limit?: number` (default 25, max 200), `offset?: number` (default 0 — pages through matches past the `limit` cap; the reference holds far more tags than one call returns).
 
 Output: `{ matches: Array<{ tag: string; emoji: string }>, total: number, truncated: boolean }`. The bundled `docs/ntfy/emojis.md` is a flat tag→emoji list — no aliases or categories to surface.
 

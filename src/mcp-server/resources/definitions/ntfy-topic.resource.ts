@@ -70,7 +70,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
       url: `${service.baseUrl}/${params.topic}`,
       baseUrl: service.baseUrl,
       since: SNAPSHOT_SINCE,
-      messages: slice.map(shapeMessage),
+      messages: slice.map((m) => shapeMessage(m)),
       count: slice.length,
       truncated,
     };

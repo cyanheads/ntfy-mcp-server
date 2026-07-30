@@ -2,10 +2,12 @@
  * @fileoverview `ntfy_fetch_messages` — polls cached messages from one or more
  * ntfy topics with optional filters. Single round-trip via the upstream
  * `<topic>/json?poll=1` endpoint; the response is parsed line-by-line and
- * filtered to drop transport frames (`open`, `keepalive`). The resolved
- * topic/since, returned count, truncation flag, active filters, and
- * empty/truncated guidance ride the `enrichment` block so they reach both
- * `structuredContent` and `content[]` without a `format()` entry.
+ * filtered to drop transport frames (`open`, `keepalive`). Over-limit windows
+ * keep the newest `limit` messages, and a call pinned to one message by `id`
+ * returns that body untruncated. The resolved topic/since, returned count,
+ * truncation flag, active filters, and empty/truncated guidance ride the
+ * `enrichment` block so they reach both `structuredContent` and `content[]`
+ * without a `format()` entry.
  * @module mcp-server/tools/definitions/ntfy-fetch-messages.tool
  */
 
@@ -28,13 +30,18 @@ const TOPIC_LIST_REGEX = /^[a-zA-Z0-9_-]+(?:,[a-zA-Z0-9_-]+)*$/;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
-const PrioritySchema = z.union([
-  z.literal(1),
-  z.literal(2),
-  z.literal(3),
-  z.literal(4),
-  z.literal(5),
-]);
+const PRIORITY_ERROR = 'Priority must be a whole number from 1 (min) to 5 (max/urgent).';
+/**
+ * One constrained JSON-Schema node (`{ type: 'integer', minimum: 1, maximum: 5 }`)
+ * rather than a five-branch `anyOf` of consts, so a bad value fails with the
+ * single message above instead of an `invalid_union` dump naming every branch.
+ * The 1–5 domain is enforced here; `Priority` narrows it back at the service
+ * boundary.
+ */
+const PrioritySchema = z
+  .int({ error: PRIORITY_ERROR })
+  .min(1, PRIORITY_ERROR)
+  .max(5, PRIORITY_ERROR);
 
 const ActionReadbackSchema = z
   .discriminatedUnion('action', [
@@ -124,7 +131,12 @@ const InputSchema = z.object({
     .describe(
       'Match all tags in the list (logical AND). Empty/omitted matches all messages regardless of tags.',
     ),
-  id: z.string().optional().describe('Exact-match a single message ID.'),
+  id: z
+    .string()
+    .optional()
+    .describe(
+      'Exact-match a single message ID. Pinning one message this way also returns its body in full — the ~500-char cap that applies to list results is lifted. `since` still bounds which cached messages are searched, so widen it when the target is older than the default window.',
+    ),
   title: z.string().optional().describe('Exact-match against the title string.'),
   message: z.string().optional().describe('Exact-match against the message body.'),
   limit: z
@@ -134,7 +146,7 @@ const InputSchema = z.object({
     .max(MAX_LIMIT)
     .default(DEFAULT_LIMIT)
     .describe(
-      'Client-side cap on returned messages. Default 20, max 100. Sets the `truncated` enrichment flag when more remain.',
+      'Client-side cap on returned messages. Default 20, max 100. When more match, the newest `limit` of the window are kept (still listed oldest-first) and the `truncated` enrichment flag is set.',
     ),
   base_url: z
     .string()
@@ -171,13 +183,13 @@ const MessageSchema = z
       .string()
       .optional()
       .describe(
-        `Notification body. Truncated client-side to ~${MESSAGE_TRUNCATE_AT} chars; see \`messageTruncated\` for the count of dropped chars. Absent on clear/delete events.`,
+        `Notification body. Truncated client-side to ~${MESSAGE_TRUNCATE_AT} chars; see \`messageTruncated\` for the count of dropped chars. Returned whole when the call pinned a single message via \`id\`. Absent on clear/delete events.`,
       ),
     messageTruncated: z
       .number()
       .optional()
       .describe(
-        'Count of additional characters dropped from `message`. Absent when the full body fit within the truncation cap.',
+        "Count of additional characters dropped from `message`. To read the whole body, call this tool again with `id` set to this message's `id` and a `since` window that still covers it — a single-message fetch skips truncation. Absent when the full body fit within the cap or truncation was skipped.",
       ),
     priority: PrioritySchema.optional().describe('Notification priority; absent when default (3).'),
     tags: z
@@ -226,7 +238,7 @@ type Input = z.infer<typeof InputSchema>;
 type Output = z.infer<typeof OutputSchema>;
 type FilterEcho = z.infer<typeof FilterEchoSchema>;
 
-function priorityLabel(p?: Priority): string {
+function priorityLabel(p?: number): string {
   switch (p) {
     case 1:
       return 'min';
@@ -254,7 +266,7 @@ function filterSummary(f: FilterEcho | undefined): string {
 
 export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
   description:
-    'Poll cached messages from one or more ntfy topics with optional filters. Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity. Multiple topics are passed as a comma-separated list. Long bodies are truncated client-side to keep responses bounded; pass the message `id` back as `since` to fetch from that point.',
+    'Poll cached messages from one or more ntfy topics with optional filters. Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity. Multiple topics are passed as a comma-separated list. Long bodies are truncated client-side to keep list responses bounded; refetch with that message `id` to read one in full, or pass the `id` as `since` to page from that point.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
@@ -273,7 +285,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     truncated: z
       .boolean()
       .describe(
-        'True when more messages matched than `limit` and the tail was dropped — refetch with a tighter `since` or target a specific message by `id`.',
+        'True when more messages matched than `limit` allowed. The newest `limit` of the window are kept and the older head is dropped — widen `limit`, use a tighter `since`, or target a specific message by `id` to reach the rest.',
       ),
     appliedFilters: FilterEchoSchema.optional().describe(
       'Active filter inputs the server applied; absent when no filters were set.',
@@ -335,7 +347,8 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
           topic,
           since: input.since,
           scheduled: input.scheduled,
-          priority: input.priority,
+          // Schema-validated to the 1–5 domain above.
+          priority: input.priority as Priority[] | undefined,
           tags: input.tags,
           id: input.id,
           title: input.title,
@@ -367,7 +380,9 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     // Filter out connection-level frames; keep only notification events.
     const notifications = raw.filter((m) => m.event !== 'open' && m.event !== 'keepalive');
     const truncated = notifications.length > input.limit;
-    const slice = truncated ? notifications.slice(0, input.limit) : notifications;
+    // ntfy returns the cache oldest-first, so the newest `limit` messages are
+    // the tail — the kept slice stays oldest-first internally.
+    const slice = truncated ? notifications.slice(-input.limit) : notifications;
 
     ctx.log.info('Fetched ntfy messages', {
       requested: input.limit,
@@ -398,11 +413,16 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       );
     } else if (truncated) {
       ctx.enrich.notice(
-        'More messages matched than the limit allowed; refetch with a tighter `since` window or pass a message `id` to target a specific one.',
+        `${notifications.length} messages matched but \`limit\` was ${input.limit}; the newest ${slice.length} are returned and the older ${notifications.length - slice.length} were dropped. Raise \`limit\` (max ${MAX_LIMIT}), use a tighter \`since\` window, or pass a message \`id\` to target a specific one.`,
       );
     }
 
-    return { messages: slice.map(shapeMessage) };
+    // A call pinned to one message by `id` returns its body whole — the only
+    // path to a body the ~500-char list cap would otherwise cut. Mirrors the
+    // service's own guard: an empty `id` is sent as no filter at all, so the
+    // response is still a list and still capped.
+    const truncateBody = !input.id;
+    return { messages: slice.map((m) => shapeMessage(m, { truncateBody })) };
   },
 
   format(result) {

@@ -1,6 +1,7 @@
 /**
  * @fileoverview Tests for `ntfy_publish_message` — happy path with mocked
- * upstream, default-topic resolution, byte-length message validation,
+ * upstream, default-topic resolution, the priority schema's single-node
+ * validation and advertised shape, byte-length message validation,
  * format-rendering (including the scheduled delivery-time label), scheduled-flag
  * synthesis, base_url override, and the full contract error mapping
  * (forbidden / rate-limit / payload-too-large from a 413 / invalid-attachment /
@@ -9,6 +10,7 @@
  * @module tests/tools/ntfy-publish-message.tool
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import {
   forbidden,
   invalidParams,
@@ -105,6 +107,39 @@ describe('ntfyPublishMessage handler', () => {
       message: 'world',
       tags: ['warning'],
     });
+  });
+
+  it('accepts every in-range priority and rejects out-of-range values with one readable issue', () => {
+    for (const priority of [1, 2, 3, 4, 5]) {
+      expect(ntfyPublishMessage.input.safeParse({ topic: 'alerts', priority }).success).toBe(true);
+    }
+
+    for (const priority of [9, 0, -1, 2.5, 'high']) {
+      const parsed = ntfyPublishMessage.input.safeParse({ topic: 'alerts', priority });
+      expect(parsed.success).toBe(false);
+      const issues = parsed.error?.issues ?? [];
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.code).not.toBe('invalid_union');
+      expect(issues[0]?.message).toBe(
+        'Priority must be a whole number from 1 (min) to 5 (max/urgent).',
+      );
+      expect(issues[0]?.path).toEqual(['priority']);
+    }
+  });
+
+  it('advertises priority as a single constrained node on both input and output schemas', () => {
+    const input = z.toJSONSchema(ntfyPublishMessage.input, { io: 'input' }) as {
+      properties: { priority: Record<string, unknown> };
+    };
+    const output = z.toJSONSchema(ntfyPublishMessage.output, { io: 'output' }) as {
+      properties: { priority: Record<string, unknown> };
+    };
+    for (const node of [input.properties.priority, output.properties.priority]) {
+      expect(node).toMatchObject({ type: 'integer', minimum: 1, maximum: 5 });
+      expect(node).not.toHaveProperty('anyOf');
+    }
+    // The label mapping rides the input field; the output field documents the echo.
+    expect(input.properties.priority.description).toContain('1=min');
   });
 
   it('uses NTFY_DEFAULT_TOPIC when the input omits topic', async () => {
