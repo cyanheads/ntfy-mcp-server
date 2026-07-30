@@ -6,7 +6,7 @@
  * YAML frontmatter declaring:
  *   • summary (required)  — ≤350-char headline, no markdown, one line
  *   • breaking (optional) — `true` flags releases with breaking changes
- *   • security (optional) — `true` flags releases with security fixes
+ *   • security (optional) — `true` flags a source-code security fix (NOT a dependency CVE bump)
  *
  * The rollup is a thin **index**, not a copy of bodies — each entry is just a
  * clickable header + one-line summary. Full content stays in the per-version files.
@@ -208,6 +208,15 @@ function main(): void {
 
   if (!existsSync(CHANGELOG_DIR)) {
     console.log(`Skipped: ${CHANGELOG_DIR} does not exist (single-file CHANGELOG.md project).`);
+    process.exit(0);
+  }
+
+  // A fresh scaffold ships `changelog/template.md` (excluded) and no `<major.minor>.x/`
+  // version files yet, so `changelog/` exists but `buildRollup()` would throw. Under
+  // --check, that's not drift — skip cleanly. A manual `changelog:build` still throws,
+  // surfacing the empty-tree mistake when someone explicitly regenerates.
+  if (checkOnly && collectVersionFiles().length === 0) {
+    console.log(`Skipped: no per-version changelog files under ${CHANGELOG_DIR}/<major.minor>.x/.`);
     process.exit(0);
   }
 
