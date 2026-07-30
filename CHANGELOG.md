@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.2.0](changelog/2.2.x/2.2.0.md) — 2026-07-29 · ⚠️ Breaking
+
+ntfy://{topic} resource timestamps become ISO 8601 and body-truncated to match ntfy_fetch_messages; ntfy_publish_message's message limit is enforced by byte length; five error-classification and message-ordering fixes; framework ^0.11.0.
+
 ## [2.1.1](changelog/2.1.x/2.1.1.md) — 2026-06-11
 
 Adopt @cyanheads/mcp-ts-core ^0.10.6 — server identity pair, MCPB bundle cleaner, root-anchored .mcpbignore, plus dep bumps and identity-consistency fixes.

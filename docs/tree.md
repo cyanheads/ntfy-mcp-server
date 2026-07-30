@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-06-12 03:08:45
+Generated on: 2026-07-30 01:10:27
 
 ```text
 ntfy-mcp-server/
@@ -16,7 +16,8 @@ ntfy-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
-│   └── FUNDING.yml
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -24,6 +25,7 @@ ntfy-mcp-server/
 │   ├── 1.0.x/
 │   ├── 2.0.x/
 │   ├── 2.1.x/
+│   ├── 2.2.x/
 │   └── template.md
 ├── docs/
 │   ├── ntfy/
@@ -39,6 +41,7 @@ ntfy-mcp-server/
 │   ├── build-changelog.ts
 │   ├── build-emoji-tags.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
@@ -156,6 +159,7 @@ ntfy-mcp-server/
 │   │   │   └── emoji-tag-service.ts
 │   │   └── ntfy/
 │   │       ├── error-classifier.ts
+│   │       ├── message-shape.ts
 │   │       ├── ntfy-service.ts
 │   │       └── types.ts
 │   └── index.ts
@@ -176,6 +180,7 @@ ntfy-mcp-server/
 │       └── ntfy-search-emoji-tags.tool.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md

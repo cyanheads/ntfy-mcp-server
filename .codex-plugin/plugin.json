@@ -1,6 +1,6 @@
 {
   "name": "ntfy-mcp-server",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "description": "Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -23,10 +23,10 @@
   "interface": {
     "displayName": "ntfy-mcp-server",
     "shortDescription": "Send, manage, and replay ntfy push notifications via MCP.",
-    "longDescription": "",
+    "longDescription": "ntfy-mcp-server drives ntfy push notifications from an agent. ntfy_publish_message sends or updates a notification on a topic (topics are created on first publish; a sequence_id turns a later call into an in-place update); ntfy_manage_message clears or deletes a previously-sent notification by sequence_id; ntfy_fetch_messages polls cached messages from one or more topics with filters — confirm delivery, replay missed alerts, or audit topic activity; ntfy_search_emoji_tags resolves emoji short codes for the tags field. Works against ntfy.sh or any self-hosted ntfy instance.",
     "developerName": "cyanheads",
     "category": "developer tools",
-    "capabilities": ["Read"],
+    "capabilities": ["Read", "Write"],
     "websiteURL": "https://github.com/cyanheads/ntfy-mcp-server#readme",
     "defaultPrompt": []
   }
