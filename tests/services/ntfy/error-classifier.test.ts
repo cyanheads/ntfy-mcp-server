@@ -1,8 +1,9 @@
 /**
- * @fileoverview Tests for the pure-data error classifiers — code/message
- * extraction, the auth/rate/invalid/not-found predicates, the
- * "retry-exhausted" heuristic, and the keyword-based 4xx sub-reason split
- * (`payload_too_large` vs `unverified_contact`).
+ * @fileoverview Tests for the pure-data error classifiers — code/message/status
+ * extraction, upstream JSON error-body parsing, the auth/rate/invalid/not-found
+ * predicates, the "retry-exhausted" heuristic, and the keyword-based 4xx
+ * sub-reason split (`invalid_attachment` vs `payload_too_large` vs
+ * `unverified_contact`).
  * @module tests/services/ntfy/error-classifier
  */
 
@@ -13,12 +14,14 @@ import {
   classifyInvalidParams,
   getCode,
   getDataBody,
+  getDataStatus,
   getMessage,
   isAuthCode,
   isInvalidParamsCode,
   isNotFoundCode,
   isRateLimitedCode,
   isUpstreamUnreachable,
+  upstreamErrorDetail,
 } from '@/services/ntfy/error-classifier.js';
 
 describe('error-classifier shape extractors', () => {
@@ -59,6 +62,51 @@ describe('error-classifier shape extractors', () => {
     expect(getDataBody(new McpError(JsonRpcErrorCode.InvalidParams, 'x', { body: 99 }))).toBe('');
     expect(getDataBody({ data: {} })).toBe('');
     expect(getDataBody(null)).toBe('');
+  });
+
+  it('getDataStatus returns the canonical numeric data.status', () => {
+    const err = new McpError(JsonRpcErrorCode.InvalidRequest, 'too big', { status: 413 });
+    expect(getDataStatus(err)).toBe(413);
+  });
+
+  it('getDataStatus returns undefined when status is absent or non-numeric', () => {
+    expect(getDataStatus(new Error('plain'))).toBeUndefined();
+    expect(
+      getDataStatus(new McpError(JsonRpcErrorCode.InvalidParams, 'x', { status: '413' })),
+    ).toBeUndefined();
+    expect(getDataStatus({ data: {} })).toBeUndefined();
+    expect(getDataStatus(null)).toBeUndefined();
+  });
+});
+
+describe('upstreamErrorDetail', () => {
+  it('extracts the error string and docs link from an ntfy JSON body', () => {
+    const body = JSON.stringify({
+      code: 40004,
+      http: 400,
+      error: 'invalid delay parameter: unable to parse delay',
+      link: 'https://ntfy.sh/docs/publish/#scheduled-delivery',
+    });
+    expect(upstreamErrorDetail(body)).toBe(
+      'invalid delay parameter: unable to parse delay (see https://ntfy.sh/docs/publish/#scheduled-delivery)',
+    );
+  });
+
+  it('returns the error string alone when no link is present', () => {
+    const body = JSON.stringify({ code: 41303, http: 413, error: 'JSON body too large' });
+    expect(upstreamErrorDetail(body)).toBe('JSON body too large');
+  });
+
+  it('returns undefined for an empty, non-JSON, or error-less body', () => {
+    expect(upstreamErrorDetail('')).toBeUndefined();
+    expect(upstreamErrorDetail('forbidden topic')).toBeUndefined();
+    expect(upstreamErrorDetail('{"code":40004,"http":400}')).toBeUndefined();
+    expect(upstreamErrorDetail('{"error":""}')).toBeUndefined();
+    expect(upstreamErrorDetail('{"error":42}')).toBeUndefined();
+  });
+
+  it('returns undefined for a body truncated mid-JSON by the capture limit', () => {
+    expect(upstreamErrorDetail('{"code":40004,"error":"invalid del…')).toBeUndefined();
   });
 });
 
@@ -125,11 +173,36 @@ describe('classifyInvalidParams', () => {
     expect(classifyInvalidParams(err)).toBe('payload_too_large');
   });
 
-  it('returns `payload_too_large` when the captured body mentions 413', () => {
+  it('returns `payload_too_large` when the captured body mentions a size rejection', () => {
     const err = new McpError(JsonRpcErrorCode.InvalidParams, 'request rejected', {
       body: 'HTTP 413 Payload Too Large',
     });
     expect(classifyInvalidParams(err)).toBe('payload_too_large');
+  });
+
+  it("returns `invalid_attachment` for ntfy's attachment-URL rejection", () => {
+    const err = new McpError(
+      JsonRpcErrorCode.InvalidParams,
+      'ntfy returned HTTP 400 Bad Request: invalid request: attachment URL is invalid',
+    );
+    expect(classifyInvalidParams(err)).toBe('invalid_attachment');
+  });
+
+  it('returns `invalid_attachment` when the rejection is only in the captured body', () => {
+    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ntfy returned HTTP 400 Bad Request', {
+      body: '{"code":40023,"http":400,"error":"invalid request: attachment URL is invalid"}',
+    });
+    expect(classifyInvalidParams(err)).toBe('invalid_attachment');
+  });
+
+  it('does not treat a bare attachment mention as a size rejection', () => {
+    // The old keyword match fired on the word "attachment" alone, telling the
+    // agent to shorten its message when the real problem was the `attach` URL.
+    const err = new McpError(
+      JsonRpcErrorCode.InvalidParams,
+      'ntfy returned HTTP 400 Bad Request: invalid request: attachment URL is invalid',
+    );
+    expect(classifyInvalidParams(err)).not.toBe('payload_too_large');
   });
 
   it('returns `unverified_contact` for email-verification phrasing', () => {
@@ -160,7 +233,7 @@ describe('classifyInvalidParams', () => {
   });
 
   it('payload_too_large takes precedence when both keywords are present', () => {
-    // Order in the implementation: too large/attachment/413 checked before
+    // Order in the implementation: attachment URL, then "too large", then
     // email/phone/verified. Lock that in so a refactor doesn't silently flip it.
     const err = new McpError(
       JsonRpcErrorCode.InvalidParams,

@@ -12,6 +12,7 @@ import { getServerConfig } from '@/config/server-config.js';
 import {
   classifyInvalidParams,
   getCode,
+  getDataStatus,
   getMessage,
   isAuthCode,
   isInvalidParamsCode,
@@ -28,6 +29,8 @@ import type {
 
 const TOPIC_REGEX = /^[a-zA-Z0-9_-]+$/;
 const SEQUENCE_ID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+/** ntfy's message-body ceiling. Counted in bytes upstream, not characters. */
+const MESSAGE_MAX_BYTES = 4096;
 
 const TopicSchema = z.string().min(1).max(64).regex(TOPIC_REGEX);
 
@@ -129,10 +132,13 @@ const InputSchema = z.object({
   ),
   message: z
     .string()
-    .max(4096)
+    .max(MESSAGE_MAX_BYTES)
+    .refine((v) => Buffer.byteLength(v, 'utf8') <= MESSAGE_MAX_BYTES, {
+      message: `Message exceeds ntfy's ${MESSAGE_MAX_BYTES}-byte limit; non-ASCII characters cost 2–4 bytes each, so the byte count can exceed the character count.`,
+    })
     .optional()
     .describe(
-      'Notification body, ≤4096 bytes. Empty/missing is replaced server-side with the literal `triggered`; pass real content even for ping-style alerts.',
+      `Notification body, ≤${MESSAGE_MAX_BYTES} bytes (not characters — accented letters, CJK, and emoji cost 2–4 bytes each). Empty/missing is replaced server-side with the literal \`triggered\`; pass real content even for ping-style alerts.`,
     ),
   title: z
     .string()
@@ -227,7 +233,9 @@ const OutputSchema = z.object({
     .describe('Server-assigned message ID — pass back as `sequence_id` to update later.'),
   time: z
     .string()
-    .describe('ISO 8601 timestamp when ntfy accepted the message (not delivery time).'),
+    .describe(
+      'ISO 8601 timestamp. For an immediate publish this is when ntfy accepted the message; when `delay` was set (`scheduled: true`) ntfy reports the scheduled delivery time instead, which is in the future.',
+    ),
   topic: z.string().describe('Topic the message was published to.'),
   url: z
     .string()
@@ -314,9 +322,16 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     {
       reason: 'payload_too_large',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Message body or attachment exceeds server limits.',
+      when: 'Upstream returned 413, or rejected the request as too large — the message body or attachment exceeds server limits.',
       recovery:
         'Shorten the message (≤4096 bytes plain) or host the long content as an external URL via `attach`.',
+    },
+    {
+      reason: 'invalid_attachment',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'ntfy rejected the `attach` URL as malformed.',
+      recovery:
+        'Pass `attach` an absolute URL (`https://host/path/file.jpg`) to an already-hosted file — the recipient device fetches it, so a local path will not work, and shortening the message will not help.',
     },
     {
       reason: 'unverified_contact',
@@ -417,7 +432,9 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       : `**Sent** — ntfy accepted message \`${result.id}\` on \`${result.topic}\``;
     lines.push(banner);
     lines.push(`URL: ${result.url}`);
-    lines.push(`Time: ${result.time}`);
+    // A scheduled publish reports the delivery time in `time`, not the accept
+    // time — label it so the agent doesn't relay a future timestamp as "sent at".
+    lines.push(result.scheduled ? `Delivers: ${result.time}` : `Time: ${result.time}`);
     if (result.expires) {
       lines.push(`Cache expires: ${result.expires}`);
     }
@@ -475,18 +492,17 @@ function classifyPublishError(
       ...ctx.recoveryFor('rate_limited'),
     });
   }
+  // 413 maps to `InvalidRequest`, which `isInvalidParamsCode` deliberately
+  // excludes — read the upstream status directly so an oversize body reaches
+  // `payload_too_large` instead of bubbling unclassified.
+  if (getDataStatus(err) === 413) {
+    return ctx.fail('payload_too_large', message, {
+      ...ctx.recoveryFor('payload_too_large'),
+    });
+  }
   if (isInvalidParamsCode(code)) {
     const sub = classifyInvalidParams(err);
-    if (sub === 'payload_too_large') {
-      return ctx.fail('payload_too_large', message, {
-        ...ctx.recoveryFor('payload_too_large'),
-      });
-    }
-    if (sub === 'unverified_contact') {
-      return ctx.fail('unverified_contact', message, {
-        ...ctx.recoveryFor('unverified_contact'),
-      });
-    }
+    if (sub) return ctx.fail(sub, message, { ...ctx.recoveryFor(sub) });
   }
   if (isUpstreamUnreachable(err)) {
     return ctx.fail('upstream_unreachable', message || 'ntfy server is unreachable.', {

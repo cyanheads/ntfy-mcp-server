@@ -1,8 +1,9 @@
 /**
  * @fileoverview Tests for `NtfyService` — multi-server auth resolution, the
  * request-shape contract for publish/manage/fetch (URL, method, headers,
- * body), NDJSON parsing edge cases, upstream error propagation, and the
- * module-level init/get/reset accessors.
+ * body), NDJSON parsing edge cases, upstream error propagation including the
+ * JSON error body folded into the message, and the module-level
+ * init/get/reset accessors.
  * @module tests/services/ntfy/ntfy-service
  */
 
@@ -214,6 +215,87 @@ describe('NtfyService.publish request shape', () => {
     await expect(svc.publish(PUBLISH_BODY)).rejects.toMatchObject({
       code: JsonRpcErrorCode.Forbidden,
     });
+  });
+});
+
+describe('NtfyService upstream error messages', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function jsonError(status: number, body: Record<string, unknown>): () => Response {
+    return () =>
+      new Response(JSON.stringify(body), {
+        status,
+        statusText: status === 400 ? 'Bad Request' : 'Request Entity Too Large',
+        headers: { 'content-type': 'application/json' },
+      });
+  }
+
+  it("folds ntfy's error string and docs link into the publish error message", async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    captureFetch(
+      jsonError(400, {
+        code: 40004,
+        http: 400,
+        error: 'invalid delay parameter: unable to parse delay',
+        link: 'https://ntfy.sh/docs/publish/#scheduled-delivery',
+      }),
+    );
+    const err = await svc
+      .publish({ topic: 'alerts', message: 'x', delay: '9 fortnights' })
+      .catch((e: unknown) => e as Error);
+    expect(err.message).toContain('invalid delay parameter: unable to parse delay');
+    expect(err.message).toContain('https://ntfy.sh/docs/publish/#scheduled-delivery');
+  });
+
+  it('keeps the canonical status on data while enriching the message', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    captureFetch(
+      jsonError(413, {
+        code: 41303,
+        http: 413,
+        error: 'JSON body too large; increase your limits with a paid plan',
+      }),
+    );
+    await expect(svc.publish(PUBLISH_BODY)).rejects.toMatchObject({
+      message: expect.stringContaining('JSON body too large'),
+      data: { status: 413 },
+    });
+  });
+
+  it('enriches fetch errors from the same choke point', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    captureFetch(
+      jsonError(400, { code: 40008, http: 400, error: 'invalid since parameter: bad duration' }),
+    );
+    await expect(svc.fetch({ topic: 'alerts', since: 'tomorrow_maybe' })).rejects.toMatchObject({
+      message: expect.stringContaining('invalid since parameter: bad duration'),
+    });
+  });
+
+  it('enriches manage errors from the same choke point', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    captureFetch(
+      jsonError(400, { code: 40015, http: 400, error: 'invalid message id: not a sequence' }),
+    );
+    await expect(svc.manage('alerts', 'seq_bogus', 'clear')).rejects.toMatchObject({
+      message: expect.stringContaining('invalid message id: not a sequence'),
+    });
+  });
+
+  it('leaves the status-line message untouched for a non-JSON body', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    captureFetch(
+      () =>
+        new Response('forbidden topic', {
+          status: 403,
+          statusText: 'Forbidden',
+          headers: { 'content-type': 'text/plain' },
+        }),
+    );
+    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    expect(err.message).toBe('ntfy returned HTTP 403 Forbidden.');
   });
 });
 

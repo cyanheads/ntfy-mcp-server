@@ -1,8 +1,10 @@
 /**
  * @fileoverview `ntfy://{topic}` — snapshot resource for a single ntfy topic.
- * Wraps `NtfyService.fetch()` with fixed defaults (since=1h, limit=20) so
+ * Wraps `NtfyService.fetch()` with fixed defaults (since=1h, latest 20) so
  * clients can answer "what's happening on topic X" without parameterizing a
- * tool. For filtering or replay, callers should use `ntfy_fetch_messages`.
+ * tool, normalizing messages through the shared `shapeMessage` so the payload
+ * matches `ntfy_fetch_messages` field for field. For filtering or replay,
+ * callers should use `ntfy_fetch_messages`.
  * @module mcp-server/resources/definitions/ntfy-topic.resource
  */
 
@@ -10,6 +12,7 @@ import { resource, z } from '@cyanheads/mcp-ts-core';
 import { forbidden } from '@cyanheads/mcp-ts-core/errors';
 
 import { getCode, getMessage, isAuthCode } from '@/services/ntfy/error-classifier.js';
+import { MESSAGE_TRUNCATE_AT, shapeMessage } from '@/services/ntfy/message-shape.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage } from '@/services/ntfy/types.js';
 
@@ -28,8 +31,7 @@ const ParamsSchema = z.object({
 
 export const ntfyTopicResource = resource('ntfy://{topic}', {
   name: 'ntfy-topic-snapshot',
-  description:
-    "Snapshot of a topic's recently-cached messages — latest 20 from the last 1 hour, plus the topic's browser URL. Discoverable 'what's happening on topic X' lookup; for filters, custom windows, or replay use `ntfy_fetch_messages`.",
+  description: `Snapshot of a topic's recently-cached messages — latest 20 from the last 1 hour, plus the topic's browser URL. Messages are oldest-first with ISO 8601 timestamps, and bodies longer than ~${MESSAGE_TRUNCATE_AT} characters are truncated with the dropped count reported as \`messageTruncated\`. Discoverable 'what's happening on topic X' lookup; for filters, custom windows, or replay use \`ntfy_fetch_messages\`.`,
   mimeType: 'application/json',
   params: ParamsSchema,
 
@@ -59,14 +61,16 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
 
     const notifications = raw.filter((m) => m.event !== 'open' && m.event !== 'keepalive');
     const truncated = notifications.length > SNAPSHOT_LIMIT;
-    const slice = truncated ? notifications.slice(0, SNAPSHOT_LIMIT) : notifications;
+    // ntfy returns the cache oldest-first, so the *latest* 20 this resource
+    // advertises are the tail — the kept slice stays oldest-first internally.
+    const slice = truncated ? notifications.slice(-SNAPSHOT_LIMIT) : notifications;
 
     return {
       topic: params.topic,
       url: `${service.baseUrl}/${params.topic}`,
       baseUrl: service.baseUrl,
       since: SNAPSHOT_SINCE,
-      messages: slice,
+      messages: slice.map(shapeMessage),
       count: slice.length,
       truncated,
     };

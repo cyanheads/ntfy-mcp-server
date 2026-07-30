@@ -160,6 +160,28 @@ describe('ntfyFetchMessages handler', () => {
     });
   });
 
+  it('keeps the upstream explanation alongside the `invalid_since` recovery hint', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'fetch').mockRejectedValue(
+      invalidParams(
+        'ntfy returned HTTP 400 Bad Request: invalid since parameter: unable to parse duration',
+        {
+          status: 400,
+          body: '{"code":40008,"http":400,"error":"invalid since parameter: unable to parse duration"}',
+        },
+      ),
+    );
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', since: 'tomorrow_maybe' });
+    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('invalid since parameter: unable to parse duration'),
+      data: {
+        reason: 'invalid_since',
+        recovery: { hint: expect.stringContaining('`all`') },
+      },
+    });
+  });
+
   it('renders message bodies and details in format()', () => {
     const blocks = ntfyFetchMessages.format!({
       messages: [

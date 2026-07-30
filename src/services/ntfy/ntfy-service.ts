@@ -8,9 +8,11 @@
  * @module services/ntfy/ntfy-service
  */
 
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import type { NtfyServerEntry, ServerConfig } from '@/config/server-config.js';
+import { getDataBody, upstreamErrorDetail } from './error-classifier.js';
 import type {
   ManageOperation,
   NtfyCallOptions,
@@ -62,6 +64,24 @@ function buildAuthHeader(entry: NtfyServerEntry): string | undefined {
     return `Basic ${encoded}`;
   }
   return;
+}
+
+/**
+ * Build the error for a non-OK ntfy response, with the upstream explanation
+ * folded into the message. `httpErrorFromResponse` renders only the status line
+ * ("ntfy returned HTTP 400 Bad Request.") and captures the body under
+ * `data.body` — but `content[]` error text is built from the message plus the
+ * recovery hint, so the captured body never reaches it, and it is dropped
+ * outright once a tool re-throws through `ctx.fail(reason, message, …)`.
+ * Folding it in here — the one place every tool and the resource shares — puts
+ * ntfy's "invalid delay parameter: unable to parse delay" on both surfaces for
+ * classified and unclassified failures alike.
+ */
+async function ntfyHttpError(response: Response, data: Record<string, unknown>): Promise<McpError> {
+  const err = await httpErrorFromResponse(response, { service: 'ntfy', data });
+  const detail = upstreamErrorDetail(getDataBody(err));
+  if (!detail) return err;
+  return new McpError(err.code, `${err.message.replace(/\.$/, '')}: ${detail}`, err.data);
 }
 
 export class NtfyService {
@@ -134,10 +154,7 @@ export class NtfyService {
           signal,
         );
         if (!response.ok) {
-          throw await httpErrorFromResponse(response, {
-            service: 'ntfy',
-            data: { operation: 'publish', topic: body.topic },
-          });
+          throw await ntfyHttpError(response, { operation: 'publish', topic: body.topic });
         }
         return (await response.json()) as NtfyPublishResponse;
       },
@@ -174,10 +191,7 @@ export class NtfyService {
           signal,
         );
         if (!response.ok) {
-          throw await httpErrorFromResponse(response, {
-            service: 'ntfy',
-            data: { operation, topic, sequenceId },
-          });
+          throw await ntfyHttpError(response, { operation, topic, sequenceId });
         }
         return (await response.json()) as NtfyManageResponse;
       },
@@ -216,10 +230,7 @@ export class NtfyService {
           signal,
         );
         if (!response.ok) {
-          throw await httpErrorFromResponse(response, {
-            service: 'ntfy',
-            data: { operation: 'fetch', topic: params.topic },
-          });
+          throw await ntfyHttpError(response, { operation: 'fetch', topic: params.topic });
         }
         const text = await response.text();
         return parseNdjson(text);

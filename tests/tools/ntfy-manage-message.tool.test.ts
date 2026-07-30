@@ -88,6 +88,29 @@ describe('ntfyManageMessage handler', () => {
     });
   });
 
+  it('keeps the upstream explanation alongside the `not_found` recovery hint', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'manage').mockRejectedValue(
+      notFound('ntfy returned HTTP 404 Not Found: message not found or already expired', {
+        status: 404,
+        body: '{"code":40401,"http":404,"error":"message not found or already expired"}',
+      }),
+    );
+    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_missing',
+      operation: 'delete',
+    });
+    await expect(ntfyManageMessage.handler(input, ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('message not found or already expired'),
+      data: {
+        reason: 'not_found',
+        recovery: { hint: expect.stringContaining('ntfy_fetch_messages') },
+      },
+    });
+  });
+
   it('maps Forbidden to reason `forbidden_topic`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(forbidden('Topic forbidden'));

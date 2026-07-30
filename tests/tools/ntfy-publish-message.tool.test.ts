@@ -1,13 +1,22 @@
 /**
  * @fileoverview Tests for `ntfy_publish_message` — happy path with mocked
- * upstream, default-topic resolution, format-rendering, scheduled-flag
+ * upstream, default-topic resolution, byte-length message validation,
+ * format-rendering (including the scheduled delivery-time label), scheduled-flag
  * synthesis, base_url override, and the full contract error mapping
- * (forbidden / rate-limit / payload-too-large / unverified-contact /
- * upstream-unreachable / generic rethrow).
+ * (forbidden / rate-limit / payload-too-large from a 413 / invalid-attachment /
+ * unverified-contact / upstream-unreachable / generic rethrow) with the upstream
+ * explanation preserved on the error message.
  * @module tests/tools/ntfy-publish-message.tool
  */
 
-import { forbidden, invalidParams, notFound, rateLimited } from '@cyanheads/mcp-ts-core/errors';
+import {
+  forbidden,
+  invalidParams,
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  rateLimited,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -151,6 +160,97 @@ describe('ntfyPublishMessage handler', () => {
     });
   });
 
+  it('maps a 413 upstream to `payload_too_large` and keeps the upstream explanation', async () => {
+    const svc = freshService();
+    // 413 maps to InvalidRequest, which the InvalidParams gate excludes — the
+    // canonical `data.status` is what makes this reachable.
+    vi.spyOn(svc, 'publish').mockRejectedValue(
+      new McpError(
+        JsonRpcErrorCode.InvalidRequest,
+        'ntfy returned HTTP 413 Request Entity Too Large: JSON body too large; increase your limits with a paid plan',
+        {
+          status: 413,
+          body: '{"code":41303,"http":413,"error":"JSON body too large; increase your limits with a paid plan"}',
+        },
+      ),
+    );
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'x'.repeat(100) });
+    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('JSON body too large'),
+      data: {
+        reason: 'payload_too_large',
+        recovery: { hint: expect.stringContaining('Shorten the message') },
+      },
+    });
+  });
+
+  it('maps an invalid `attach` URL to `invalid_attachment`, not `payload_too_large`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockRejectedValue(
+      new McpError(
+        JsonRpcErrorCode.InvalidParams,
+        'ntfy returned HTTP 400 Bad Request: invalid request: attachment URL is invalid',
+        {
+          status: 400,
+          body: '{"code":40023,"http":400,"error":"invalid request: attachment URL is invalid"}',
+        },
+      ),
+    );
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'x',
+      attach: 'not-a-url',
+    });
+    const err = (await ntfyPublishMessage.handler(input, ctx).catch((e: unknown) => e)) as McpError;
+    expect(err.data).toMatchObject({ reason: 'invalid_attachment' });
+    expect(err.message).toContain('attachment URL is invalid');
+    const hint = String((err.data as { recovery: { hint: string } }).recovery.hint);
+    expect(hint).toContain('absolute URL');
+    expect(hint).not.toContain('Shorten the message');
+  });
+
+  it('rejects a multibyte message over 4096 bytes but under 4096 characters', () => {
+    // 3000 × 'é' = 3000 UTF-16 units but 6000 UTF-8 bytes.
+    expect(() =>
+      ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'é'.repeat(3000) }),
+    ).toThrow(/byte/i);
+  });
+
+  it('accepts a multibyte message that fits inside the 4096-byte limit', () => {
+    // 2000 × 'é' = 4000 UTF-8 bytes.
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'é'.repeat(2000),
+    });
+    expect(input.message).toHaveLength(2000);
+  });
+
+  it('preserves the upstream explanation on an unclassified 4xx rethrow', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockRejectedValue(
+      new McpError(
+        JsonRpcErrorCode.InvalidParams,
+        'ntfy returned HTTP 400 Bad Request: invalid delay parameter: unable to parse delay (see https://ntfy.sh/docs/publish/#scheduled-delivery)',
+        {
+          status: 400,
+          body: '{"code":40004,"http":400,"error":"invalid delay parameter: unable to parse delay"}',
+        },
+      ),
+    );
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({
+      topic: 'alerts',
+      message: 'x',
+      delay: '9 fortnights',
+    });
+    const err = (await ntfyPublishMessage.handler(input, ctx).catch((e: unknown) => e)) as McpError;
+    expect(err.message).toContain('invalid delay parameter: unable to parse delay');
+    expect(err.data?.reason).toBeUndefined();
+  });
+
   it('maps a 4xx with email/phone-verification hint to `unverified_contact`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'publish').mockRejectedValue(invalidParams('Phone number is not verified'));
@@ -168,10 +268,10 @@ describe('ntfyPublishMessage handler', () => {
   it('renders every output field in format()', () => {
     const blocks = ntfyPublishMessage.format!({
       id: 'mid_42',
-      time: 1700000000,
+      time: '2023-11-14T22:13:20.000Z',
       topic: 'alerts',
       url: 'https://ntfy.test/alerts',
-      expires: 1700001000,
+      expires: '2023-11-14T22:30:00.000Z',
       sequence_id: 'seq_1',
       scheduled: false,
       title: 'Hello',
@@ -190,6 +290,10 @@ describe('ntfyPublishMessage handler', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('mid_42');
     expect(text).toContain('alerts');
+    // Unscheduled publishes report the accept time under the plain `Time:` label.
+    expect(text).toContain('Time: 2023-11-14T22:13:20.000Z');
+    expect(text).toContain('Cache expires: 2023-11-14T22:30:00.000Z');
+    expect(text).not.toContain('Delivers:');
     expect(text).toContain('https://ntfy.test/alerts');
     expect(text).toContain('Hello');
     expect(text).toContain('world');
@@ -291,7 +395,7 @@ describe('ntfyPublishMessage handler', () => {
   it('renders the scheduled banner and actions list in format()', () => {
     const blocks = ntfyPublishMessage.format!({
       id: 'mid_99',
-      time: 1700000000,
+      time: '2026-07-28T13:00:13.000Z',
       topic: 'alerts',
       url: 'https://ntfy.test/alerts',
       scheduled: true,
@@ -305,5 +409,9 @@ describe('ntfyPublishMessage handler', () => {
     expect(text).toContain('Actions:');
     expect(text).toContain('Open dashboard');
     expect(text).toContain('Acknowledge');
+    // `time` carries the scheduled delivery time here, so it must not read as
+    // the accept time an unscheduled publish reports in the same slot.
+    expect(text).toContain('Delivers: 2026-07-28T13:00:13.000Z');
+    expect(text).not.toContain('Time:');
   });
 });
