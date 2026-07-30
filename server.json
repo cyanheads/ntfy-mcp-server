@@ -6,14 +6,14 @@
     "url": "https://github.com/cyanheads/ntfy-mcp-server",
     "source": "github"
   },
-  "version": "2.2.1",
+  "version": "2.3.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
       "runtimeHint": "bun",
-      "version": "2.2.1",
+      "version": "2.3.0",
       "packageArguments": [
         { "type": "positional", "value": "run" },
         { "type": "positional", "value": "start:stdio" }
@@ -71,6 +71,13 @@
           "default": "3"
         },
         {
+          "name": "NTFY_BLOCK_PRIVATE_HOSTS",
+          "description": "When true, a per-call `base_url` override must resolve to a public address and its redirects are not followed. Servers registered under NTFY_SERVERS / NTFY_BASE_URL are exempt. Turn it on where callers you do not control can reach the server.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -101,7 +108,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
       "runtimeHint": "bun",
-      "version": "2.2.1",
+      "version": "2.3.0",
       "packageArguments": [
         { "type": "positional", "value": "run" },
         { "type": "positional", "value": "start:http" }
@@ -157,6 +164,13 @@
           "format": "string",
           "isRequired": false,
           "default": "3"
+        },
+        {
+          "name": "NTFY_BLOCK_PRIVATE_HOSTS",
+          "description": "When true, a per-call `base_url` override must resolve to a public address and its redirects are not followed. Servers registered under NTFY_SERVERS / NTFY_BASE_URL are exempt. Turn it on where callers you do not control can reach the server.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
         },
         {
           "name": "MCP_SESSION_MODE",

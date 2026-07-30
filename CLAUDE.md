@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** ntfy-mcp-server
-**Version:** 2.2.1
+**Version:** 2.3.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.0`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -37,6 +37,8 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch` for control flow. The narrow `try/catch` blocks in this codebase exist solely to translate upstream ntfy errors into typed contract failures via `ctx.fail()` before re-throwing; everything else bubbles for framework auto-classification. Use error factories (`notFound()`, `forbidden()`, `validationError()`, …) when no contract entry fits.
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
 - **Auth scope is the configured `NTFY_BASE_URL`.** When a tool's `base_url` argument differs from the configured base, `NtfyService` strips the auth header before sending — never widen this to "always forward credentials" without explicit operator opt-in.
+- **`base_url` overrides are validated before they are dereferenced.** Absolute `http(s)` form is enforced unconditionally (`assertAbsoluteHttpUrl`, plus the advertised `BASE_URL_PATTERN` on all three tool schemas); the private-address guard and redirect refusal are opt-in behind `NTFY_BLOCK_PRIVATE_HOSTS` so LAN and stdio deployments keep working. Registered servers bypass the guard — that is the operator's lever for a deliberate private target, so keep the bypass set sourced from every `cfg.servers[]` entry, not from the credentialed subset.
+- **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. A declined, cancelled, or unparseable elicit response fails with `consent_declined`; a client that never advertised elicitation proceeds on the tool annotations alone — refusing there would break clients on calls that work today. Streamable HTTP is always that case: the framework builds a fresh `McpServer` per request, so `getClientCapabilities()` never sees the `initialize` handshake and `ctx.elicit` is undefined regardless of what the client advertised. Consent is a stdio guarantee until the framework closes that gap (`cyanheads/mcp-ts-core#312`).
 - **Secrets in env vars only** — never hardcoded. `NTFY_AUTH_TOKEN` is mutually exclusive with `NTFY_AUTH_USERNAME` / `NTFY_AUTH_PASSWORD`; the basic-auth pair must be set together. Validation enforces this at config load.
 - **Treat topic names as secrets.** Anyone who knows a topic name can publish or subscribe — surface that in tool descriptions and never log full topic names at info level when the topic is private.
 
@@ -217,6 +219,7 @@ Handlers receive a unified `ctx` object. Key properties this server uses today (
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. |
 | `ctx.signal` | `AbortSignal` forwarded into `NtfyService` calls so client cancellations propagate to upstream HTTP. |
+| `ctx.elicit` | Present only when the client advertised elicitation — never over Streamable HTTP, where the per-request `McpServer` misses the handshake (`cyanheads/mcp-ts-core#312`). Reached through `confirmAction()`, never called directly from a handler — it centralizes the boolean confirmation schema and the "no elicitation, proceed on annotations" fallback. |
 | `ctx.fail(reason, ...)` | Throw a typed contract failure declared in the tool's `errors[]` array. Pair with `ctx.recoveryFor(reason)` to attach the declared `recovery` hint to the wire payload. |
 | `ctx.enrich(...)` | Accumulate agent-facing success-path context (empty-result notices, query/filter echo, pagination totals) declared in a tool's `enrichment` block — reaches both `structuredContent` and `content[]`. Helpers: `.notice()`, `.total()`, `.echo()`. |
 | `ctx.requestId` | Unique request ID. Surfaces in logs and error payloads. |
@@ -275,7 +278,9 @@ src/
   services/
     ntfy/
       ntfy-service.ts                   # HTTP client (publish, manage, fetch)
+      base-url-guard.ts                 # base_url override validation + SSRF guard
       error-classifier.ts               # Map upstream errors → contract reasons
+      message-shape.ts                  # Normalize/truncate a message envelope
       types.ts                          # Domain types (NtfyMessage, NtfyAction, …)
     emoji-tags/
       emoji-tag-service.ts              # In-memory tag → emoji lookup
@@ -286,6 +291,8 @@ src/
       ntfy-manage-message.tool.ts       # Clear/delete by sequence_id
       ntfy-fetch-messages.tool.ts       # Poll cached messages with filters
       ntfy-search-emoji-tags.tool.ts    # Look up emoji short codes
+    tools/utils/
+      confirm-action.ts                 # ctx.elicit consent gate for side effects
     resources/definitions/
       ntfy-topic.resource.ts            # ntfy://{topic} snapshot
 ```
@@ -378,7 +385,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 `bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected.
 
-**Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match.
+**Adding an env var:** `server.json` always (registry discovery, `environmentVariables[]`). `manifest.json` only when the var is required with no default, or when bundle users should be prompted for it — then it needs both `mcp_config.env` and a `user_config` field. `lint:packaging` (run by `devcheck`) enforces exactly that pairing and checks the names match. Optional vars carrying a default stay out of `manifest.json`, which is why `user_config` is empty today.
 
 **README install badges** (Claude Desktop `.mcpb`, Cursor, VS Code) and the `base64` / `encodeURIComponent` config-generation commands are ship-time concerns — run the `polish-docs-meta` skill, which carries the badge format, layout, and generation snippets in `skills/polish-docs-meta/references/readme.md`.
 

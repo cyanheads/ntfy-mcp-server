@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.3.0](changelog/2.3.x/2.3.0.md) — 2026-07-29 · ⚠️ Breaking · 🛡️ Security
+
+SSRF guard for base_url overrides and a consent gate on destructive/side-effect ntfy_manage_message and ntfy_publish_message calls
+
 ## [2.2.1](changelog/2.2.x/2.2.1.md) — 2026-07-29
 
 ntfy_fetch_messages returns the newest window, single-message id fetches skip truncation, priority validation collapses to one error, and emoji-tag search pages past its cap
