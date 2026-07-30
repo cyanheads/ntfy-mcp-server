@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
+[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
@@ -57,14 +57,14 @@ Poll cached messages from one or more topics with optional filters. Returns a sn
 
 - Comma-separated multi-topic queries (e.g. `alerts,backups,phil_alerts`)
 - Filter by `since` (duration / timestamp / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, scheduled-only
-- Default window `10m`, default limit 20 messages per response, hard cap 100
-- Long bodies truncated to ~500 chars with `messageTruncated` reporting the dropped count
+- Default window `10m`, default limit 20 messages per response, hard cap 100 — over-limit windows keep the newest `limit` messages, listed oldest-first
+- Long bodies truncated to ~500 chars with `messageTruncated` reporting the dropped count; refetch with a message `id` to read that one in full
 
 ---
 
 ### `ntfy_search_emoji_tags`
 
-Substring search over the bundled ntfy emoji-tag reference. Returns the `tag` strings ready to plug into `ntfy_publish_message`'s `tags` field. Without a query, returns the first slice of the full reference.
+Substring search over the bundled ntfy emoji-tag reference. Returns the `tag` strings ready to plug into `ntfy_publish_message`'s `tags` field. Without a query, returns the first slice of the full reference; `offset` pages through matches beyond the `limit` cap.
 
 ## Resources and prompts
 

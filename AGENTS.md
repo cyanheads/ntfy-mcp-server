@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** ntfy-mcp-server
-**Version:** 2.2.0
+**Version:** 2.2.1
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.0`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
