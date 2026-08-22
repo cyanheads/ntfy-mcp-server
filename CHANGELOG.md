@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.3.2](changelog/2.3.x/2.3.2.md) — 2026-08-22
+
+The Docker build stage runs on the build host's platform, so the multi-arch image publishes again — 2.3.1 shipped to npm and the registry but no container image
+
 ## [2.3.1](changelog/2.3.x/2.3.1.md) — 2026-08-22 · ⚠️ Breaking
 
 Adopts mcp-ts-core 0.12.3 and MCP SDK v2: the consent gate becomes a multi-round-trip request that now reaches Streamable HTTP clients, tool inputs turn strict, and the advertised outputSchema declares the error envelope
