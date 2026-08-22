@@ -3,7 +3,8 @@
  * on an ntfy topic. Single tool covering all 18 publish parameters; updates
  * ride this tool by setting `sequence_id`. Publishes whose side effects leave
  * the notification drawer (`email`, `call`, `broadcast` / `http` buttons) pass
- * through a user-confirmation gate when the client supports elicitation.
+ * through a user-confirmation gate: the first such call returns an input
+ * request and the publish only fires once the retried call carries an approval.
  * @module mcp-server/tools/definitions/ntfy-publish-message.tool
  */
 
@@ -342,7 +343,7 @@ function outOfBandSideEffects(input: Input): string[] {
 
 export const ntfyPublishMessage = tool('ntfy_publish_message', {
   description:
-    'Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`. A publish carrying `email`, `call`, or a `broadcast`/`http` action button reaches beyond the notification drawer, so clients that support elicitation prompt the user to confirm it first and the call fails with `consent_declined` if they say no.',
+    'Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`. A publish carrying `email`, `call`, or a `broadcast`/`http` action button reaches beyond the notification drawer, so that call always asks the user to confirm the specific target first and comes back requesting that input rather than a result; reissue the same call with the answer attached to send it. Declining fails the call with `consent_declined`. A plain notification publishes on the first call.',
   annotations: { openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
@@ -414,18 +415,13 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
 
     const sideEffects = outOfBandSideEffects(input);
     if (sideEffects.length > 0) {
-      const consent = await confirmAction(
+      const consent = confirmAction(
         ctx,
         `Publish to ntfy topic \`${topic}\` with ${sideEffects.join(' and ')}?`,
       );
       if (consent === 'declined') {
         throw ctx.fail('consent_declined', `Publish to ${topic} was not confirmed.`, {
           ...ctx.recoveryFor('consent_declined'),
-        });
-      }
-      if (consent === 'unsupported') {
-        ctx.log.notice('Proceeding without confirmation — client does not support elicitation', {
-          sideEffects: sideEffects.length,
         });
       }
     }

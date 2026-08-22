@@ -45,23 +45,21 @@ function captureFetch(
     new Response(JSON.stringify({ id: 'm1', time: 1, topic: 'alerts' }), { status: 200 }),
 ) {
   const calls: CapturedCall[] = [];
-  const mock = vi
-    .spyOn(globalThis, 'fetch' as never)
-    .mockImplementation(async (...args: unknown[]) => {
-      const url = args[0] as string;
-      const init = args[1] as RequestInit | undefined;
-      const headers = (init?.headers ?? {}) as Record<string, string>;
-      const call: CapturedCall = {
-        url,
-        method: init?.method,
-        headers,
-        auth: headers.Authorization,
-        body: typeof init?.body === 'string' ? init.body : undefined,
-        redirect: init?.redirect,
-      };
-      calls.push(call);
-      return responder(call) as unknown as Response;
-    });
+  const mock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (...args: unknown[]) => {
+    const url = args[0] as string;
+    const init = args[1] as RequestInit | undefined;
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    const call: CapturedCall = {
+      url,
+      method: init?.method,
+      headers,
+      auth: headers.Authorization,
+      body: typeof init?.body === 'string' ? init.body : undefined,
+      redirect: init?.redirect,
+    };
+    calls.push(call);
+    return responder(call) as unknown as Response;
+  });
   return { calls, mock };
 }
 

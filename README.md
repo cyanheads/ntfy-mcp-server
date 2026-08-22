@@ -7,9 +7,9 @@
 
 <div align="center">
 
-[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
+[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -42,7 +42,7 @@ Send or update a push notification on an ntfy topic. Topics are created on first
 - Up to three discriminated action buttons (`view`, `broadcast`, `http`, `copy`) per message
 - Update or replace previously-sent messages by passing the original `sequence_id`
 - Per-call `base_url` override that forwards credentials only when the override matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request goes out unauthenticated, so credentials never leak to alternate hosts
-- Publishes carrying `email`, `call`, or a `broadcast` / `http` action button ask the user to confirm the specific recipient or target first, on STDIO clients that support MCP elicitation
+- Publishes carrying `email`, `call`, or a `broadcast` / `http` action button ask the user to confirm the specific recipient or target first — the call comes back requesting that confirmation, and the message goes out only when it is reissued with the answer attached
 
 ---
 
@@ -50,7 +50,7 @@ Send or update a push notification on an ntfy topic. Topics are created on first
 
 Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only — the original message stays in cache, and a `message_clear` / `message_delete` event is emitted to subscribers. Idempotent.
 
-- STDIO clients that support MCP elicitation prompt the user to confirm the topic, `sequence_id`, and operation before the event fires; declining fails the call with `consent_declined`
+- Every call asks the user to confirm the topic, `sequence_id`, and operation before the event fires — the first call comes back requesting that confirmation, and declining fails the call with `consent_declined`
 
 ---
 
@@ -92,7 +92,7 @@ ntfy-specific:
 
 - Wraps ntfy's HTTP API with retry-aware client (`withRetry` + per-request timeout)
 - Per-server scoped auth — credentials are bound to each registered base URL (`NTFY_BASE_URL` or per-entry under `NTFY_SERVERS`); per-call `base_url` overrides forward auth only when the override matches a registered server, and go out unauthenticated otherwise
-- User confirmation before side effects that leave the notification drawer — a clear/delete, or a publish carrying `email`, `call`, or a `broadcast` / `http` action button. Clients that support MCP elicitation get a prompt naming the exact target; on clients that don't, the tool annotations remain the only signal. Reachable over STDIO today — the Streamable HTTP transport builds a fresh server per request, so a client's advertised capabilities do not survive to the tool call and no prompt is issued
+- User confirmation before side effects that leave the notification drawer — a clear/delete, or a publish carrying `email`, `call`, or a `broadcast` / `http` action button. The tool returns a confirmation request naming the exact target, and acts only on the reissued call that carries an approval. Enforced on both STDIO and Streamable HTTP; a client that cannot present the prompt gets an error instead of an unasked side effect
 - Optional SSRF guard on `base_url` overrides (`NTFY_BLOCK_PRIVATE_HOSTS`) — resolves the host and blocks every reserved destination it answers on (loopback, RFC 1918, RFC 6598 mesh space, link-local, and the IPv6 equivalents), then refuses redirects, with registered servers exempt
 - Bundled emoji-tag reference, regenerated from upstream `docs/ntfy/emojis.md` via `scripts/build-emoji-tags.ts`
 - Mutually-exclusive auth modes (bearer token *or* basic auth) validated at config-load time
@@ -190,7 +190,7 @@ cp .env.example .env
 | `NTFY_MAX_RETRIES` | Max retry attempts for transient upstream failures (5xx, network, 429). | `3` |
 | `NTFY_BLOCK_PRIVATE_HOSTS` | When `true`, a per-call `base_url` override must resolve to a public address, and its redirects are not followed. Servers registered under `NTFY_SERVERS` / `NTFY_BASE_URL` are exempt, so a deliberate LAN target still works. Turn it on where callers you don't control can reach the server. | `false` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
-| `MCP_SESSION_MODE` | HTTP session model: `stateless`, `stateful`, or `auto`. | `auto` |
+| `MCP_SESSION_MODE` | HTTP session model: `auto`, `stateful`, or `stateless`. `auto` resolves to `stateful`. Keep it stateful — the consent prompt on destructive and outbound calls is a multi-round-trip request that a 2025-era HTTP client can only complete over a live session. | `auto` (→ `stateful`) |
 | `MCP_HTTP_HOST` | HTTP host. | `127.0.0.1` |
 | `MCP_HTTP_PORT` | HTTP port. | `3010` |
 | `MCP_HTTP_ENDPOINT_PATH` | HTTP endpoint path. | `/mcp` |
@@ -232,7 +232,7 @@ docker build -t ntfy-mcp-server .
 docker run --rm -e NTFY_DEFAULT_TOPIC=your-topic -p 3010:3010 ntfy-mcp-server
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/ntfy-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The Dockerfile defaults to HTTP transport, stateful session mode, and logs to `/var/log/ntfy-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 

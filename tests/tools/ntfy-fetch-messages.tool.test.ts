@@ -197,7 +197,7 @@ describe('ntfyFetchMessages handler', () => {
   });
 
   it('advertises priority as a single constrained node rather than a five-branch union', () => {
-    const schema = z.toJSONSchema(ntfyFetchMessages.input, { io: 'input' }) as {
+    const schema = z.toJSONSchema(ntfyFetchMessages.input, { io: 'input' }) as unknown as {
       properties: { priority: { items: Record<string, unknown> } };
     };
     expect(schema.properties.priority.items).toMatchObject({
@@ -424,7 +424,9 @@ describe('ntfyFetchMessages handler', () => {
       topic: 'alerts',
       base_url: 'http://169.254.169.254',
     });
-    const err = await ntfyFetchMessages.handler(input, ctx).catch((e: unknown) => e);
+    const err = await Promise.resolve(ntfyFetchMessages.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({ message: expect.stringContaining('non-public address') });
     expect((err as { data?: { reason?: string } }).data?.reason).toBeUndefined();
   });

@@ -4,7 +4,7 @@
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
 # ==============================================================================
-FROM oven/bun:1.3.14 AS build
+FROM oven/bun:1.4.0 AS build
 
 WORKDIR /usr/src/app
 
@@ -30,7 +30,7 @@ RUN bun run build
 # application. It uses a slim base image and only includes production
 # dependencies and build artifacts.
 # ==============================================================================
-FROM oven/bun:1.3.14-slim AS production
+FROM oven/bun:1.4.0-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -49,8 +49,13 @@ COPY package.json bun.lock ./
 
 # Install only production dependencies, ignoring any lifecycle scripts (like 'prepare')
 # that are not needed in the final production image.
+# `--omit=peer` drops the framework's optional peer tiers (test runner, service
+# SDKs, parsers) that Bun would otherwise auto-install. Anything this server
+# actually imports belongs in its own `dependencies`, so nothing needed at
+# runtime is lost. The OTEL step below carries the same flag — without it, that
+# install re-resolves the graph and pulls every optional peer back in.
 RUN --mount=type=cache,target=/root/.bun/install/cache \
-    bun install --production --frozen-lockfile --ignore-scripts
+    bun install --production --omit=peer --frozen-lockfile --ignore-scripts
 
 # Conditionally install OpenTelemetry optional peer dependencies (Tier 3).
 # These are not bundled by default to keep the base image lean. Enable at build time
@@ -58,7 +63,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 ARG OTEL_ENABLED=true
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     if [ "$OTEL_ENABLED" = "true" ]; then \
-      bun add --omit=dev --ignore-scripts @hono/otel \
+      bun add --omit=dev --omit=peer --ignore-scripts @hono/otel \
         @opentelemetry/instrumentation-http \
         @opentelemetry/exporter-metrics-otlp-http \
         @opentelemetry/exporter-trace-otlp-http \
@@ -91,7 +96,11 @@ ARG PORT
 ENV MCP_HTTP_PORT=${PORT:-3010}
 ENV MCP_HTTP_HOST="0.0.0.0"
 ENV MCP_TRANSPORT_TYPE="http"
-ENV MCP_SESSION_MODE="stateless"
+# Stateful, not stateless: the consent prompt on destructive and outbound calls
+# is a multi-round-trip request, and a 2025-era HTTP client needs a live session
+# for the SDK's legacy shim to complete it. Declared explicitly so the container
+# states the same posture as every other launch path.
+ENV MCP_SESSION_MODE="stateful"
 ENV MCP_LOG_LEVEL="info"
 ENV LOGS_DIR="/var/log/ntfy-mcp-server"
 

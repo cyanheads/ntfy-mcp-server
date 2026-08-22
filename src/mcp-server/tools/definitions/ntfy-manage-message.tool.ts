@@ -3,7 +3,8 @@
  * notification by `sequence_id`. Append-only: the original message stays in
  * cache; subscribers receive a `message_clear` or `message_delete` event and
  * update the notification accordingly. Both operations pass through a
- * user-confirmation gate when the client supports elicitation.
+ * user-confirmation gate: the first call returns an input request and the
+ * clear/delete only fires once the retried call carries an approval.
  * @module mcp-server/tools/definitions/ntfy-manage-message.tool
  */
 
@@ -72,7 +73,7 @@ const OutputSchema = z.object({
 
 export const ntfyManageMessage = tool('ntfy_manage_message', {
   description:
-    'Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only: the original message stays in cache and a `message_clear`/`message_delete` event is emitted to subscribers. Re-issuing the same operation is safe — message state does not change, but a fresh event fires each time. ntfy.sh accepts unknown sequence IDs without error; stricter ntfy variants surface a `not_found` failure. Clients that support elicitation prompt the user to confirm the topic, `sequence_id`, and operation first, and the call fails with `consent_declined` if they say no.',
+    'Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only: the original message stays in cache and a `message_clear`/`message_delete` event is emitted to subscribers. Re-issuing the same operation is safe — message state does not change, but a fresh event fires each time. ntfy.sh accepts unknown sequence IDs without error; stricter ntfy variants surface a `not_found` failure. The first call always asks the user to confirm the topic, `sequence_id`, and operation and comes back requesting that input rather than a result; reissue the same call with the answer attached to carry it out. Declining fails the call with `consent_declined`.',
   annotations: {
     destructiveHint: true,
     idempotentHint: true,
@@ -124,7 +125,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       });
     }
 
-    const consent = await confirmAction(
+    const consent = confirmAction(
       ctx,
       `${input.operation === 'clear' ? 'Clear' : 'Delete'} ntfy notification \`${input.sequence_id}\` on topic \`${topic}\`? Subscribers receive a message_${input.operation} event.`,
     );
@@ -134,11 +135,6 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
         `The ${input.operation} of ${input.sequence_id} on topic ${topic} was not confirmed.`,
         { ...ctx.recoveryFor('consent_declined') },
       );
-    }
-    if (consent === 'unsupported') {
-      ctx.log.notice('Proceeding without confirmation — client does not support elicitation', {
-        operation: input.operation,
-      });
     }
 
     const overrideBase = normalizeBaseOverride(input.base_url);

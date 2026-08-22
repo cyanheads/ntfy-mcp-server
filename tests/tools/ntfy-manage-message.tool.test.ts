@@ -3,14 +3,19 @@
  * reason mapping (not_found / forbidden_topic / upstream_unreachable / generic
  * rethrow), default-topic resolution, missing-topic ValidationError,
  * base_url override plus its scheme validation, format() rendering for both
- * operations, and the consent gate — prompt contents, every declining reply,
- * the proceed-anyway path on clients without elicitation, and a failing
- * elicitation call.
+ * operations, and the consent gate across both round trips — the first round's
+ * `input_required` result and its prompt contents, and every re-entry reply
+ * (accepted, refused, cancelled, schema-invalid, wrong response kind).
  * @module tests/tools/ntfy-manage-message.tool
  */
 
+import type { InputRequiredResult } from '@cyanheads/mcp-ts-core';
 import { forbidden, invalidParams, notFound } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  expectInputRequired,
+  type MockContextOptions,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
@@ -33,6 +38,26 @@ function freshService() {
     requestTimeoutMs: 1000,
     maxRetries: 0,
   } as never);
+}
+
+/** The wire shape of the embedded `elicitation/create` request the gate emits. */
+type ElicitParams = {
+  message: string;
+  requestedSchema: { properties: Record<string, { type: string }>; required?: string[] };
+};
+
+/**
+ * Every clear/delete is gated, so a handler test that wants to reach the
+ * upstream stands in for the second round: the context carries the approval the
+ * client would have collected after the first round's `input_required`.
+ */
+function consentedCtx(
+  reply: Record<string, unknown> = { action: 'accept', content: { confirm: true } },
+) {
+  return createMockContext({
+    errors: ntfyManageMessage.errors,
+    inputResponses: { confirm: reply },
+  } as MockContextOptions<typeof ntfyManageMessage.errors>);
 }
 
 describe('ntfyManageMessage handler', () => {
@@ -59,7 +84,7 @@ describe('ntfyManageMessage handler', () => {
       sequence_id: 'seq_1',
     });
 
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_1',
@@ -80,7 +105,7 @@ describe('ntfyManageMessage handler', () => {
   it('maps NotFound to reason `not_found`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(notFound('No such sequence'));
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_missing',
@@ -99,7 +124,7 @@ describe('ntfyManageMessage handler', () => {
         body: '{"code":40401,"http":404,"error":"message not found or already expired"}',
       }),
     );
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_missing',
@@ -117,7 +142,7 @@ describe('ntfyManageMessage handler', () => {
   it('maps Forbidden to reason `forbidden_topic`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(forbidden('Topic forbidden'));
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'protected',
       sequence_id: 'seq_1',
@@ -138,7 +163,7 @@ describe('ntfyManageMessage handler', () => {
       topic: 'fallback',
       sequence_id: 'seq_1',
     });
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       sequence_id: 'seq_1',
       operation: 'delete',
@@ -149,17 +174,18 @@ describe('ntfyManageMessage handler', () => {
 
   it('renders the operation banner in format()', () => {
     const blocks = ntfyManageMessage.format!({
-      id: 'evt_1',
+      event_id: 'evt_1',
       topic: 'alerts',
       sequence_id: 'seq_1',
       operation: 'delete',
-      time: 1700000000,
+      time: '2023-11-14T22:13:20.000Z',
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('DELETED');
     expect(text).toContain('alerts');
     expect(text).toContain('seq_1');
-    expect(text).toContain('1700000000');
+    expect(text).toContain('evt_1');
+    expect(text).toContain('2023-11-14T22:13:20.000Z');
   });
 
   it('dispatches the `delete` operation distinctly from `clear`', async () => {
@@ -171,7 +197,7 @@ describe('ntfyManageMessage handler', () => {
       topic: 'alerts',
       sequence_id: 'seq_2',
     });
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_2',
@@ -197,7 +223,7 @@ describe('ntfyManageMessage handler', () => {
 
   it('throws ValidationError when neither topic nor NTFY_DEFAULT_TOPIC is set', async () => {
     freshService();
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       sequence_id: 'seq_x',
       operation: 'clear',
@@ -214,7 +240,7 @@ describe('ntfyManageMessage handler', () => {
       topic: 'alerts',
       sequence_id: 'seq_4',
     });
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_4',
@@ -248,7 +274,7 @@ describe('ntfyManageMessage handler', () => {
       topic: 'alerts',
       sequence_id: 'seq_5',
     });
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_5',
@@ -262,7 +288,7 @@ describe('ntfyManageMessage handler', () => {
   it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(new Error('econnreset (failed after 3 attempts)'));
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_x',
@@ -276,7 +302,7 @@ describe('ntfyManageMessage handler', () => {
   it('rethrows unclassified errors so the framework auto-classifier handles them', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(invalidParams('weird upstream complaint'));
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+    const ctx = consentedCtx();
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
       sequence_id: 'seq_x',
@@ -319,18 +345,64 @@ describe('ntfyManageMessage consent gate', () => {
       operation: 'delete',
     });
 
-  it('names the topic, sequence_id, and operation in the prompt', async () => {
+  /** The elicitation params the first round hands back to the client. */
+  function confirmRequest(asked: InputRequiredResult): ElicitParams {
+    const request = asked.inputRequests?.confirm;
+    if (!request) throw new Error('Expected a `confirm` input request.');
+    expect(request.method).toBe('elicitation/create');
+    return request.params as ElicitParams;
+  }
+
+  function firstRound(): Promise<InputRequiredResult> {
+    return expectInputRequired(() =>
+      ntfyManageMessage.handler(input(), createMockContext({ errors: ntfyManageMessage.errors })),
+    );
+  }
+
+  it('asks before touching the upstream and names the topic, sequence_id, and operation', async () => {
     const manage = stubbedManage();
-    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors, elicit });
 
-    await ntfyManageMessage.handler(input(), ctx);
+    const { message } = confirmRequest(await firstRound());
 
-    const prompt = elicit.mock.calls[0]?.[0] as string;
-    expect(prompt).toContain('alerts');
-    expect(prompt).toContain('seq_1');
-    expect(prompt).toMatch(/delete/i);
+    expect(message).toContain('alerts');
+    expect(message).toContain('seq_1');
+    expect(message).toMatch(/delete/i);
+    expect(manage).not.toHaveBeenCalled();
+  });
+
+  it('advertises a single boolean `confirm` field on the prompt schema', async () => {
+    stubbedManage();
+    const { requestedSchema } = confirmRequest(await firstRound());
+
+    expect(Object.keys(requestedSchema.properties)).toEqual(['confirm']);
+    expect(requestedSchema.properties.confirm?.type).toBe('boolean');
+    expect(requestedSchema.required).toEqual(['confirm']);
+  });
+
+  it('describes the operation being asked about, not a fixed prompt', async () => {
+    stubbedManage();
+    const asked = await expectInputRequired(() =>
+      ntfyManageMessage.handler(
+        ntfyManageMessage.input.parse({
+          topic: 'alerts',
+          sequence_id: 'seq_1',
+          operation: 'clear',
+        }),
+        createMockContext({ errors: ntfyManageMessage.errors }),
+      ),
+    );
+    const { message } = confirmRequest(asked);
+    expect(message).toMatch(/^Clear/);
+    expect(message).toContain('message_clear');
+  });
+
+  it('carries out the operation once the retried call approves it', async () => {
+    const manage = stubbedManage();
+
+    const result = await ntfyManageMessage.handler(input(), consentedCtx());
+
     expect(manage).toHaveBeenCalledTimes(1);
+    expect(result.operation).toBe('delete');
   });
 
   it.each([
@@ -340,41 +412,23 @@ describe('ntfyManageMessage consent gate', () => {
     ['accept with a missing confirm', { action: 'accept', content: {} }],
     ['accept with a stringified boolean', { action: 'accept', content: { confirm: 'true' } }],
     ['accept with no content at all', { action: 'accept' }],
+    ['a roots listing instead of an elicitation', { roots: [] }],
   ])(
     'fails with `consent_declined` on %s, without touching the upstream',
     async (_label, reply) => {
       const manage = stubbedManage();
-      const ctx = createMockContext({
-        errors: ntfyManageMessage.errors,
-        elicit: vi.fn().mockResolvedValue(reply),
-      });
 
-      await expect(ntfyManageMessage.handler(input(), ctx)).rejects.toMatchObject({
+      await expect(ntfyManageMessage.handler(input(), consentedCtx(reply))).rejects.toMatchObject({
         data: { reason: 'consent_declined' },
       });
       expect(manage).not.toHaveBeenCalled();
     },
   );
 
-  it('proceeds when the client does not support elicitation', async () => {
-    const manage = stubbedManage();
-    const ctx = createMockContext({ errors: ntfyManageMessage.errors });
-    expect(ctx.elicit).toBeUndefined();
-
-    await ntfyManageMessage.handler(input(), ctx);
-    expect(manage).toHaveBeenCalledTimes(1);
-  });
-
-  it('fails the call when an advertised elicitation errors out', async () => {
-    const manage = stubbedManage();
-    const ctx = createMockContext({
-      errors: ntfyManageMessage.errors,
-      elicit: vi.fn().mockRejectedValue(new Error('client transport closed')),
-    });
-
-    await expect(ntfyManageMessage.handler(input(), ctx)).rejects.toThrow(
-      /client transport closed/,
-    );
-    expect(manage).not.toHaveBeenCalled();
+  it('does not re-ask after a refusal — a declined round is a dead end', async () => {
+    stubbedManage();
+    const declined = ntfyManageMessage.handler(input(), consentedCtx({ action: 'decline' }));
+    await expect(declined).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
+    await expect(declined).rejects.not.toMatchObject({ isInputRequiredSignal: true });
   });
 });

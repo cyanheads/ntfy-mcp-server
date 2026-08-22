@@ -6,14 +6,14 @@
     "url": "https://github.com/cyanheads/ntfy-mcp-server",
     "source": "github"
   },
-  "version": "2.3.0",
+  "version": "2.3.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
       "runtimeHint": "bun",
-      "version": "2.3.0",
+      "version": "2.3.1",
       "packageArguments": [
         { "type": "positional", "value": "run" },
         { "type": "positional", "value": "start:stdio" }
@@ -108,7 +108,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
       "runtimeHint": "bun",
-      "version": "2.3.0",
+      "version": "2.3.1",
       "packageArguments": [
         { "type": "positional", "value": "run" },
         { "type": "positional", "value": "start:http" }
@@ -174,7 +174,7 @@
         },
         {
           "name": "MCP_SESSION_MODE",
-          "description": "HTTP session model: 'stateless', 'stateful', or 'auto'.",
+          "description": "HTTP session model: 'auto', 'stateful', or 'stateless'. 'auto' resolves to 'stateful'. Keep it stateful \u2014 the consent prompt on destructive and outbound calls is a multi-round-trip request that a 2025-era HTTP client can only complete over a live session.",
           "format": "string",
           "isRequired": false,
           "default": "auto"

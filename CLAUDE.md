@@ -1,10 +1,10 @@
 # Developer Protocol
 
 **Server:** ntfy-mcp-server
-**Version:** 2.3.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.0`
+**Version:** 2.3.1
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.12.3`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.0.0 (via the framework)
 **Zod:** ^4.4.3
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -38,7 +38,11 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
 - **Auth scope is the configured `NTFY_BASE_URL`.** When a tool's `base_url` argument differs from the configured base, `NtfyService` strips the auth header before sending — never widen this to "always forward credentials" without explicit operator opt-in.
 - **`base_url` overrides are validated before they are dereferenced.** Absolute `http(s)` form is enforced unconditionally (`assertAbsoluteHttpUrl`, plus the advertised `BASE_URL_PATTERN` on all three tool schemas); the private-address guard and redirect refusal are opt-in behind `NTFY_BLOCK_PRIVATE_HOSTS` so LAN and stdio deployments keep working. Registered servers bypass the guard — that is the operator's lever for a deliberate private target, so keep the bypass set sourced from every `cfg.servers[]` entry, not from the credentialed subset.
-- **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. A declined, cancelled, or unparseable elicit response fails with `consent_declined`; a client that never advertised elicitation proceeds on the tool annotations alone — refusing there would break clients on calls that work today. Streamable HTTP is always that case: the framework builds a fresh `McpServer` per request, so `getClientCapabilities()` never sees the `initialize` handshake and `ctx.elicit` is undefined regardless of what the client advertised. Consent is a stdio guarantee until the framework closes that gap (`cyanheads/mcp-ts-core#312`).
+- **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. The gate is a multi-round-trip flow: the first call returns `input_required` carrying an `elicitation/create` request that names the exact target, and the operation runs only when the retried call carries an approval. A declined, cancelled, or unparseable response fails with `consent_declined` — and so does a refusal of any other shape, since `accepted()` collapses them all. There is no proceed-anyway branch: `ctx.requestInput` exists on every transport and both protocol eras, so the gate is fail-closed on Streamable HTTP as much as on stdio. A 2025-era client that never declared the elicitation capability fails the call with an error naming the missing capability rather than publishing unasked.
+- **The consent gate requires `MCP_SESSION_MODE=stateful` over HTTP.** Only the stateful arm keeps a live session per `Mcp-Session-Id`, and the SDK's legacy shim needs one to complete an `input_required` round for a 2025-era client. `auto` resolves to `stateful`, but every launch path here states it outright — `.env.example` and the `Dockerfile` `ENV` — so the posture is declared, never inherited. Never set it to `stateless`.
+- **Everything above `confirmAction` in a gated handler runs twice.** The handler is re-entered from the top on the approval round, so keep that stretch free of side effects — config reads, validation, and prompt construction only.
+- **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
+- **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 - **Secrets in env vars only** — never hardcoded. `NTFY_AUTH_TOKEN` is mutually exclusive with `NTFY_AUTH_USERNAME` / `NTFY_AUTH_PASSWORD`; the basic-auth pair must be set together. Validation enforces this at config load.
 - **Treat topic names as secrets.** Anyone who knows a topic name can publish or subscribe — surface that in tool descriptions and never log full topic names at info level when the topic is private.
 
@@ -209,6 +213,8 @@ export function getServerConfig() {
 
 `parseEnvConfig` maps Zod schema paths → env var names so validation errors name the actual variable (`NTFY_AUTH_TOKEN`) rather than the internal path (`authToken`). It throws a `ConfigurationError` the framework catches and prints as a clean startup banner.
 
+For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
+
 ---
 
 ## Context
@@ -217,9 +223,10 @@ Handlers receive a unified `ctx` object. Key properties this server uses today (
 
 | Property | Description |
 |:---------|:------------|
-| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. |
+| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat every log line as client-visible — this is why full topic names never go out at info level. |
 | `ctx.signal` | `AbortSignal` forwarded into `NtfyService` calls so client cancellations propagate to upstream HTTP. |
-| `ctx.elicit` | Present only when the client advertised elicitation — never over Streamable HTTP, where the per-request `McpServer` misses the handshake (`cyanheads/mcp-ts-core#312`). Reached through `confirmAction()`, never called directly from a handler — it centralizes the boolean confirmation schema and the "no elicitation, proceed on annotations" fallback. |
+| `ctx.requestInput` | Suspend the handler and ask the caller for more input — never returns. Always present, on every transport and both protocol eras. Reached through `confirmAction()`, never called directly from a handler: that helper centralizes the boolean confirmation schema and the reading of the reply. |
+| `ctx.inputs` | Reader over a retried request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped`. Empty on the first round. Responses are never re-validated by the SDK, so `confirmAction` passes its schema to `accepted()` and treats the value as untrusted. |
 | `ctx.fail(reason, ...)` | Throw a typed contract failure declared in the tool's `errors[]` array. Pair with `ctx.recoveryFor(reason)` to attach the declared `recovery` hint to the wire payload. |
 | `ctx.enrich(...)` | Accumulate agent-facing success-path context (empty-result notices, query/filter echo, pagination totals) declared in a tool's `enrichment` block — reaches both `structuredContent` and `content[]`. Helpers: `.notice()`, `.total()`, `.echo()`. |
 | `ctx.requestId` | Unique request ID. Surfaces in logs and error payloads. |
@@ -240,7 +247,7 @@ errors: [
 ],
 async handler(input, ctx) {
   const item = await db.find(input.id);
-  if (!item) throw ctx.fail('no_match', `No item ${input.id}`);
+  if (!item) throw ctx.fail('no_match', `No item ${input.id}`, ctx.recoveryFor('no_match'));
   return item;
 }
 ```
@@ -292,7 +299,7 @@ src/
       ntfy-fetch-messages.tool.ts       # Poll cached messages with filters
       ntfy-search-emoji-tags.tool.ts    # Look up emoji short codes
     tools/utils/
-      confirm-action.ts                 # ctx.elicit consent gate for side effects
+      confirm-action.ts                 # Multi-round-trip consent gate for side effects
     resources/definitions/
       ntfy-topic.resource.ts            # ntfy://{topic} snapshot
 ```
@@ -343,7 +350,7 @@ Available skills:
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
 | `api-canvas` | DataCanvas: register tabular data, run SQL, export, plus the `spillover()` helper for big result sets — Tier 3 opt-in |
 | `api-config` | AppConfig, parseConfig, env vars |
-| `api-context` | Context interface, logger, state, progress |
+| `api-context` | Context interface, RequestContext, logger, state, multi-round-trip input |
 | `api-errors` | McpError, JsonRpcErrorCode, error patterns |
 | `api-linter` | Definition linter rule catalog — invoked by `bun run lint:mcp` and `devcheck` |
 | `api-mirror` | MirrorService: persistent self-refreshing local mirror (embedded SQLite + FTS5) of a bulk upstream dataset — Tier 3 opt-in |
@@ -369,9 +376,14 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run rebuild` | Clean + build |
 | `bun run clean` | Remove build artifacts |
 | `bun run devcheck` | Lint + format + typecheck + security + changelog sync |
+| `bun run audit:refresh` | Delete `bun.lock`, reinstall, and re-run `bun audit`. Use when `devcheck` flags a transitive advisory — Bun's `update` is sticky on transitive resolutions, so the advisory may be a stale-lockfile false positive. If it survives the refresh, it's real. |
 | `bun run tree` | Regenerate `docs/tree.md` |
-| `bun run format` | Auto-fix formatting (Biome) |
-| `bun run lint:mcp` | Validate MCP definitions against the spec |
+| `bun run list-skills` | Print the skill registry |
+| `bun run format` | Auto-fix formatting (Biome, safe fixes only) |
+| `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
+| `bun run lint:mcp` | Validate MCP definitions against the spec (rule catalog: `api-linter` skill) |
+| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
+| `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
 | `bun run test` | Run the Vitest test suite |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
@@ -401,16 +413,20 @@ Each per-version file opens with YAML frontmatter:
 ---
 summary: "One-line headline, ≤350 chars"  # required — powers the rollup index
 breaking: false                            # optional — true flags breaking changes
-security: false                            # optional — true flags security fixes
+security: false                            # optional — true ONLY for a source-code security fix, never a dependency CVE bump
 ---
 
 # 0.1.0 — YYYY-MM-DD
 ...
 ```
 
-`breaking: true` renders a `· ⚠️ Breaking` badge — use it when consumers must update code on upgrade (signature changes, removed APIs, config renames). `security: true` renders a `· 🛡️ Security` badge and pairs with a `## Security` body section. When both are set, badges render `· ⚠️ Breaking · 🛡️ Security`.
+`breaking: true` renders a `· ⚠️ Breaking` badge — use it when consumers must update code on upgrade (signature changes, removed APIs, config renames). `security: true` renders a `· 🛡️ Security` badge and pairs with a `## Security` body section — set it only for a security fix in this server's *own source code*, never for a routine dependency or transitive CVE bump (record those under `## Dependencies`). When both are set, badges render `· ⚠️ Breaking · 🛡️ Security`.
+
+`agent-notes` is an optional free-form field for maintenance agents processing the release downstream. Content here won't appear in the rendered CHANGELOG — it's consumed by agents running the `maintenance` skill. Use it for adoption instructions that don't fit the human-facing sections: new files to create, fields to populate, one-time migration steps. Omit entirely when there's nothing to say.
 
 **Section order** (Keep a Changelog): Added, Changed, Deprecated, Removed, Fixed, Security. Include only sections with entries — don't ship empty headers.
+
+**Tag annotations** render as GitHub Release bodies via `--notes-from-tag`. They must be structured markdown — never a flat comma-separated string. Subject omits the version number (GitHub prepends it). See `changelog/template.md` for the full format reference.
 
 ---
 
@@ -442,4 +458,7 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] ntfy-specific: per-call `base_url` overrides go out unauthenticated when they differ from the configured base — never widen this without explicit operator opt-in
 - [ ] Registered in `createApp()` arrays in `src/index.ts`
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
+- [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = package name; `interface.shortDescription` from `package.json` description
+- [ ] `.codex-plugin/mcp.json` updated — server name key matches `package.json` name; env vars added for any required API keys
+- [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; inline `mcpServers` entry with server name key, env vars for any required API keys
 - [ ] `bun run devcheck` passes

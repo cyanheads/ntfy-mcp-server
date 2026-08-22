@@ -23,6 +23,15 @@ vi.mock('node:dns/promises', async (importOriginal) => {
 });
 const { lookup } = await import('node:dns/promises');
 
+/**
+ * `lookup`'s declared return type is the single-address overload; the guard
+ * calls it with `{ all: true }`, so the mock resolves the array form.
+ */
+const resolvesTo = (addresses: Array<{ address: string; family: number }>) =>
+  vi
+    .mocked(lookup)
+    .mockResolvedValueOnce(addresses as unknown as { address: string; family: number });
+
 describe('BASE_URL_PATTERN', () => {
   it.each(['https://ntfy.sh', 'http://ntfy.example.com:8080', 'https://ntfy.sh/', ''])(
     'accepts %j',
@@ -133,7 +142,7 @@ describe('assertPublicHost', () => {
   });
 
   it('rejects when any resolved address is reserved, not just the first', async () => {
-    vi.mocked(lookup).mockResolvedValueOnce([
+    resolvesTo([
       { address: '93.184.216.34', family: 4 },
       { address: '10.0.0.7', family: 4 },
     ]);
@@ -143,7 +152,7 @@ describe('assertPublicHost', () => {
   });
 
   it('allows a host whose every resolved address is public', async () => {
-    vi.mocked(lookup).mockResolvedValueOnce([
+    resolvesTo([
       { address: '93.184.216.34', family: 4 },
       { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 },
     ]);

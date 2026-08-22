@@ -4,16 +4,16 @@
  * validation and advertised shape, byte-length message validation,
  * format-rendering (including the scheduled delivery-time label), scheduled-flag
  * synthesis, base_url override and its scheme validation, the consent gate
- * (which inputs prompt, which do not, every declining reply, and the
- * proceed-anyway path on clients without elicitation), and the full contract
- * error mapping
+ * across both round trips (which inputs prompt and which publish straight
+ * through, the first round's `input_required` result, and every re-entry
+ * reply), and the full contract error mapping
  * (forbidden / rate-limit / payload-too-large from a 413 / invalid-attachment /
  * unverified-contact / upstream-unreachable / generic rethrow) with the upstream
  * explanation preserved on the error message.
  * @module tests/tools/ntfy-publish-message.tool
  */
 
-import { z } from '@cyanheads/mcp-ts-core';
+import { type InputRequiredResult, z } from '@cyanheads/mcp-ts-core';
 import {
   forbidden,
   invalidParams,
@@ -23,7 +23,11 @@ import {
   rateLimited,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  expectInputRequired,
+  type MockContextOptions,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
@@ -47,6 +51,26 @@ function freshService() {
     requestTimeoutMs: 1000,
     maxRetries: 0,
   } as never);
+}
+
+/** The wire shape of the embedded `elicitation/create` request the gate emits. */
+type ElicitParams = {
+  message: string;
+  requestedSchema: { properties: Record<string, { type: string }>; required?: string[] };
+};
+
+/**
+ * Stands in for the second round of a gated publish: the context carries the
+ * approval the client would have collected after the first round's
+ * `input_required`.
+ */
+function consentedCtx(
+  reply: Record<string, unknown> = { action: 'accept', content: { confirm: true } },
+) {
+  return createMockContext({
+    errors: ntfyPublishMessage.errors,
+    inputResponses: { confirm: reply },
+  } as MockContextOptions<typeof ntfyPublishMessage.errors>);
 }
 
 describe('ntfyPublishMessage handler', () => {
@@ -132,10 +156,10 @@ describe('ntfyPublishMessage handler', () => {
   });
 
   it('advertises priority as a single constrained node on both input and output schemas', () => {
-    const input = z.toJSONSchema(ntfyPublishMessage.input, { io: 'input' }) as {
+    const input = z.toJSONSchema(ntfyPublishMessage.input, { io: 'input' }) as unknown as {
       properties: { priority: Record<string, unknown> };
     };
-    const output = z.toJSONSchema(ntfyPublishMessage.output, { io: 'output' }) as {
+    const output = z.toJSONSchema(ntfyPublishMessage.output, { io: 'output' }) as unknown as {
       properties: { priority: Record<string, unknown> };
     };
     for (const node of [input.properties.priority, output.properties.priority]) {
@@ -243,7 +267,9 @@ describe('ntfyPublishMessage handler', () => {
       message: 'x',
       attach: 'not-a-url',
     });
-    const err = (await ntfyPublishMessage.handler(input, ctx).catch((e: unknown) => e)) as McpError;
+    const err = (await Promise.resolve(ntfyPublishMessage.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    )) as McpError;
     expect(err.data).toMatchObject({ reason: 'invalid_attachment' });
     expect(err.message).toContain('attachment URL is invalid');
     const hint = String((err.data as { recovery: { hint: string } }).recovery.hint);
@@ -285,7 +311,9 @@ describe('ntfyPublishMessage handler', () => {
       message: 'x',
       delay: '9 fortnights',
     });
-    const err = (await ntfyPublishMessage.handler(input, ctx).catch((e: unknown) => e)) as McpError;
+    const err = (await Promise.resolve(ntfyPublishMessage.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    )) as McpError;
     expect(err.message).toContain('invalid delay parameter: unable to parse delay');
     expect(err.data?.reason).toBeUndefined();
   });
@@ -293,7 +321,8 @@ describe('ntfyPublishMessage handler', () => {
   it('maps a 4xx with email/phone-verification hint to `unverified_contact`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'publish').mockRejectedValue(invalidParams('Phone number is not verified'));
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    // `call` is a gated side effect — stand in for the approved second round.
+    const ctx = consentedCtx();
     const input = ntfyPublishMessage.input.parse({
       topic: 'alerts',
       message: 'x',
@@ -421,7 +450,9 @@ describe('ntfyPublishMessage handler', () => {
       message: 'hi',
       base_url: 'http://email.internal.example.com',
     });
-    const err = await ntfyPublishMessage.handler(input, ctx).catch((e: unknown) => e);
+    const err = await Promise.resolve(ntfyPublishMessage.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({ message: expect.stringContaining('non-public address') });
     expect((err as { data?: { reason?: string } }).data?.reason).toBeUndefined();
   });
@@ -534,55 +565,68 @@ describe('ntfyPublishMessage consent gate', () => {
   } as const;
   const BROADCAST_ACTION = { action: 'broadcast', label: 'Run macro' } as const;
 
+  const inputWith = (extra: Record<string, unknown>) =>
+    ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'hi', ...extra });
+
+  /** The elicitation params the first round hands back to the client. */
+  function confirmRequest(asked: InputRequiredResult): ElicitParams {
+    const request = asked.inputRequests?.confirm;
+    if (!request) throw new Error('Expected a `confirm` input request.');
+    expect(request.method).toBe('elicitation/create');
+    return request.params as ElicitParams;
+  }
+
+  function firstRound(extra: Record<string, unknown>): Promise<InputRequiredResult> {
+    return expectInputRequired(() =>
+      ntfyPublishMessage.handler(
+        inputWith(extra),
+        createMockContext({ errors: ntfyPublishMessage.errors }),
+      ),
+    );
+  }
+
   it.each([
     ['email forwarding', { email: 'ops@example.com' }, 'ops@example.com'],
     ['a voice call', { call: '+15551234567' }, '+15551234567'],
     ['a broadcast action', { actions: [BROADCAST_ACTION] }, 'broadcast intent'],
     ['an http action', { actions: [HTTP_ACTION] }, 'https://example.com/ack'],
-  ])('prompts for %s and names the target', async (_label, extra, expected) => {
+  ])('asks before publishing %s and names the target', async (_label, extra, expected) => {
     const publish = stubbedPublish();
-    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
 
-    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'hi', ...extra });
-    await ntfyPublishMessage.handler(input, ctx);
+    const { message } = confirmRequest(await firstRound(extra));
 
-    expect(elicit).toHaveBeenCalledOnce();
-    const prompt = elicit.mock.calls[0]?.[0] as string;
-    expect(prompt).toContain('alerts');
-    expect(prompt).toContain(expected);
-    expect(publish).toHaveBeenCalledOnce();
+    expect(message).toContain('alerts');
+    expect(message).toContain(expected);
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it('names the method of an http action button', async () => {
     stubbedPublish();
-    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
-    const input = ntfyPublishMessage.input.parse({
-      topic: 'alerts',
-      message: 'hi',
-      actions: [HTTP_ACTION],
-    });
-    await ntfyPublishMessage.handler(input, ctx);
-    expect(elicit.mock.calls[0]?.[0]).toContain('HTTP DELETE');
+    const { message } = confirmRequest(await firstRound({ actions: [HTTP_ACTION] }));
+    expect(message).toContain('HTTP DELETE');
   });
 
   it('lists every side effect when a publish carries more than one', async () => {
     stubbedPublish();
-    const elicit = vi.fn().mockResolvedValue({ action: 'accept', content: { confirm: true } });
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
-    const input = ntfyPublishMessage.input.parse({
-      topic: 'alerts',
-      message: 'hi',
-      email: 'ops@example.com',
-      call: '+15551234567',
-      actions: [HTTP_ACTION],
-    });
-    await ntfyPublishMessage.handler(input, ctx);
-    const prompt = elicit.mock.calls[0]?.[0] as string;
-    expect(prompt).toContain('ops@example.com');
-    expect(prompt).toContain('+15551234567');
-    expect(prompt).toContain('https://example.com/ack');
+    const { message } = confirmRequest(
+      await firstRound({
+        email: 'ops@example.com',
+        call: '+15551234567',
+        actions: [HTTP_ACTION],
+      }),
+    );
+    expect(message).toContain('ops@example.com');
+    expect(message).toContain('+15551234567');
+    expect(message).toContain('https://example.com/ack');
+  });
+
+  it('advertises a single boolean `confirm` field on the prompt schema', async () => {
+    stubbedPublish();
+    const { requestedSchema } = confirmRequest(await firstRound({ email: 'ops@example.com' }));
+
+    expect(Object.keys(requestedSchema.properties)).toEqual(['confirm']);
+    expect(requestedSchema.properties.confirm?.type).toBe('boolean');
+    expect(requestedSchema.required).toEqual(['confirm']);
   });
 
   it.each([
@@ -591,16 +635,26 @@ describe('ntfyPublishMessage consent gate', () => {
     ['a click URL', { click: 'https://example.com/dashboard' }],
     ['a view action', { actions: [{ action: 'view', label: 'Open', url: 'https://example.com' }] }],
     ['a copy action', { actions: [{ action: 'copy', label: 'Copy', value: 'token' }] }],
-  ])('does not prompt for %s', async (_label, extra) => {
+  ])('publishes %s on the first call, without asking', async (_label, extra) => {
     const publish = stubbedPublish();
-    const elicit = vi.fn();
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors, elicit });
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
 
-    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'hi', ...extra });
-    await ntfyPublishMessage.handler(input, ctx);
+    await ntfyPublishMessage.handler(inputWith(extra), ctx);
 
-    expect(elicit).not.toHaveBeenCalled();
     expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it('publishes once the retried call approves the side effect', async () => {
+    const publish = stubbedPublish();
+
+    const result = await ntfyPublishMessage.handler(
+      inputWith({ email: 'ops@example.com' }),
+      consentedCtx(),
+    );
+
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish.mock.calls[0]?.[0]).toMatchObject({ email: 'ops@example.com' });
+    expect(result.id).toBe('mid_1');
   });
 
   it.each([
@@ -608,35 +662,24 @@ describe('ntfyPublishMessage consent gate', () => {
     ['cancel', { action: 'cancel' }],
     ['accept with confirm=false', { action: 'accept', content: { confirm: false } }],
     ['accept with an unparseable payload', { action: 'accept', content: { confirm: 'yes' } }],
+    ['accept with no content at all', { action: 'accept' }],
+    ['a roots listing instead of an elicitation', { roots: [] }],
   ])('fails with `consent_declined` on %s, without publishing', async (_label, reply) => {
     const publish = stubbedPublish();
-    const ctx = createMockContext({
-      errors: ntfyPublishMessage.errors,
-      elicit: vi.fn().mockResolvedValue(reply),
-    });
 
-    const input = ntfyPublishMessage.input.parse({
-      topic: 'alerts',
-      message: 'hi',
-      email: 'ops@example.com',
-    });
-    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'consent_declined' },
-    });
+    await expect(
+      ntfyPublishMessage.handler(inputWith({ email: 'ops@example.com' }), consentedCtx(reply)),
+    ).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
     expect(publish).not.toHaveBeenCalled();
   });
 
-  it('proceeds when the client does not support elicitation', async () => {
-    const publish = stubbedPublish();
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
-    expect(ctx.elicit).toBeUndefined();
-
-    const input = ntfyPublishMessage.input.parse({
-      topic: 'alerts',
-      message: 'hi',
-      call: '+15551234567',
-    });
-    await ntfyPublishMessage.handler(input, ctx);
-    expect(publish).toHaveBeenCalledOnce();
+  it('does not re-ask after a refusal — a declined round is a dead end', async () => {
+    stubbedPublish();
+    const declined = ntfyPublishMessage.handler(
+      inputWith({ call: '+15551234567' }),
+      consentedCtx({ action: 'decline' }),
+    );
+    await expect(declined).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
+    await expect(declined).rejects.not.toMatchObject({ isInputRequiredSignal: true });
   });
 });
