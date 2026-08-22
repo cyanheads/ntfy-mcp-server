@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.3.1](changelog/2.3.x/2.3.1.md) — 2026-08-22 · ⚠️ Breaking
+
+Adopts mcp-ts-core 0.12.3 and MCP SDK v2: the consent gate becomes a multi-round-trip request that now reaches Streamable HTTP clients, tool inputs turn strict, and the advertised outputSchema declares the error envelope
+
 ## [2.3.0](changelog/2.3.x/2.3.0.md) — 2026-07-29 · ⚠️ Breaking · 🛡️ Security
 
 SSRF guard for base_url overrides and a consent gate on destructive/side-effect ntfy_manage_message and ntfy_publish_message calls

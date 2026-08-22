@@ -1,11 +1,9 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-07-30 03:19:52
+Generated on: 2026-08-22 19:06:02
 
 ```text
 ntfy-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ ntfy-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
