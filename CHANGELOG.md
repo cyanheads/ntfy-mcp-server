@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [2.3.3](changelog/2.3.x/2.3.3.md) — 2026-09-04
 
-Recognizes retry-exhausted upstream 5xx failures again under mcp-ts-core 0.12.5's error codes, and reports a cancelled ntfy request as cancelled instead of a retryable upstream fault
+Recognizes retry-exhausted upstream 5xx failures again under mcp-ts-core 0.12.4's reclassified error codes, and reports a cancelled ntfy request as cancelled instead of a retryable upstream fault
 
 ## [2.3.2](changelog/2.3.x/2.3.2.md) — 2026-08-22
 
