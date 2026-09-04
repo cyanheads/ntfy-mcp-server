@@ -6,14 +6,14 @@
     "url": "https://github.com/cyanheads/ntfy-mcp-server",
     "source": "github"
   },
-  "version": "2.3.2",
+  "version": "2.3.3",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
       "runtimeHint": "bun",
-      "version": "2.3.2",
+      "version": "2.3.3",
       "packageArguments": [
         { "type": "positional", "value": "run" },
         { "type": "positional", "value": "start:stdio" }
@@ -108,7 +108,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
       "runtimeHint": "bun",
-      "version": "2.3.2",
+      "version": "2.3.3",
       "packageArguments": [
         { "type": "positional", "value": "run" },
         { "type": "positional", "value": "start:http" }
