@@ -154,16 +154,72 @@ describe('isUpstreamUnreachable', () => {
     expect(isUpstreamUnreachable(err)).toBe(true);
   });
 
-  it('rejects retried errors that surfaced a non-internal JSON-RPC code', () => {
-    // 4xx-classed retries (rare, but the helper wouldn't retry them) — the
-    // upstream status should win, not the network classifier.
+  it('matches a retry-exhausted ServiceUnavailable — the shape an ntfy 5xx takes', () => {
+    const err = new McpError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      'ntfy returned HTTP 502 Bad Gateway. (failed after 4 attempts)',
+    );
+    expect(isUpstreamUnreachable(err)).toBe(true);
+  });
+
+  it('matches a retry-exhausted ServiceUnavailable from a 500', () => {
+    // 500 and 501 map to ServiceUnavailable as well, so a hard upstream fault
+    // exhausts under the same code as a gateway error.
+    const err = new McpError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      'ntfy returned HTTP 500 Internal Server Error. (failed after 4 attempts)',
+    );
+    expect(isUpstreamUnreachable(err)).toBe(true);
+  });
+
+  it('matches a retry-exhausted Timeout', () => {
+    const err = new McpError(
+      JsonRpcErrorCode.Timeout,
+      'ntfy returned HTTP 504 Gateway Timeout. (failed after 4 attempts)',
+    );
+    expect(isUpstreamUnreachable(err)).toBe(true);
+  });
+
+  it('rejects a retry-exhausted RateLimited — 429 has its own reason', () => {
+    // RateLimited is transient and does exhaust with the suffix, but it is
+    // deliberately excluded: the publish tool declares `rate_limited`, and the
+    // other two should surface the 429 rather than call the server unreachable.
     const err = new McpError(JsonRpcErrorCode.RateLimited, 'throttled (failed after 3 attempts)');
     expect(isUpstreamUnreachable(err)).toBe(false);
+  });
+
+  it('rejects a retry-exhausted error carrying a non-transient code', () => {
+    for (const code of [
+      JsonRpcErrorCode.Forbidden,
+      JsonRpcErrorCode.NotFound,
+      JsonRpcErrorCode.ValidationError,
+      JsonRpcErrorCode.InvalidParams,
+    ]) {
+      expect(isUpstreamUnreachable(new McpError(code, 'nope (failed after 3 attempts)'))).toBe(
+        false,
+      );
+    }
+  });
+
+  it('rejects a cancellation, retried or not — the caller is gone, not the server', () => {
+    expect(
+      isUpstreamUnreachable(new McpError(JsonRpcErrorCode.RequestCancelled, 'caller went away')),
+    ).toBe(false);
+    expect(
+      isUpstreamUnreachable(
+        new McpError(JsonRpcErrorCode.RequestCancelled, 'gone (failed after 3 attempts)'),
+      ),
+    ).toBe(false);
   });
 
   it('rejects errors that lack the retry-exhausted suffix', () => {
     expect(isUpstreamUnreachable(new Error('connection refused'))).toBe(false);
     expect(isUpstreamUnreachable(new Error(''))).toBe(false);
+    // A transient code alone is not enough — a 503 that failed fast on an
+    // over-cap `Retry-After` never went through the retry loop.
+    expect(
+      isUpstreamUnreachable(new McpError(JsonRpcErrorCode.ServiceUnavailable, 'ntfy is down')),
+    ).toBe(false);
   });
 });
 

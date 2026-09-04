@@ -14,6 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ServerConfig } from '@/config/server-config.js';
 import {
+  getCode as getErrorCode,
+  isUpstreamUnreachable,
+} from '@/services/ntfy/error-classifier.js';
+import {
   getNtfyService,
   initNtfyService,
   NtfyService,
@@ -37,11 +41,13 @@ interface CapturedCall {
   headers: Record<string, string>;
   method: string | undefined;
   redirect: string | undefined;
+  /** The composed signal `timedFetch` hands to `fetch` — abort-path tests wait on it. */
+  signal: AbortSignal | undefined;
   url: string;
 }
 
 function captureFetch(
-  responder: (call: CapturedCall) => Response = () =>
+  responder: (call: CapturedCall) => Response | Promise<Response> = () =>
     new Response(JSON.stringify({ id: 'm1', time: 1, topic: 'alerts' }), { status: 200 }),
 ) {
   const calls: CapturedCall[] = [];
@@ -56,11 +62,31 @@ function captureFetch(
       auth: headers.Authorization,
       body: typeof init?.body === 'string' ? init.body : undefined,
       redirect: init?.redirect,
+      signal: init?.signal ?? undefined,
     };
     calls.push(call);
-    return responder(call) as unknown as Response;
+    return (await responder(call)) as unknown as Response;
   });
   return { calls, mock };
+}
+
+/**
+ * A responder that models a real `fetch`: it never settles on its own, and
+ * rejects with the composed signal's abort reason once `timedFetch` aborts —
+ * whether the timeout timer or the caller's signal fired. Verified against
+ * Bun's own `fetch`, which rejects with the reason object it was aborted with
+ * (and a generic `AbortError` DOMException when the reason is `undefined`).
+ */
+function abortAwareResponder(call: CapturedCall): Promise<Response> {
+  return new Promise<Response>((_resolve, reject) => {
+    const signal = call.signal;
+    if (!signal) return;
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
 }
 
 describe('NtfyService multi-server', () => {
@@ -609,6 +635,144 @@ describe('NtfyService.fetch request shape', () => {
     await expect(svc.fetch({ topic: 'alerts', since: 'tomorrow_maybe' })).rejects.toMatchObject({
       code: JsonRpcErrorCode.InvalidParams,
     });
+  });
+});
+
+describe('NtfyService cancellation vs timeout', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('surfaces a request-deadline abort as a timeout, never a cancellation', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      requestTimeoutMs: 20,
+    });
+    captureFetch(abortAwareResponder);
+    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    expect(getErrorCode(err)).not.toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(err.message).toContain('Timeout');
+    // Retry-exhausted, so the network classifier still claims it.
+    expect(err.message).toMatch(/\(failed after 1 attempt\)/);
+    expect(isUpstreamUnreachable(err)).toBe(true);
+  });
+
+  it('surfaces a caller disconnect as RequestCancelled', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    const controller = new AbortController();
+    captureFetch((call) => {
+      queueMicrotask(() => controller.abort());
+      return abortAwareResponder(call);
+    });
+    const err = await svc
+      .publish(PUBLISH_BODY, { signal: controller.signal })
+      .catch((e: unknown) => e as Error);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RequestCancelled);
+  });
+
+  it('surfaces an already-aborted caller signal as RequestCancelled', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    const controller = new AbortController();
+    controller.abort();
+    captureFetch(abortAwareResponder);
+    const err = await svc
+      .fetch({ topic: 'alerts' }, { signal: controller.signal })
+      .catch((e: unknown) => e as Error);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RequestCancelled);
+  });
+
+  it('does not treat a cancellation as unreachable, and does not retry it', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 3,
+    });
+    const controller = new AbortController();
+    const { calls } = captureFetch((call) => {
+      queueMicrotask(() => controller.abort());
+      return abortAwareResponder(call);
+    });
+    const err = await svc
+      .manage('alerts', 'seq_1', 'clear', { signal: controller.signal })
+      .catch((e: unknown) => e as Error);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(isUpstreamUnreachable(err)).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('classifies a disconnect that lands on a later retry attempt', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 2,
+    });
+    const controller = new AbortController();
+    let attempt = 0;
+    const { calls } = captureFetch((call) => {
+      attempt += 1;
+      if (attempt === 1) {
+        return new Response('upstream hiccup', {
+          status: 503,
+          headers: { 'content-type': 'text/plain' },
+        });
+      }
+      queueMicrotask(() => controller.abort());
+      return abortAwareResponder(call);
+    });
+    const err = await svc
+      .publish(PUBLISH_BODY, { signal: controller.signal })
+      .catch((e: unknown) => e as Error);
+    expect(calls).toHaveLength(2);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RequestCancelled);
+    // The retry budget was not spent re-issuing a request nobody is waiting for.
+    expect(err.message).not.toMatch(/failed after/);
+  });
+});
+
+describe('NtfyService retry exhaustion', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('retries an upstream 5xx to exhaustion and lands on `upstream_unreachable` territory', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 2,
+    });
+    const { calls } = captureFetch(
+      () => new Response('bad gateway', { status: 502, headers: { 'content-type': 'text/plain' } }),
+    );
+    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    expect(calls).toHaveLength(3);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(err.message).toMatch(/\(failed after 3 attempts\)/);
+    expect(isUpstreamUnreachable(err)).toBe(true);
+  });
+
+  it('retries a 500 the same way — no status maps to InternalError any more', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 1,
+    });
+    const { calls } = captureFetch(
+      () => new Response('boom', { status: 500, headers: { 'content-type': 'text/plain' } }),
+    );
+    const err = await svc.fetch({ topic: 'alerts' }).catch((e: unknown) => e as Error);
+    expect(calls).toHaveLength(2);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(isUpstreamUnreachable(err)).toBe(true);
+  });
+
+  it('does not fold a retried-out 429 into unreachable', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 1,
+    });
+    const { calls } = captureFetch(
+      () => new Response('slow down', { status: 429, headers: { 'content-type': 'text/plain' } }),
+    );
+    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    expect(calls).toHaveLength(2);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RateLimited);
+    expect(isUpstreamUnreachable(err)).toBe(false);
   });
 });
 

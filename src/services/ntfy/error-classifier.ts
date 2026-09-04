@@ -82,15 +82,31 @@ export function isNotFoundCode(code: unknown): boolean {
 }
 
 /**
- * Retry-exhausted network failures surface as plain `Error` with the framework
- * retry suffix `(failed after N attempts)` and no JSON-RPC code (or the
- * `InternalError` fallback). The retry helper only retries transient/5xx
- * conditions, so the suffix alone is a reliable network-failure signal.
+ * The retry suffix `(failed after N attempts)` marks an error the framework's
+ * retry boundary already gave up on, which is the signal that ntfy itself is
+ * not answering rather than answering with a complaint. A raw network throw
+ * (DNS failure, refused connection) arrives with no JSON-RPC code at all; an
+ * upstream 5xx arrives classified — `Timeout` for a 504, `ServiceUnavailable`
+ * for every other 5xx — since the framework maps no status onto
+ * `InternalError`, that code meaning *this* server failed. `InternalError`
+ * stays accepted for the classifier's own fallback on an unrecognized throw.
+ *
+ * `RateLimited` is excluded even though it is transient and exhausts with the
+ * same suffix: a quota is a live server answering, and `ntfy_publish_message`
+ * declares a `rate_limited` reason for it. `RequestCancelled` is excluded
+ * because the caller is the one who left. Retry exhaustion is also required,
+ * never a matching code on its own: a 503 whose `Retry-After` exceeds the retry
+ * budget fails fast without ever looping.
  */
 export function isUpstreamUnreachable(err: unknown): boolean {
   if (!/\(failed after \d+ attempts?\)/.test(getMessage(err))) return false;
   const code = getCode(err);
-  return typeof code !== 'number' || code === JsonRpcErrorCode.InternalError;
+  if (typeof code !== 'number') return true;
+  return (
+    code === JsonRpcErrorCode.ServiceUnavailable ||
+    code === JsonRpcErrorCode.Timeout ||
+    code === JsonRpcErrorCode.InternalError
+  );
 }
 
 /**

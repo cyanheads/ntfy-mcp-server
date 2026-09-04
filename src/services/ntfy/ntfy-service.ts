@@ -12,7 +12,7 @@
  * @module services/ntfy/ntfy-service
  */
 
-import { McpError, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, requestCancelled, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import type { NtfyServerEntry, ServerConfig } from '@/config/server-config.js';
@@ -34,6 +34,14 @@ import type {
  * non-ok response, which would erase the upstream's actual status code from
  * `httpErrorFromResponse` — and we need that for the error contract mapping
  * (`forbidden_topic` ← 403, `not_found` ← 404, `invalid_since` ← 400, etc.).
+ *
+ * One controller serves two unrelated aborts, so the cause is tracked rather
+ * than read back off the rejection: the request deadline expiring is a
+ * `Timeout` the retry boundary should keep trying, while the caller's signal
+ * firing means the MCP client is gone and nothing can be delivered to it. The
+ * latter surfaces as `RequestCancelled`, which sits outside the transient set
+ * and logs without a stack — matching what `fetchWithTimeout` does on its own
+ * external-abort path.
  */
 async function timedFetch(
   url: string,
@@ -41,16 +49,28 @@ async function timedFetch(
   timeoutMs: number,
   externalSignal: AbortSignal | undefined,
 ): Promise<Response> {
+  let callerGone = false;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('Timeout')), timeoutMs);
-  const onAbort = () => controller.abort(externalSignal?.reason);
+  const onAbort = () => {
+    callerGone = true;
+    controller.abort(externalSignal?.reason);
+  };
   if (externalSignal) {
-    if (externalSignal.aborted) controller.abort(externalSignal.reason);
+    if (externalSignal.aborted) onAbort();
     else externalSignal.addEventListener('abort', onAbort, { once: true });
   }
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (err) {
+    // The caller abandoned the request. Say so with the code that means it, so
+    // the failure is not counted as an ntfy outage and no attempt is spent
+    // re-issuing a request nobody is waiting for.
+    if (callerGone) {
+      throw requestCancelled('The ntfy request was cancelled by the caller.', undefined, {
+        cause: err,
+      });
+    }
     // A refused redirect is a deliberate block, not a transient network fault:
     // name it, and give it a non-retryable code so the retry boundary above
     // doesn't burn three attempts re-refusing the same hop.
