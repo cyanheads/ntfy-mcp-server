@@ -23,6 +23,10 @@ await createApp({
   title: 'ntfy-mcp-server',
   tools: [ntfyPublishMessage, ntfyManageMessage, ntfyFetchMessages, ntfySearchEmojiTags],
   resources: [ntfyTopicResource],
+  // The consent gate in `confirmAction` is a multi-round-trip `ctx.requestInput`
+  // flow, which a 2025-era HTTP client can only answer over a live session — so a
+  // stateless HTTP start is refused at boot rather than breaking the gate.
+  sessionMode: { default: 'stateful', require: 'stateful' },
   instructions:
     'Use the ntfy_* tools to publish and manage push notifications via ntfy, a pub/sub notification service. Messages live on topics (arbitrary string channels) and get a server-assigned `sequence_id` reusable to update or replace them later. Typical flow: `ntfy_publish_message` → `ntfy_fetch_messages` to poll cached history → `ntfy_manage_message` to clear or delete by `sequence_id`. Use `ntfy_search_emoji_tags` to look up short codes for `tags`. Topic names act as access tokens — treat them as secrets.',
   setup() {

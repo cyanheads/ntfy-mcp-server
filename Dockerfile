@@ -108,8 +108,9 @@ ENV MCP_HTTP_HOST="0.0.0.0"
 ENV MCP_TRANSPORT_TYPE="http"
 # Stateful, not stateless: the consent prompt on destructive and outbound calls
 # is a multi-round-trip request, and a 2025-era HTTP client needs a live session
-# for the SDK's legacy shim to complete it. Declared explicitly so the container
-# states the same posture as every other launch path.
+# for the SDK's legacy shim to complete it. src/index.ts requires it, so a
+# stateless HTTP start fails at boot; declared here too so the container states
+# the same posture as every other launch path.
 ENV MCP_SESSION_MODE="stateful"
 ENV MCP_LOG_LEVEL="info"
 ENV LOGS_DIR="/var/log/ntfy-mcp-server"

@@ -174,10 +174,10 @@
         },
         {
           "name": "MCP_SESSION_MODE",
-          "description": "HTTP session model: 'auto', 'stateful', or 'stateless'. 'auto' resolves to 'stateful'. Keep it stateful \u2014 the consent prompt on destructive and outbound calls is a multi-round-trip request that a 2025-era HTTP client can only complete over a live session.",
+          "description": "HTTP session model: 'auto', 'stateful', or 'stateless'. This server requires 'stateful' over HTTP \u2014 the consent prompt on destructive and outbound calls is a multi-round-trip request that a 2025-era HTTP client can only complete over a live session \u2014 so an HTTP start with 'stateless' is refused. 'auto' resolves to 'stateful'; stdio ignores the setting.",
           "format": "string",
           "isRequired": false,
-          "default": "auto"
+          "default": "stateful"
         },
         {
           "name": "MCP_HTTP_HOST",
