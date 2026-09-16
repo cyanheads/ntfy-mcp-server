@@ -15,6 +15,7 @@
     "README.md",
     "LICENSE",
     "CLAUDE.md",
+    "AGENTS.md",
     "Dockerfile",
     "server.json"
   ],
