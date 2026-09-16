@@ -4,7 +4,8 @@
  * mutual exclusion of token vs basic auth, trailing-slash stripping, the
  * precedence of NTFY_SERVERS over the shorthand vars when both are set, the
  * deprecated NTFY_API_KEY alias, defaultTopic / numeric-coercion validation,
- * the NTFY_BLOCK_PRIVATE_HOSTS boolean flag, and the memoization behavior of
+ * the NTFY_BLOCK_PRIVATE_HOSTS boolean flag, blank / whitespace / whole-value
+ * `${…}` placeholder values reading as unset, and the memoization behavior of
  * `getServerConfig` / `resetServerConfig`.
  * @module tests/config/server-config
  */
@@ -226,6 +227,60 @@ describe('getServerConfig', () => {
     it('names the env var when the value is not a recognized boolean', () => {
       process.env.NTFY_BLOCK_PRIVATE_HOSTS = 'maybe';
       expect(() => getServerConfig()).toThrow(/NTFY_BLOCK_PRIVATE_HOSTS/);
+    });
+  });
+
+  describe('blank and unsubstituted placeholder values', () => {
+    const DEFAULTS = {
+      servers: [{ baseUrl: 'https://ntfy.sh' }],
+      requestTimeoutMs: 15_000,
+      maxRetries: 3,
+      blockPrivateHosts: false,
+    };
+
+    /** A whole-value `${name}` reference an install host forwarded unsubstituted. */
+    const placeholder = (name: string) => `\${${name}}`;
+
+    const cases = KEYS.flatMap((key) => [
+      [key, ''],
+      [key, '   '],
+      [key, placeholder(key)],
+      [key, placeholder('user_config.value')],
+    ]);
+
+    it.each(cases)('reads %s=%j as unset', (key, value) => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      process.env[key] = value;
+      const cfg = getServerConfig();
+      expect(cfg).toEqual(DEFAULTS);
+      expect(cfg.defaultTopic).toBeUndefined();
+      expect(stderr).not.toHaveBeenCalled();
+    });
+
+    it('falls back to NTFY_API_KEY, with the deprecation warning, when NTFY_AUTH_TOKEN is blank', () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      process.env.NTFY_AUTH_TOKEN = '';
+      process.env.NTFY_API_KEY = 'tk_legacy';
+      expect(getServerConfig().servers[0]?.authToken).toBe('tk_legacy');
+      const writes = stderr.mock.calls.map((c) => String(c[0]));
+      expect(writes.some((w) => /NTFY_API_KEY is deprecated/i.test(w))).toBe(true);
+    });
+
+    it('treats a placeholder username as unset, so a lone password still fails naming NTFY_AUTH_USERNAME', () => {
+      process.env.NTFY_AUTH_USERNAME = placeholder('NTFY_AUTH_USERNAME');
+      process.env.NTFY_AUTH_PASSWORD = 'pass';
+      expect(() => getServerConfig()).toThrow(/NTFY_AUTH_USERNAME.*Basic auth requires both/);
+    });
+
+    it('keeps a value that only contains a placeholder', () => {
+      const token = `tk_${placeholder('suffix')}`;
+      process.env.NTFY_AUTH_TOKEN = token;
+      expect(getServerConfig().servers[0]?.authToken).toBe(token);
+    });
+
+    it('still names the env var for a non-blank invalid value', () => {
+      process.env.NTFY_REQUEST_TIMEOUT_MS = 'soon';
+      expect(() => getServerConfig()).toThrow(/NTFY_REQUEST_TIMEOUT_MS/);
     });
   });
 

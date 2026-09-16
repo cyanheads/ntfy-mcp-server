@@ -16,6 +16,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { normalizeEnv } from '@cyanheads/mcp-ts-core/config';
 import { configurationError } from '@cyanheads/mcp-ts-core/errors';
 
 const NtfyServerEntrySchema = z
@@ -128,7 +129,14 @@ interface RawEnv {
   NTFY_SERVERS?: string | undefined;
 }
 
-function loadFromEnv(env: RawEnv | NodeJS.ProcessEnv): ServerConfig {
+/**
+ * Reads blank, whitespace-only, and whole-value `${…}` placeholder values as
+ * unset — the rule the framework applies to its own config — so an optional
+ * var stays unset and a defaulted one takes its default instead of failing
+ * validation against the literal text an install host forwarded.
+ */
+function loadFromEnv(rawEnv: Record<string, string | undefined>): ServerConfig {
+  const env: RawEnv = normalizeEnv(rawEnv);
   const serversInput = env.NTFY_SERVERS
     ? parseServersJson(env.NTFY_SERVERS)
     : [singleServerFromEnv(env)];
@@ -138,9 +146,7 @@ function loadFromEnv(env: RawEnv | NodeJS.ProcessEnv): ServerConfig {
     defaultTopic: env.NTFY_DEFAULT_TOPIC,
     requestTimeoutMs: env.NTFY_REQUEST_TIMEOUT_MS,
     maxRetries: env.NTFY_MAX_RETRIES,
-    // `||` not `??`: an empty-string env var means "unset" here, and
-    // `z.stringbool()` rejects '' rather than falling back to the default.
-    blockPrivateHosts: env.NTFY_BLOCK_PRIVATE_HOSTS || undefined,
+    blockPrivateHosts: env.NTFY_BLOCK_PRIVATE_HOSTS,
   });
 
   if (!result.success) {
@@ -164,7 +170,7 @@ function parseServersJson(raw: string): unknown {
   return parsed;
 }
 
-function singleServerFromEnv(env: RawEnv | NodeJS.ProcessEnv): Record<string, unknown> {
+function singleServerFromEnv(env: RawEnv): Record<string, unknown> {
   const authToken = env.NTFY_AUTH_TOKEN ?? env.NTFY_API_KEY;
   if (!env.NTFY_AUTH_TOKEN && env.NTFY_API_KEY) {
     warnDeprecatedApiKey();
@@ -189,7 +195,7 @@ function warnDeprecatedApiKey(): void {
   );
 }
 
-function formatIssues(issues: z.ZodIssue[], env: RawEnv | NodeJS.ProcessEnv): string {
+function formatIssues(issues: z.ZodIssue[], env: RawEnv): string {
   const usingRegistry = Boolean(env.NTFY_SERVERS);
   const lines = issues.map((issue) => {
     const path = issue.path.join('.');
