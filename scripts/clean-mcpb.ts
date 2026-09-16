@@ -9,8 +9,8 @@
  *   2. Exact-name strip of two entry classes nested under `node_modules/`,
  *      which root-anchored `.mcpbignore` patterns cannot reach by design
  *      (issues #146/#207):
- *        a. Dependency-shipped agent docs — `skills/`, `.claude/`, `.agents/`
- *           trees and stray `SKILL.md` files (issue #230).
+ *        a. Dependency-shipped agent docs — `framework-skills/`, `skills/`,
+ *           `.claude/`, `.agents/` trees and stray `SKILL.md` files (issue #230).
  *        b. Platform-specific native bindings, which would otherwise lock the
  *           bundle to the build host's platform and push it past the 25 MB cap
  *           registries enforce (issue #274).
@@ -33,15 +33,21 @@ import { fileURLToPath } from 'node:url';
 /**
  * Agent-doc entries under `node_modules/` that must not ship in a bundle.
  * KEEP IN SYNC with `AGENT_DOC_ENTRY` in `scripts/lint-packaging.ts`
- * (post-bundle content check) — a unit test asserts the two are identical.
+ * (post-bundle content check) — edit both literals together. The assertion that
+ * they match lives in the mcp-ts-core repository's own test suite; `tests/` is
+ * not part of the published package, so nothing enforces the pair in a server
+ * these scripts were copied into.
  */
 export const AGENT_DOC_ENTRY =
-  /^node_modules\/.*(?:\/skills\/|\/\.claude\/|\/\.agents\/|\/SKILL\.md$)/;
+  /^node_modules\/.*(?:\/framework-skills\/|\/skills\/|\/\.claude\/|\/\.agents\/|\/SKILL\.md$)/;
 
 /**
  * Platform-specific native binding packages, which must not ship in a bundle.
  * KEEP IN SYNC with `NATIVE_BINDING_ENTRY` in `scripts/lint-packaging.ts`
- * (post-bundle content check) — a unit test asserts the two are identical.
+ * (post-bundle content check) — edit both literals together. The assertion that
+ * they match lives in the mcp-ts-core repository's own test suite; `tests/` is
+ * not part of the published package, so nothing enforces the pair in a server
+ * these scripts were copied into.
  *
  * `mcpb pack` archives the whole project directory, so a native dependency
  * contributes the build host's platform slice and nothing else — for
