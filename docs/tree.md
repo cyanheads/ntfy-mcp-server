@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-08-22 19:06:02
+Generated on: 2026-09-16 09:10:58
 
 ```text
 ntfy-mcp-server/
@@ -38,25 +38,7 @@ ntfy-mcp-server/
 │   │   ├── publish.md
 │   │   └── SOURCES.md
 │   └── design.md
-├── scripts/
-│   ├── build-changelog.ts
-│   ├── build-emoji-tags.ts
-│   ├── build.ts
-│   ├── check-dependency-specifiers.ts
-│   ├── check-docs-sync.ts
-│   ├── check-framework-antipatterns.ts
-│   ├── check-skill-versions.ts
-│   ├── check-skills-sync.ts
-│   ├── clean-mcpb.ts
-│   ├── clean.ts
-│   ├── devcheck.ts
-│   ├── lint-mcp.ts
-│   ├── lint-packaging.ts
-│   ├── list-skills.ts
-│   ├── release-github.ts
-│   ├── split-changelog.ts
-│   └── tree.ts
-├── skills/
+├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
 │   ├── add-prompt/
@@ -127,6 +109,8 @@ ntfy-mcp-server/
 │   │   └── SKILL.md
 │   ├── release-and-publish/
 │   │   └── SKILL.md
+│   ├── release-pr-review/
+│   │   └── SKILL.md
 │   ├── report-issue-framework/
 │   │   └── SKILL.md
 │   ├── report-issue-local/
@@ -141,6 +125,24 @@ ntfy-mcp-server/
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
+├── scripts/
+│   ├── build-changelog.ts
+│   ├── build-emoji-tags.ts
+│   ├── build.ts
+│   ├── check-dependency-specifiers.ts
+│   ├── check-docs-sync.ts
+│   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
+│   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
+│   ├── clean.ts
+│   ├── devcheck.ts
+│   ├── lint-mcp.ts
+│   ├── lint-packaging.ts
+│   ├── list-skills.ts
+│   ├── release-github.ts
+│   ├── split-changelog.ts
+│   └── tree.ts
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts

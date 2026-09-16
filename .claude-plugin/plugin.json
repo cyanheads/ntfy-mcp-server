@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ntfy-mcp-server",
-  "version": "2.3.3",
+  "version": "2.3.4",
   "description": "Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",

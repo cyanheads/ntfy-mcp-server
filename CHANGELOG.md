@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.3.4](changelog/2.3.x/2.3.4.md) — 2026-09-16
+
+HTTP now refuses to start under a stateless session, since the consent gate needs a live session to complete. Blank and unsubstituted ${…} placeholder NTFY_* values read as unset instead of failing or forwarding the literal text. Development skills move from skills/ to framework-skills/.
+
 ## [2.3.3](changelog/2.3.x/2.3.3.md) — 2026-09-04
 
 Recognizes retry-exhausted upstream 5xx failures again under mcp-ts-core 0.12.4's reclassified error codes, and reports a cancelled ntfy request as cancelled instead of a retryable upstream fault
