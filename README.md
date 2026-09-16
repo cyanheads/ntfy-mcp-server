@@ -9,7 +9,7 @@
 
 [![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -21,43 +21,52 @@
 
 ---
 
-## Tools
+## Overview
 
-Four tools covering the ntfy publish/subscribe surface — message lifecycle (publish, manage, fetch) plus an emoji-tag lookup that feeds the publish tool's `tags` field:
+Push notifications over the ntfy pub/sub HTTP API. Publish, update, and manage notifications, poll cached topic history, and look up emoji short codes for tags from any MCP client. Runs as a stdio process or a local Streamable HTTP server.
 
-| Tool Name | Description |
-|:----------|:------------|
+### Tools
+
+| Tool | Description |
+|:---|:---|
 | `ntfy_publish_message` | Send or update a push notification on an ntfy topic. |
 | `ntfy_manage_message` | Clear or delete a previously-sent notification by `sequence_id`. |
 | `ntfy_fetch_messages` | Poll cached messages from one or more topics with optional filters. |
 | `ntfy_search_emoji_tags` | Look up ntfy emoji tag short codes for use in `tags`. |
 
----
+### Resources
 
-### `ntfy_publish_message`
+| Resource | Description |
+|:---|:---|
+| `ntfy://{topic}` | Snapshot of a topic — latest 20 messages from the past hour, plus the topic's browser URL. |
 
-Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe.
+`ntfy_fetch_messages` covers the same topic data with custom windows and filters when the resource's fixed defaults aren't enough.
 
-- Full publish-parameter coverage — `title`, `priority` (1–5), `tags`, `click`, `attach`, `icon`, `filename`, `markdown`, `delay`, `email`, `call`, `cache`, `firebase`
+## Capability reference
+
+### `ntfy_publish_message` <sub>tool</sub>
+
+- Topics are created on first publish — treat the topic name as a secret; anyone who knows it can publish or subscribe
+- Full publish-parameter coverage — `title`, `priority` (1–5), `tags`, `click`, `attach`, `icon`, `filename`, `markdown`, `delay`, `email`, `call`, `cache`, `firebase`; message body capped at 4096 bytes (non-ASCII characters cost more), empty body defaults server-side to `triggered`
 - Up to three discriminated action buttons (`view`, `broadcast`, `http`, `copy`) per message
-- Update or replace previously-sent messages by passing the original `sequence_id`
-- Per-call `base_url` override that forwards credentials only when the override matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request goes out unauthenticated, so credentials never leak to alternate hosts
-- Publishes carrying `email`, `call`, or a `broadcast` / `http` action button ask the user to confirm the specific recipient or target first — the call comes back requesting that confirmation, and the message goes out only when it is reissued with the answer attached
+- Update or replace a previously-sent message by passing the original `sequence_id`
+- Per-call `base_url` override forwards credentials only when it matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request goes out unauthenticated
+- Publishes carrying `email`, `call`, or a `broadcast`/`http` action button ask the user to confirm the specific target first — the call returns a confirmation request, and sends only once reissued with the answer
 
 ---
 
-### `ntfy_manage_message`
+### `ntfy_manage_message` <sub>tool</sub>
 
-Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only — the original message stays in cache, and a `message_clear` / `message_delete` event is emitted to subscribers. Idempotent.
-
-- Every call asks the user to confirm the topic, `sequence_id`, and operation before the event fires — the first call comes back requesting that confirmation, and declining fails the call with `consent_declined`
+- `operation`: `clear` marks the notification read & dismisses it (subscribers see `message_clear`); `delete` removes it from the drawer (subscribers see `message_delete`)
+- Append-only — the original message stays in cache; re-issuing the same operation is safe, though a fresh event fires each call
+- Every call asks the user to confirm the topic, `sequence_id`, and operation before the event fires — the first call returns that confirmation request, and declining fails with `consent_declined`
+- ntfy.sh accepts an unknown `sequence_id` without error; stricter ntfy deployments return a `not_found` failure instead
 
 ---
 
-### `ntfy_fetch_messages`
+### `ntfy_fetch_messages` <sub>tool</sub>
 
-Poll cached messages from one or more topics with optional filters. Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity.
-
+- Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity
 - Comma-separated multi-topic queries (e.g. `alerts,backups,phil_alerts`)
 - Filter by `since` (duration / timestamp / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, scheduled-only
 - Default window `10m`, default limit 20 messages per response, hard cap 100 — over-limit windows keep the newest `limit` messages, listed oldest-first
@@ -65,37 +74,36 @@ Poll cached messages from one or more topics with optional filters. Returns a sn
 
 ---
 
-### `ntfy_search_emoji_tags`
+### `ntfy_search_emoji_tags` <sub>tool</sub>
 
-Substring search over the bundled ntfy emoji-tag reference. Returns the `tag` strings ready to plug into `ntfy_publish_message`'s `tags` field. Without a query, returns the first slice of the full reference; `offset` pages through matches beyond the `limit` cap.
+- Substring match against tag names, case-insensitive; omit `query` to list the reference from the start in its documented order
+- `limit` default 25, max 200; `offset` pages past the cap using the returned `totalCount`
+- Returned `tag` strings plug directly into `ntfy_publish_message`'s `tags` field
 
-## Resources and prompts
+---
 
-| Type | Name | Description |
-|:---|:---|:---|
-| Resource | `ntfy://{topic}` | Snapshot of a topic — latest 20 messages from the past 1 hour, plus the topic's browser URL. Same normalized message shape as `ntfy_fetch_messages`: ISO 8601 timestamps and ~500-char body truncation. |
+### `ntfy://{topic}` <sub>resource</sub>
 
-`ntfy_fetch_messages` covers the same topic data with custom windows and filters when the resource's fixed defaults aren't enough.
+- Fixed snapshot — latest 20 messages from the past 1 hour, plus the topic's browser URL; same normalized message shape as `ntfy_fetch_messages` (ISO 8601 timestamps, ~500-char body truncation)
+- For custom windows, filters, or replay, use `ntfy_fetch_messages` instead
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool and resource definitions — single file per primitive, framework handles registration and validation
-- Typed error contracts via `ctx.fail(reason, …)` plus framework error factories (`forbidden`, `notFound`, `validationError`, …)
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 ntfy-specific:
 
-- Wraps ntfy's HTTP API with retry-aware client (`withRetry` + per-request timeout)
-- Per-server scoped auth — credentials are bound to each registered base URL (`NTFY_BASE_URL` or per-entry under `NTFY_SERVERS`); per-call `base_url` overrides forward auth only when the override matches a registered server, and go out unauthenticated otherwise
-- User confirmation before side effects that leave the notification drawer — a clear/delete, or a publish carrying `email`, `call`, or a `broadcast` / `http` action button. The tool returns a confirmation request naming the exact target, and acts only on the reissued call that carries an approval. Enforced on both STDIO and Streamable HTTP; a client that cannot present the prompt gets an error instead of an unasked side effect
-- Optional SSRF guard on `base_url` overrides (`NTFY_BLOCK_PRIVATE_HOSTS`) — resolves the host and blocks every reserved destination it answers on (loopback, RFC 1918, RFC 6598 mesh space, link-local, and the IPv6 equivalents), then refuses redirects, with registered servers exempt
+- Wraps ntfy's HTTP API with a retry-aware client (`withRetry` + per-request timeout)
+- Per-server scoped auth — credentials bind to each registered base URL (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); mutually-exclusive bearer-token / basic-auth modes validated at config load; a per-call `base_url` override forwards auth only when it matches a registered server
+- User confirmation before side effects that leave the notification drawer — a clear/delete, or a publish carrying `email`, `call`, or a `broadcast`/`http` action button — enforced on both stdio and Streamable HTTP
+- Optional SSRF guard on `base_url` overrides (`NTFY_BLOCK_PRIVATE_HOSTS`) — blocks loopback, RFC 1918, RFC 6598 mesh, link-local, and IPv6 equivalents, then refuses redirects; registered servers are exempt
 - Bundled emoji-tag reference, regenerated from upstream `docs/ntfy/emojis.md` via `scripts/build-emoji-tags.ts`
-- Mutually-exclusive auth modes (bearer token *or* basic auth) validated at config-load time
+
+Agent-friendly output:
+
+- Provenance — `ntfy_publish_message` and `ntfy_manage_message` echo back the resolved topic, ID, and timestamp; `ntfy_fetch_messages` also echoes the resolved `since` and applied filters
+- Discriminated outputs — typed `reason` codes (`consent_declined`, `forbidden_topic`, `rate_limited`, `not_found`, `payload_too_large`, and more) on every tool's error contract let callers branch on failure mode instead of parsing error text
+- Truncation and paging guidance — `ntfy_fetch_messages` and `ntfy_search_emoji_tags` report a `truncated` flag plus a `notice` naming the exact next step (widen `since`, raise `limit`, advance `offset`) instead of silently dropping results
 
 ## Getting started
 
@@ -108,6 +116,25 @@ Add the following to your MCP client configuration file. Public ntfy.sh works ou
       "type": "stdio",
       "command": "bunx",
       "args": ["ntfy-mcp-server@latest"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "MCP_LOG_LEVEL": "info",
+        "NTFY_DEFAULT_TOPIC": "your-topic-name"
+      }
+    }
+  }
+}
+```
+
+Or with npx (no Bun required):
+
+```json
+{
+  "mcpServers": {
+    "ntfy-mcp-server": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "ntfy-mcp-server@latest"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_LOG_LEVEL": "info",
@@ -146,7 +173,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 NTFY_DEFAULT_TOPIC=your-topic bun run
 
 ### Prerequisites
 
-- [Bun v1.3.11](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - A topic name on an ntfy server. Public `ntfy.sh` requires no account; self-hosted instances and protected topics may need a bearer token or basic-auth credentials.
 
 ### Installation
@@ -190,7 +217,7 @@ cp .env.example .env
 | `NTFY_MAX_RETRIES` | Max retry attempts for transient upstream failures (5xx, network, 429). | `3` |
 | `NTFY_BLOCK_PRIVATE_HOSTS` | When `true`, a per-call `base_url` override must resolve to a public address, and its redirects are not followed. Servers registered under `NTFY_SERVERS` / `NTFY_BASE_URL` are exempt, so a deliberate LAN target still works. Turn it on where callers you don't control can reach the server. | `false` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
-| `MCP_SESSION_MODE` | HTTP session model: `auto`, `stateful`, or `stateless`. `auto` resolves to `stateful`. Keep it stateful — the consent prompt on destructive and outbound calls is a multi-round-trip request that a 2025-era HTTP client can only complete over a live session. | `auto` (→ `stateful`) |
+| `MCP_SESSION_MODE` | HTTP session model: `auto`, `stateful`, or `stateless`. This server requires `stateful` over HTTP — the consent prompt on destructive and outbound calls is a multi-round-trip request that a 2025-era HTTP client can only complete over a live session — so an HTTP start with `stateless` is refused. `auto` resolves to `stateful`; stdio ignores the setting. | `stateful` |
 | `MCP_HTTP_HOST` | HTTP host. | `127.0.0.1` |
 | `MCP_HTTP_PORT` | HTTP port. | `3010` |
 | `MCP_HTTP_ENDPOINT_PATH` | HTTP endpoint path. | `/mcp` |
@@ -258,7 +285,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
