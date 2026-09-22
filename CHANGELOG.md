@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.3.5](changelog/2.3.x/2.3.5.md) — 2026-09-21
+
+mcp-ts-core 0.13.6 brings structured consent-refusal and argument-rejection errors, drops the upstream request URL from unclassified error data, and normalizes sequence_id-style argument variants before validation.
+
 ## [2.3.4](changelog/2.3.x/2.3.4.md) — 2026-09-16
 
 HTTP now refuses to start under a stateless session, since the consent gate needs a live session to complete. Blank and unsubstituted ${…} placeholder NTFY_* values read as unset instead of failing or forwarding the literal text. Development skills move from skills/ to framework-skills/.
