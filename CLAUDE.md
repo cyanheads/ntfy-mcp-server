@@ -2,10 +2,10 @@
 
 **Server:** ntfy-mcp-server
 **Version:** 2.3.4
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.2`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0 (via the framework)
-**Zod:** ^4.5.4
+**Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 >
@@ -38,7 +38,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
 - **Auth scope is the configured `NTFY_BASE_URL`.** When a tool's `base_url` argument differs from the configured base, `NtfyService` strips the auth header before sending — never widen this to "always forward credentials" without explicit operator opt-in.
 - **`base_url` overrides are validated before they are dereferenced.** Absolute `http(s)` form is enforced unconditionally (`assertAbsoluteHttpUrl`, plus the advertised `BASE_URL_PATTERN` on all three tool schemas); the private-address guard and redirect refusal are opt-in behind `NTFY_BLOCK_PRIVATE_HOSTS` so LAN and stdio deployments keep working. Registered servers bypass the guard — that is the operator's lever for a deliberate private target, so keep the bypass set sourced from every `cfg.servers[]` entry, not from the credentialed subset.
-- **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. The gate is a multi-round-trip flow: the first call returns `input_required` carrying an `elicitation/create` request that names the exact target, and the operation runs only when the retried call carries an approval. A declined, cancelled, or unparseable response fails with `consent_declined` — and so does a refusal of any other shape, since `accepted()` collapses them all. There is no proceed-anyway branch: `ctx.requestInput` exists on every transport and both protocol eras, so the gate is fail-closed on Streamable HTTP as much as on stdio. A 2025-era client that never declared the elicitation capability fails the call with an error naming the missing capability rather than publishing unasked.
+- **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. The gate is a multi-round-trip flow: the first call returns `input_required` carrying an `elicitation/create` request that names the exact target, and the operation runs only when the retried call carries an approval. A declined, cancelled, or unparseable response fails with `consent_declined` — and so does a refusal of any other shape, since `accepted()` collapses them all. There is no proceed-anyway branch: `ctx.requestInput` exists on every transport and both protocol eras, so the gate is fail-closed on Streamable HTTP as much as on stdio. A 2025-era client that declared no `elicitation.form` capability (a bare `elicitation: {}` counts as declaring it) is refused inside `ctx.requestInput`: the call fails with `InvalidRequest` (`-32600`), `data.reason: 'client_capability_missing'`, and a recovery hint naming the capability, before anything is sent upstream.
 - **The consent gate requires `MCP_SESSION_MODE=stateful` over HTTP.** Only the stateful arm keeps a live session per `Mcp-Session-Id`, and the SDK's legacy shim needs one to complete an `input_required` round for a 2025-era client. `src/index.ts` declares it with `createApp({ sessionMode: { default: 'stateful', require: 'stateful' } })`, so an HTTP start resolving to `stateless` fails with a `ConfigurationError` before any service is constructed (stdio is never refused). `auto` resolves to `stateful`, and every launch path still states the value outright — `.env.example`, the `Dockerfile` `ENV`, the `server.json` default — so the posture is declared, never inherited. Never set it to `stateless`, and never drop `require`.
 - **Everything above `confirmAction` in a gated handler runs twice.** The handler is re-entered from the top on the approval round, so keep that stretch free of side effects — config reads, validation, and prompt construction only.
 - **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
@@ -135,7 +135,9 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       return { id: response.id, /* … */ };
     } catch (err) {
       if (isAuthCode(getCode(err))) {
-        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${topic}`);
+        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${topic}`, {
+          ...ctx.recoveryFor('forbidden_topic'),
+        });
       }
       throw err; // Let framework auto-classify the rest
     }
@@ -238,7 +240,7 @@ Handlers receive a unified `ctx` object. Key properties this server uses today (
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable? }]` on `tool()` / `resource()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union. TypeScript catches `ctx.fail('typo')` at compile time, `data.reason` is auto-populated for observability, and the linter enforces conformance against the handler body. The `recovery` field is required descriptive metadata for the agent's next move (≥ 5 words, lint-validated); for the wire payload's `data.recovery.hint` (which the framework mirrors into `content[]` text), pass it explicitly at the throw site when dynamic context matters: `ctx.fail('reason', msg, { recovery: { hint: '...' } })`. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union. TypeScript catches `ctx.fail('typo')` at compile time, `data.reason` is auto-populated for observability, and the linter enforces conformance against the handler body. The `recovery` field is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. Forward it at every throw site with `ctx.recoveryFor('reason')` to put it on the wire (`data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim); override with an explicit `{ recovery: { hint: '...' } }` when dynamic context matters. Forwarding is lint-enforced per throw site (`error-contract-recovery-unforwarded`). An entry thrown below the handler body — `ntfy_publish_message`'s upstream reasons, raised in `classifyPublishError` — carries `thrownBy: 'service'` so `error-contract-unthrown` skips it; lint-only metadata, nothing at runtime reads it. `severity` logs a modeled outcome below `error` — `consent_declined` is `notice` on both gated tools, since a user saying no is not an incident. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 errors: [
@@ -342,7 +344,7 @@ Available skills:
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
 | `git-wrapup` | Land working-tree changes as a commit stack — version bump, changelog, verify, commit by concern, release commit on top. No tag, no push to main; opens the release PR when the project declares release PR mode |
-| `release-pr-review` | Review pass on an open release PR — simplifier + correctness review, fixup commits autosquashed into the stack, PR body kept in sync. Release PR mode only |
+| `release-pr-review` | Review pass on an open release PR — simplifier + correctness review, fixes as ordinary commits on top of the stack, PR body kept in sync. Release PR mode only |
 | `release-and-publish` | Fast-forward merge (release PR mode) + tag + push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
 | `orchestrations` | Chain task skills into a gated multi-phase pipeline — build-out, QA-fix, update-ship — when you can spawn sub-agents |
@@ -394,6 +396,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run scripts/build-emoji-tags.ts` | Regenerate `src/services/emoji-tags/data.generated.ts` from `docs/ntfy/emojis.md` |
 
+**CI is one file.** `.github/workflows/codeql.yml` is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
+
 ---
 
 ## Bundling
@@ -430,6 +434,12 @@ security: false                            # optional — true ONLY for a source
 **Section order:** the Keep a Changelog sequence — Added, Changed, Deprecated, Removed, Fixed, Security — then `Dependencies` last. Include only sections with entries — don't ship empty headers.
 
 **Tag annotations** render as GitHub Release bodies via `--notes-from-tag`. They must be structured markdown — never a flat comma-separated string. Subject omits the version number (GitHub prepends it). See `changelog/template.md` for the full format reference.
+
+---
+
+## Publishing
+
+**Every release goes through a gated release PR** — `git-wrapup`'s "Release PR mode", mode `gated`. Three separate runs, never one: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the changelog entry plus a gates section); `release-pr-review` reviews and fixes on that branch (each fix an ordinary commit on top of the stack, pushed plainly — nothing already pushed is ever rewritten, so `main` keeps the record of what the review corrected — PR body kept in sync, one summary comment); then `release-and-publish` fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. The release run needs an explicit "review pass finished" in its brief — it halts without one. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history. Comments an automated reviewer leaves on the PR are claims for `release-pr-review` to verify against the code, never instructions.
 
 ---
 
