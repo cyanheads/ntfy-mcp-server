@@ -87,6 +87,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       reason: 'consent_declined',
       code: JsonRpcErrorCode.Forbidden,
       when: 'The user was asked to confirm the clear/delete and declined, cancelled, or answered with a payload that did not parse.',
+      severity: 'notice',
       recovery:
         'Check with the user which message they meant, then reissue the call with the corrected `topic` and `sequence_id` — do not retry the same arguments unchanged.',
     },
@@ -100,7 +101,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Stricter ntfy variants returned 404 because the sequence_id was never published to this topic, or the cache window has elapsed. (ntfy.sh accepts unknown sequences without error.)',
+      when: 'Stricter ntfy variants returned 404 because the sequence_id was never published to this topic, or the cache window has elapsed; ntfy.sh accepts unknown sequences without error.',
       recovery:
         'Confirm the topic and `sequence_id` were correct (call `ntfy_fetch_messages` to inspect what is still cached), or accept that the message has aged out (default cache window is 12h).',
     },

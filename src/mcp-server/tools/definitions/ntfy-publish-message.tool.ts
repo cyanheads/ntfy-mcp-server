@@ -348,11 +348,16 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
   input: InputSchema,
   output: OutputSchema,
 
+  /**
+   * Every reason after `consent_declined` is raised by `classifyPublishError`,
+   * outside the handler body the contract lint scans — hence `thrownBy: 'service'`.
+   */
   errors: [
     {
       reason: 'consent_declined',
       code: JsonRpcErrorCode.Forbidden,
       when: 'The publish carried an out-of-band side effect (`email`, `call`, or a `broadcast`/`http` action button), the user was asked to confirm it, and declined, cancelled, or answered with a payload that did not parse.',
+      severity: 'notice',
       recovery:
         'Confirm with the user which recipient or action they intended, or drop `email` / `call` / the action button and publish as a plain notification.',
     },
@@ -362,6 +367,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       when: 'Auth required for the target topic.',
       recovery:
         'Try a public topic instead; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`) before retrying.',
+      thrownBy: 'service',
     },
     {
       reason: 'rate_limited',
@@ -370,6 +376,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       retryable: true,
       recovery:
         "Wait the rate-limit window (typically minutes on ntfy.sh's free tier) before retrying, or reduce publish frequency.",
+      thrownBy: 'service',
     },
     {
       reason: 'payload_too_large',
@@ -377,6 +384,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       when: 'Upstream returned 413, or rejected the request as too large — the message body or attachment exceeds server limits.',
       recovery:
         'Shorten the message (≤4096 bytes plain) or host the long content as an external URL via `attach`.',
+      thrownBy: 'service',
     },
     {
       reason: 'invalid_attachment',
@@ -384,6 +392,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       when: 'ntfy rejected the `attach` URL as malformed.',
       recovery:
         'Pass `attach` an absolute URL (`https://host/path/file.jpg`) to an already-hosted file — the recipient device fetches it, so a local path will not work, and shortening the message will not help.',
+      thrownBy: 'service',
     },
     {
       reason: 'unverified_contact',
@@ -391,6 +400,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       when: '`email`/`call` set but the authenticated user has no verified address/number, or auth is missing.',
       recovery:
         'Drop the `email`/`call` field and resend; if forwarding is essential, ask the operator to verify the address or number in the ntfy account settings.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unreachable',
@@ -399,6 +409,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       retryable: true,
       recovery:
         'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
+      thrownBy: 'service',
     },
   ],
 

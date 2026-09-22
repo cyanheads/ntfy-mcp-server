@@ -28,9 +28,12 @@ const CONSENT_KEY = 'confirm';
  * on every transport and both protocol eras, so the gate always asks: a
  * 2026-07-28 client fulfils the request itself, and on a 2025-era session the
  * SDK's legacy shim issues a real `elicitation/create` round trip. A 2025-era
- * client that never declared the elicitation capability fails the call with an
- * error naming the missing capability — before the upstream request goes out.
- * The gate is fail-closed on every transport, Streamable HTTP included.
+ * client that declared no `elicitation.form` capability (a bare
+ * `elicitation: {}` counts as declaring it) is refused inside
+ * `ctx.requestInput`, which throws `InvalidRequest` (-32600) with
+ * `data.reason: 'client_capability_missing'` and a recovery hint naming the
+ * capability — so the call fails before the upstream request goes out. The
+ * gate is fail-closed on every transport, Streamable HTTP included.
  */
 export type ConfirmationOutcome = 'confirmed' | 'declined';
 

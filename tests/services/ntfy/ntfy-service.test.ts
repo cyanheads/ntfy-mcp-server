@@ -2,7 +2,8 @@
  * @fileoverview Tests for `NtfyService` — multi-server auth resolution, the
  * request-shape contract for publish/manage/fetch (URL, method, headers,
  * body), NDJSON parsing edge cases, upstream error propagation including the
- * JSON error body folded into the message, the module-level init/get/reset
+ * JSON error body folded into the message and the request URL kept off
+ * `error.data`, the module-level init/get/reset
  * accessors, and `base_url` override validation — the always-on absolute
  * http(s) check plus the opt-in private-host guard, its registered-base bypass,
  * and its redirect refusal.
@@ -455,6 +456,18 @@ describe('NtfyService upstream error messages', () => {
     );
     const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
     expect(err.message).toBe('ntfy returned HTTP 403 Forbidden.');
+  });
+
+  it('keeps the upstream request URL off the client-facing error data', async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    captureFetch(({ url }) => {
+      const response = new Response('forbidden topic', { status: 403, statusText: 'Forbidden' });
+      Object.defineProperty(response, 'url', { value: url });
+      return response;
+    });
+    const rejection = svc.fetch({ topic: 'alerts', since: '1h' });
+    await expect(rejection).rejects.toMatchObject({ data: { status: 403 } });
+    await expect(rejection).rejects.not.toHaveProperty('data.url');
   });
 });
 

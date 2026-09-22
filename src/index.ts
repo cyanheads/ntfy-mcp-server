@@ -28,7 +28,7 @@ await createApp({
   // stateless HTTP start is refused at boot rather than breaking the gate.
   sessionMode: { default: 'stateful', require: 'stateful' },
   instructions:
-    'Use the ntfy_* tools to publish and manage push notifications via ntfy, a pub/sub notification service. Messages live on topics (arbitrary string channels) and get a server-assigned `sequence_id` reusable to update or replace them later. Typical flow: `ntfy_publish_message` → `ntfy_fetch_messages` to poll cached history → `ntfy_manage_message` to clear or delete by `sequence_id`. Use `ntfy_search_emoji_tags` to look up short codes for `tags`. Topic names act as access tokens — treat them as secrets.',
+    'The ntfy_* tools publish and manage push notifications on ntfy, a pub/sub service where messages live on topics (arbitrary string channels) and a topic name works as an access token, so treat it as a secret. Send with `ntfy_publish_message` (look up `tags` short codes with `ntfy_search_emoji_tags`), poll cached history with `ntfy_fetch_messages`, and clear or delete a notification with `ntfy_manage_message`. Each published message gets a server-assigned `id`; pass it back as `sequence_id` to update, replace, clear, or delete that message later.',
   setup() {
     initEmojiTagService();
     initNtfyService(getServerConfig());
