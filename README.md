@@ -7,9 +7,9 @@
 
 <div align="center">
 
-[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
+[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -95,7 +95,7 @@ ntfy-specific:
 
 - Wraps ntfy's HTTP API with a retry-aware client (`withRetry` + per-request timeout)
 - Per-server scoped auth — credentials bind to each registered base URL (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); mutually-exclusive bearer-token / basic-auth modes validated at config load; a per-call `base_url` override forwards auth only when it matches a registered server
-- User confirmation before side effects that leave the notification drawer — a clear/delete, or a publish carrying `email`, `call`, or a `broadcast`/`http` action button — enforced on both stdio and Streamable HTTP
+- User confirmation before side effects that leave the notification drawer — a clear/delete, or a publish carrying `email`, `call`, or a `broadcast`/`http` action button — enforced on both stdio and Streamable HTTP. An approval counts only on the round that redeems the single-use record the server stored when it asked, bound to the tool, the caller, the target, and the exact request; an unprompted or replayed answer gets a fresh prompt
 - Optional SSRF guard on `base_url` overrides (`NTFY_BLOCK_PRIVATE_HOSTS`) — blocks loopback, RFC 1918, RFC 6598 mesh, link-local, and IPv6 equivalents, then refuses redirects; registered servers are exempt
 - Bundled emoji-tag reference, regenerated from upstream `docs/ntfy/emojis.md` via `scripts/build-emoji-tags.ts`
 
@@ -222,8 +222,11 @@ cp .env.example .env
 | `MCP_HTTP_PORT` | HTTP port. | `3010` |
 | `MCP_HTTP_ENDPOINT_PATH` | HTTP endpoint path. | `/mcp` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
+| `MCP_REQUEST_STATE_KEY` | Recommended for HTTP. Key (≥ 32 bytes, e.g. `openssl rand -base64 32`, the same on every instance) that seals the `requestState` carrying the consent-record id, bound to the caller for 900 s; a forged, tampered, or expired state is rejected (`-32602` `invalid_request_state`) before the handler runs. | — |
+| `STORAGE_PROVIDER_TYPE` | Where consent records live (600 s TTL). `in-memory` suits one process; a multi-instance HTTP deployment needs storage every instance shares — `filesystem` (on a shared volume), `supabase`, or `cloudflare-d1`, never `cloudflare-kv`. | `in-memory` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `LOGS_DIR` | Directory for file-based logs (Node only; ignored on Workers). | `./logs` |
+| `LOG_TOOL_FAILURE_PAYLOADS` | Log each failed tool call's arguments and result, redacted by key name and capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (default `16384`). A secret inside a free-form value is not redacted. | `false` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry) (spans, metrics, completion logs). | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.

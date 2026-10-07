@@ -296,8 +296,20 @@ Per-topic snapshot. Reuses `NtfyService.fetch()` with fixed defaults so a client
 - **Topic is treated as a secret.** Topic names function as access tokens for unprotected ntfy servers. The server logs topics at `debug` only; tool descriptions warn agents not to invent guessable names.
 - **Auth credentials are server-config, not tool-input.** A token in a tool argument would log on every call and bloat schemas. One server instance ↔ one identity; multi-tenant scenarios run multiple servers.
 - **`base_url` is overridable per-call; auth is not.** Configured credentials are scoped to the configured `NTFY_BASE_URL`. When `base_url` is set to anything other than the configured value, the request goes out unauthenticated — preventing the agent from leaking server-configured tokens to an arbitrary URL it picked. The override exists for ad-hoc publishes/fetches against public ntfy servers; protected topics on alternate hosts need a separate server instance.
+- **Side effects past the drawer need the user's consent, proven by a server record.** A clear/delete, or a publish carrying `email`, `call`, or a `broadcast`/`http` button, runs through `confirmAction` (`src/mcp-server/tools/utils/confirm-action.ts`). Asking stores `{ operation, clientId, subject, target, contentHash }` in `ctx.state` under a random UUID with a 600 s TTL and sends only that id as `requestState` with the `elicitation/create` request. Every call redeems first — reads and deletes the record its `requestState` names — and proceeds only when the record is deep-equal to what this call would confirm and the answer is an accepted `confirm: true`; a decline, cancel, `confirm: false`, or unreadable answer against that record fails with `consent_declined`, and every other round asks again under a fresh record. Why: a client that declared `elicitation` can send `inputResponses` on a call nothing prompted, and any `requestState`, sealed or not, can be replayed within its lifetime, so an answer on `ctx.inputs` proves nothing on its own; only a single-use record the server wrote when it asked does.
+
+  | Record field | `ntfy_manage_message` | `ntfy_publish_message` |
+  |:--|:--|:--|
+  | `operation` | `ntfy_manage_message:clear` or `:delete` | `ntfy_publish_message` |
+  | `clientId` / `subject` | `ctx.auth.clientId` / `ctx.auth.sub`, empty strings without auth | same |
+  | `target` | `<base>/<topic>/<sequence_id>` | `<base>/<topic>` |
+  | `contentHash` | SHA-256 of canonical JSON `{ base, topic, sequence_id, operation }` | SHA-256 of canonical JSON `{ url, body }` — the exact `POST` body ntfy receives |
+
+  `<base>` is the resolved base URL: the normalized `base_url` override, else the configured default. The id must be a UUID before it is used as a storage key, so a forged or path-shaped id names nothing. The default `in-memory` store serves one process; a multi-instance HTTP deployment needs `STORAGE_PROVIDER_TYPE` set to `filesystem`, `supabase`, or `cloudflare-d1` (never `cloudflare-kv`, which is eventually consistent), and should set `MCP_REQUEST_STATE_KEY` so the framework rejects a tampered `requestState` before the handler runs.
 
 ## Known Limitations
+
+- Consent records stop sequential replays, not concurrent ones. `ctx.state` has no atomic read-and-delete (cyanheads/mcp-ts-core#593), so retries carrying one `requestState` at the same moment can each read the record before either delete lands. ntfy offers no idempotency key to pin the action to the record id — `sequence_id` groups a notification's updates, it does not deduplicate publishes. A duplicate clear/delete re-emits its `message_clear`/`message_delete` event and leaves message state unchanged; a duplicate gated publish delivers again, email and call included.
 
 - Phone calls and `email: yes` require server-side authenticated users with verified contacts. The MCP server can't verify these; failures surface as `unverified_contact`.
 - Message templating (Go template fields, `?template=github` etc.) is intentionally **not** exposed. The LLM can format messages itself before sending; templating is for non-LLM webhook bridges.
