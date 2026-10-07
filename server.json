@@ -12,12 +12,8 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
-      "runtimeHint": "bun",
+      "runtimeHint": "npx",
       "version": "2.3.5",
-      "packageArguments": [
-        { "type": "positional", "value": "run" },
-        { "type": "positional", "value": "start:stdio" }
-      ],
       "environmentVariables": [
         {
           "name": "NTFY_SERVERS",
@@ -107,13 +103,15 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "ntfy-mcp-server",
-      "runtimeHint": "bun",
+      "runtimeHint": "npx",
       "version": "2.3.5",
-      "packageArguments": [
-        { "type": "positional", "value": "run" },
-        { "type": "positional", "value": "start:http" }
-      ],
       "environmentVariables": [
+        {
+          "name": "MCP_TRANSPORT_TYPE",
+          "description": "Selects the HTTP transport.",
+          "format": "string",
+          "value": "http"
+        },
         {
           "name": "NTFY_SERVERS",
           "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
@@ -206,6 +204,13 @@
           "format": "string",
           "isRequired": false,
           "default": "none"
+        },
+        {
+          "name": "MCP_REQUEST_STATE_KEY",
+          "description": "Recommended for HTTP. Key (>= 32 bytes, the same on every instance) that seals the requestState carrying the consent-record id of a confirmation prompt, bound to the caller for 900 s; a forged, tampered, or expired state is rejected before the handler runs.",
+          "format": "string",
+          "isRequired": false,
+          "isSecret": true
         },
         {
           "name": "MCP_LOG_LEVEL",
