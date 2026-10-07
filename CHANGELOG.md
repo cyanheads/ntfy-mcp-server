@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.3.6](changelog/2.3.x/2.3.6.md) — 2026-10-07 · 🛡️ Security
+
+Consent prompts on ntfy_manage_message and gated ntfy_publish_message act only on an answer to a prompt the server recorded, single-use and bound to the exact request; mcp-ts-core 0.13.6 → 0.13.13 adds request ids to tool errors and fixes the registry HTTP entry.
+
 ## [2.3.5](changelog/2.3.x/2.3.5.md) — 2026-09-21
 
 mcp-ts-core 0.13.6 brings structured consent-refusal and argument-rejection errors, drops the upstream request URL from unclassified error data, and normalizes sequence_id-style argument variants before validation.

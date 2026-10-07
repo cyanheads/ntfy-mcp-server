@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-09-22 04:59:33
+Generated on: 2026-10-07 11:21:45
 
 ```text
 ntfy-mcp-server/
@@ -139,9 +139,11 @@ ntfy-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
