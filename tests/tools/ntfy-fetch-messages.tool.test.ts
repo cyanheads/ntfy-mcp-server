@@ -12,7 +12,7 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { forbidden, invalidParams, notFound, validationError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
@@ -296,13 +296,20 @@ describe('ntfyFetchMessages handler', () => {
         },
       ),
     );
-    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
-    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', since: 'tomorrow_maybe' });
-    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
-      message: expect.stringContaining('invalid since parameter: unable to parse duration'),
-      data: {
-        reason: 'invalid_since',
-        recovery: { hint: expect.stringContaining('`all`') },
+    const result = await runToolContract(ntfyFetchMessages, {
+      topic: 'alerts',
+      since: 'tomorrow_maybe',
+    });
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          message: expect.stringContaining('invalid since parameter: unable to parse duration'),
+          data: {
+            reason: 'invalid_since',
+            recovery: { hint: expect.stringContaining('`all`') },
+          },
+        },
       },
     });
   });

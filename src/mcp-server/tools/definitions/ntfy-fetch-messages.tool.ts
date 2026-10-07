@@ -370,19 +370,13 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       const code = getCode(err);
       const msg = getMessage(err);
       if (isAuthCode(code)) {
-        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${topic}`, {
-          ...ctx.recoveryFor('forbidden_topic'),
-        });
+        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${topic}`);
       }
       if (isInvalidParamsCode(code)) {
-        throw ctx.fail('invalid_since', msg || `Could not parse since=${input.since}`, {
-          ...ctx.recoveryFor('invalid_since'),
-        });
+        throw ctx.fail('invalid_since', msg || `Could not parse since=${input.since}`);
       }
       if (isUpstreamUnreachable(err)) {
-        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.', {
-          ...ctx.recoveryFor('upstream_unreachable'),
-        });
+        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.');
       }
       throw err;
     }
