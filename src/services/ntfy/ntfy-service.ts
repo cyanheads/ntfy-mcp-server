@@ -1,7 +1,7 @@
 /**
- * @fileoverview HTTP client for the ntfy publish/subscribe API. Wraps
- * `fetchWithTimeout` + `withRetry` so the publish, manage, and fetch calls
- * share one transient-failure boundary. Auth headers are scoped to specific
+ * @fileoverview HTTP client for the ntfy publish/subscribe API. Wraps a
+ * timed raw `fetch` (`timedFetch`) in `withRetry` so the publish, manage, and
+ * fetch calls share one transient-failure boundary. Auth headers are scoped to specific
  * registered base URLs — per-call `baseUrl` overrides that match a registered
  * base forward that base's credentials, anything else goes out unauthenticated
  * to avoid leaking credentials to arbitrary hosts the agent picks.

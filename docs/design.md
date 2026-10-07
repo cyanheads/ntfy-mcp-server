@@ -46,7 +46,7 @@ ntfy is a pub/sub HTTP service for push notifications. Anyone with a topic name 
 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
-| `NtfyService` | ntfy HTTP API (`POST /` for JSON publish, `PUT /<topic>/<sequence_id>/clear`, `DELETE /<topic>/<sequence_id>`, `GET /<topic>/json?poll=1&...`). Wraps `fetchWithTimeout` + `withRetry` from `@cyanheads/mcp-ts-core/utils`. Each method accepts an optional per-call `baseUrl` override; when omitted, falls back to `NTFY_BASE_URL`. Auth header (Bearer or Basic) is injected only when the resolved base URL matches the configured one — overrides go out unauthenticated. | `ntfy_publish_message`, `ntfy_manage_message`, `ntfy_fetch_messages`, `ntfy://{topic}` |
+| `NtfyService` | ntfy HTTP API (`POST /` for JSON publish, `PUT /<topic>/<sequence_id>/clear`, `DELETE /<topic>/<sequence_id>`, `GET /<topic>/json?poll=1&...`). Wraps a timed raw `fetch` in `withRetry` from `@cyanheads/mcp-ts-core/utils` — not `fetchWithTimeout`, which would replace the upstream status with `ServiceUnavailable` before `httpErrorFromResponse` can map it. Each method accepts an optional per-call `baseUrl` override; when omitted, falls back to `NTFY_BASE_URL`. Auth header (Bearer or Basic) is injected only when the resolved base URL matches the configured one — overrides go out unauthenticated. | `ntfy_publish_message`, `ntfy_manage_message`, `ntfy_fetch_messages`, `ntfy://{topic}` |
 | `EmojiTagService` | In-memory map of tag short code → emoji, parsed at startup from a TS module generated at build time from `docs/ntfy/emojis.md`. No external deps. | `ntfy_search_emoji_tags` |
 
 `NtfyService` resilience: retry boundary is the full publish/fetch round trip; backoff base 500ms with 3 attempts; `withRetry` enriches the final error with attempt count. 429 responses retry with the upstream `Retry-After` honoured (or 2× base if absent). 4xx other than 408/429 do not retry.
@@ -67,7 +67,7 @@ All env vars are optional except where noted. The server runs unauthenticated ag
 
 ## Implementation Order
 
-1. **Config & service skeleton** — `src/config/server-config.ts` (Zod schema, lazy parse), bare `NtfyService` with auth-header builder + `fetchWithTimeout` wrapper.
+1. **Config & service skeleton** — `src/config/server-config.ts` (Zod schema, lazy parse), bare `NtfyService` with auth-header builder + timed `fetch` wrapper.
 2. **Emoji tag data** — `scripts/build-emoji-tags.ts` parses `docs/ntfy/emojis.md` → emits `src/services/emoji-tags/data.generated.ts`. `EmojiTagService` consumes it. Search uses substring match.
 3. **`ntfy_publish_message`** — main tool; calls `NtfyService.publish()` (POST `/` JSON body). Cover all publish fields. Smoke test against `ntfy.sh/<random_topic>` from the phone app.
 4. **`ntfy_manage_message`** — clear/delete via `NtfyService.manage()`. Verify subscriber receives `message_clear` / `message_delete` events.
