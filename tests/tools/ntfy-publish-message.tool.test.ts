@@ -5,15 +5,18 @@
  * format-rendering (including the scheduled delivery-time label), scheduled-flag
  * synthesis, base_url override and its scheme validation, the consent gate
  * across both round trips (which inputs prompt and which publish straight
- * through, the first round's `input_required` result, and every re-entry
- * reply), and the full contract error mapping
+ * through, the first round's `input_required` result and the consent record
+ * it stores, every reply on the round that redeems that record, and every
+ * round that must ask again instead of publishing — replay, pre-answer,
+ * fabricated or malformed id, a record minted for other content, target, tool,
+ * or caller), and the full contract error mapping
  * (forbidden / rate-limit / payload-too-large from a 413 / invalid-attachment /
  * unverified-contact / upstream-unreachable / generic rethrow) with the upstream
  * explanation preserved on the error message.
  * @module tests/tools/ntfy-publish-message.tool
  */
 
-import { type InputRequiredResult, z } from '@cyanheads/mcp-ts-core';
+import { type AuthContext, type InputRequiredResult, z } from '@cyanheads/mcp-ts-core';
 import {
   forbidden,
   invalidParams,
@@ -27,10 +30,12 @@ import {
   createMockContext,
   expectInputRequired,
   type MockContextOptions,
+  runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
+import { ntfyManageMessage } from '@/mcp-server/tools/definitions/ntfy-manage-message.tool.js';
 import { ntfyPublishMessage } from '@/mcp-server/tools/definitions/ntfy-publish-message.tool.js';
 import { initNtfyService, resetNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyPublishResponse } from '@/services/ntfy/types.js';
@@ -59,18 +64,52 @@ type ElicitParams = {
   requestedSchema: { properties: Record<string, { type: string }>; required?: string[] };
 };
 
+type PublishInput = ReturnType<typeof ntfyPublishMessage.input.parse>;
+
+const ACCEPT = { action: 'accept', content: { confirm: true } } as const;
+
+/** Where the gate keeps the record a round-one prompt minted. */
+const recordKey = (id: unknown) => `consent/${String(id)}`;
+
 /**
- * Stands in for the second round of a gated publish: the context carries the
- * approval the client would have collected after the first round's
- * `input_required`.
+ * Round one of a gated publish on its own context: the handler asks, and the
+ * record it stored under the returned `requestState` is read back so a
+ * round-two context can carry it — each mock context has its own `ctx.state`.
  */
-function consentedCtx(
-  reply: Record<string, unknown> = { action: 'accept', content: { confirm: true } },
+async function askFirst(input: PublishInput, auth?: AuthContext) {
+  const first = createMockContext({ errors: ntfyPublishMessage.errors, ...(auth ? { auth } : {}) });
+  const asked = await expectInputRequired(() => ntfyPublishMessage.handler(input, first));
+  return { asked, record: await first.state.get(recordKey(asked.requestState)) };
+}
+
+/** A round-two context: the reply, the round's `requestState`, and the record behind it. */
+async function roundTwoCtx(
+  requestState: unknown,
+  record: unknown,
+  reply: Record<string, unknown> = ACCEPT,
+  auth?: AuthContext,
 ) {
-  return createMockContext({
+  const ctx = createMockContext({
     errors: ntfyPublishMessage.errors,
     inputResponses: { confirm: reply },
+    requestState,
+    ...(auth ? { auth } : {}),
   } as MockContextOptions<typeof ntfyPublishMessage.errors>);
+  if (record !== null) await ctx.state.set(recordKey(requestState), record);
+  return ctx;
+}
+
+/**
+ * The second round of a real gated exchange: round one asked about `input`,
+ * and this context carries its record, its `requestState`, and the `reply`.
+ */
+async function approvedCtx(
+  input: PublishInput,
+  reply: Record<string, unknown> = ACCEPT,
+  auth?: AuthContext,
+) {
+  const { asked, record } = await askFirst(input, auth);
+  return roundTwoCtx(asked.requestState, record, reply, auth);
 }
 
 describe('ntfyPublishMessage handler', () => {
@@ -237,14 +276,21 @@ describe('ntfyPublishMessage handler', () => {
         },
       ),
     );
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
-    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'x'.repeat(100) });
-    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ValidationError,
-      message: expect.stringContaining('JSON body too large'),
-      data: {
-        reason: 'payload_too_large',
-        recovery: { hint: expect.stringContaining('Shorten the message') },
+    const result = await runToolContract(ntfyPublishMessage, {
+      topic: 'alerts',
+      message: 'x'.repeat(100),
+    });
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining('JSON body too large'),
+          data: {
+            reason: 'payload_too_large',
+            recovery: { hint: expect.stringContaining('Shorten the message') },
+          },
+        },
       },
     });
   });
@@ -261,20 +307,21 @@ describe('ntfyPublishMessage handler', () => {
         },
       ),
     );
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
-    const input = ntfyPublishMessage.input.parse({
+    const result = await runToolContract(ntfyPublishMessage, {
       topic: 'alerts',
       message: 'x',
       attach: 'not-a-url',
     });
-    const err = (await Promise.resolve(ntfyPublishMessage.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    )) as McpError;
-    expect(err.data).toMatchObject({ reason: 'invalid_attachment' });
-    expect(err.message).toContain('attachment URL is invalid');
-    const hint = String((err.data as { recovery: { hint: string } }).recovery.hint);
-    expect(hint).toContain('absolute URL');
-    expect(hint).not.toContain('Shorten the message');
+    const error = (
+      result.structuredContent as {
+        error: { message: string; data: { reason: string; recovery: { hint: string } } };
+      }
+    ).error;
+    expect(result.isError).toBe(true);
+    expect(error.data.reason).toBe('invalid_attachment');
+    expect(error.message).toContain('attachment URL is invalid');
+    expect(error.data.recovery.hint).toContain('absolute URL');
+    expect(error.data.recovery.hint).not.toContain('Shorten the message');
   });
 
   it('rejects a multibyte message over 4096 bytes but under 4096 characters', () => {
@@ -321,13 +368,13 @@ describe('ntfyPublishMessage handler', () => {
   it('maps a 4xx with email/phone-verification hint to `unverified_contact`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'publish').mockRejectedValue(invalidParams('Phone number is not verified'));
-    // `call` is a gated side effect — stand in for the approved second round.
-    const ctx = consentedCtx();
     const input = ntfyPublishMessage.input.parse({
       topic: 'alerts',
       message: 'x',
       call: '+15555550100',
     });
+    // `call` is a gated side effect — run the approved second round.
+    const ctx = await approvedCtx(input);
     await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'unverified_contact' },
     });
@@ -549,13 +596,27 @@ describe('ntfyPublishMessage consent gate', () => {
     vi.restoreAllMocks();
   });
 
-  function stubbedPublish() {
-    return vi.spyOn(freshService(), 'publish').mockResolvedValue({
-      id: 'mid_1',
-      time: 1700000000,
-      topic: 'alerts',
-    });
+  /**
+   * The ntfy server at the HTTP boundary — every call is one outbound publish,
+   * so the call count is how many notifications (and the emails, calls, and
+   * buttons they carry) actually went out.
+   */
+  function fakeUpstream() {
+    freshService();
+    return vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () =>
+        Response.json({ id: 'mid_1', time: 1700000000, topic: 'alerts' }),
+      );
   }
+
+  /** The JSON body of the `n`th outbound publish. */
+  function sentBody(upstream: ReturnType<typeof fakeUpstream>, n = 0): Record<string, unknown> {
+    return JSON.parse(String((upstream.mock.calls[n]?.[1] as RequestInit | undefined)?.body));
+  }
+
+  const ALICE: AuthContext = { clientId: 'client-a', sub: 'alice', scopes: [] };
+  const EMAIL = { email: 'ops@example.com' } as const;
 
   const HTTP_ACTION = {
     action: 'http',
@@ -591,23 +652,33 @@ describe('ntfyPublishMessage consent gate', () => {
     ['a broadcast action', { actions: [BROADCAST_ACTION] }, 'broadcast intent'],
     ['an http action', { actions: [HTTP_ACTION] }, 'https://example.com/ack'],
   ])('asks before publishing %s and names the target', async (_label, extra, expected) => {
-    const publish = stubbedPublish();
+    const upstream = fakeUpstream();
 
     const { message } = confirmRequest(await firstRound(extra));
 
     expect(message).toContain('alerts');
     expect(message).toContain(expected);
-    expect(publish).not.toHaveBeenCalled();
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('sends a requestState with the prompt that names a record it stored', async () => {
+    const upstream = fakeUpstream();
+
+    const { asked, record } = await askFirst(inputWith(EMAIL));
+
+    expect(asked.requestState).toEqual(expect.stringMatching(/^[0-9a-f-]{36}$/));
+    expect(record).not.toBeNull();
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it('names the method of an http action button', async () => {
-    stubbedPublish();
+    fakeUpstream();
     const { message } = confirmRequest(await firstRound({ actions: [HTTP_ACTION] }));
     expect(message).toContain('HTTP DELETE');
   });
 
   it('lists every side effect when a publish carries more than one', async () => {
-    stubbedPublish();
+    fakeUpstream();
     const { message } = confirmRequest(
       await firstRound({
         email: 'ops@example.com',
@@ -621,8 +692,8 @@ describe('ntfyPublishMessage consent gate', () => {
   });
 
   it('advertises a single boolean `confirm` field on the prompt schema', async () => {
-    stubbedPublish();
-    const { requestedSchema } = confirmRequest(await firstRound({ email: 'ops@example.com' }));
+    fakeUpstream();
+    const { requestedSchema } = confirmRequest(await firstRound(EMAIL));
 
     expect(Object.keys(requestedSchema.properties)).toEqual(['confirm']);
     expect(requestedSchema.properties.confirm?.type).toBe('boolean');
@@ -636,25 +707,153 @@ describe('ntfyPublishMessage consent gate', () => {
     ['a view action', { actions: [{ action: 'view', label: 'Open', url: 'https://example.com' }] }],
     ['a copy action', { actions: [{ action: 'copy', label: 'Copy', value: 'token' }] }],
   ])('publishes %s on the first call, without asking', async (_label, extra) => {
-    const publish = stubbedPublish();
+    const upstream = fakeUpstream();
     const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
 
     await ntfyPublishMessage.handler(inputWith(extra), ctx);
 
-    expect(publish).toHaveBeenCalledOnce();
+    expect(upstream).toHaveBeenCalledOnce();
   });
 
-  it('publishes once the retried call approves the side effect', async () => {
-    const publish = stubbedPublish();
+  it('publishes an ungated notification on each call, with no consent round in between', async () => {
+    const upstream = fakeUpstream();
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+
+    await ntfyPublishMessage.handler(inputWith({}), ctx);
+    await ntfyPublishMessage.handler(inputWith({}), ctx);
+
+    expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it('publishes once, on the round that redeems its own record', async () => {
+    const upstream = fakeUpstream();
 
     const result = await ntfyPublishMessage.handler(
-      inputWith({ email: 'ops@example.com' }),
-      consentedCtx(),
+      inputWith(EMAIL),
+      await approvedCtx(inputWith(EMAIL)),
     );
 
-    expect(publish).toHaveBeenCalledOnce();
-    expect(publish.mock.calls[0]?.[0]).toMatchObject({ email: 'ops@example.com' });
+    expect(upstream).toHaveBeenCalledOnce();
+    expect(String(upstream.mock.calls[0]?.[0])).toBe('https://ntfy.test/');
+    expect(sentBody(upstream)).toMatchObject({ topic: 'alerts', email: 'ops@example.com' });
     expect(result.id).toBe('mid_1');
+  });
+
+  it('publishes for the same authenticated caller on both rounds', async () => {
+    const upstream = fakeUpstream();
+
+    await ntfyPublishMessage.handler(
+      inputWith(EMAIL),
+      await approvedCtx(inputWith(EMAIL), ACCEPT, ALICE),
+    );
+
+    expect(upstream).toHaveBeenCalledOnce();
+  });
+
+  it('asks again when a redeemed round is replayed, and sends nothing more', async () => {
+    const upstream = fakeUpstream();
+    const ctx = await approvedCtx(inputWith(EMAIL));
+    await ntfyPublishMessage.handler(inputWith(EMAIL), ctx);
+    const spent = ctx.inputs.state();
+
+    const again = await expectInputRequired(() =>
+      ntfyPublishMessage.handler(inputWith(EMAIL), ctx),
+    );
+
+    expect(again.requestState).toEqual(expect.any(String));
+    expect(again.requestState).not.toBe(spent);
+    expect(upstream).toHaveBeenCalledOnce();
+  });
+
+  it('asks instead of acting on an accepted answer that nothing asked for', async () => {
+    const upstream = fakeUpstream();
+    const preAnswered = createMockContext({
+      errors: ntfyPublishMessage.errors,
+      inputResponses: { confirm: ACCEPT },
+    });
+
+    const asked = await expectInputRequired(() =>
+      ntfyPublishMessage.handler(inputWith(EMAIL), preAnswered),
+    );
+
+    expect(asked.inputRequests?.confirm).toBeDefined();
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an unknown id', '0b8f5a52-6a52-4c49-9b4b-6f5e6f0d2a11'],
+    ['a malformed id', 'not-a-consent-id'],
+    ['a path-shaped id', '../consent/x'],
+    ['an id outside the storage key charset', 'a:b'],
+    ['an empty id', ''],
+  ])('asks again for %s, sending nothing', async (_label, requestState) => {
+    const upstream = fakeUpstream();
+    const ctx = await roundTwoCtx(requestState, null);
+
+    await expectInputRequired(() => ntfyPublishMessage.handler(inputWith(EMAIL), ctx));
+
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('asks again for a malformed id even when a matching record sits under it', async () => {
+    const upstream = fakeUpstream();
+    const { record } = await askFirst(inputWith(EMAIL));
+    const ctx = await roundTwoCtx('forged', record);
+
+    await expectInputRequired(() => ntfyPublishMessage.handler(inputWith(EMAIL), ctx));
+
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['another email recipient', { email: 'attacker@example.com' }],
+    ['another message body', { ...EMAIL, message: 'something else' }],
+    ['an added voice call', { ...EMAIL, call: '+15551234567' }],
+    ['another topic', { ...EMAIL, topic: 'other' }],
+    ['another ntfy server', { ...EMAIL, base_url: 'https://other.example.com' }],
+  ])('asks again when the record was minted for %s', async (_label, overrides) => {
+    const upstream = fakeUpstream();
+    const { asked, record } = await askFirst(inputWith(EMAIL));
+    const ctx = await roundTwoCtx(asked.requestState, record);
+
+    await expectInputRequired(() => ntfyPublishMessage.handler(inputWith(overrides), ctx));
+
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('asks again on a record minted by ntfy_manage_message', async () => {
+    const upstream = fakeUpstream();
+    const first = createMockContext({ errors: ntfyManageMessage.errors });
+    const asked = await expectInputRequired(() =>
+      ntfyManageMessage.handler(
+        ntfyManageMessage.input.parse({
+          topic: 'alerts',
+          sequence_id: 'seq_1',
+          operation: 'delete',
+        }),
+        first,
+      ),
+    );
+    const record = await first.state.get(recordKey(asked.requestState));
+    const ctx = await roundTwoCtx(asked.requestState, record);
+
+    await expectInputRequired(() => ntfyPublishMessage.handler(inputWith(EMAIL), ctx));
+
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['another client', { clientId: 'client-b', sub: 'alice', scopes: [] }],
+    ['another subject', { clientId: 'client-a', sub: 'mallory', scopes: [] }],
+    ['no authenticated caller', undefined],
+  ])('asks again when a record minted for one caller is redeemed by %s', async (_label, auth) => {
+    const upstream = fakeUpstream();
+    const { asked, record } = await askFirst(inputWith(EMAIL), ALICE);
+    const ctx = await roundTwoCtx(asked.requestState, record, ACCEPT, auth);
+
+    await expectInputRequired(() => ntfyPublishMessage.handler(inputWith(EMAIL), ctx));
+
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -664,20 +863,23 @@ describe('ntfyPublishMessage consent gate', () => {
     ['accept with an unparseable payload', { action: 'accept', content: { confirm: 'yes' } }],
     ['accept with no content at all', { action: 'accept' }],
     ['a roots listing instead of an elicitation', { roots: [] }],
-  ])('fails with `consent_declined` on %s, without publishing', async (_label, reply) => {
-    const publish = stubbedPublish();
+  ])(
+    'fails with `consent_declined` on %s against its own record, without publishing',
+    async (_label, reply) => {
+      const upstream = fakeUpstream();
 
-    await expect(
-      ntfyPublishMessage.handler(inputWith({ email: 'ops@example.com' }), consentedCtx(reply)),
-    ).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
-    expect(publish).not.toHaveBeenCalled();
-  });
+      await expect(
+        ntfyPublishMessage.handler(inputWith(EMAIL), await approvedCtx(inputWith(EMAIL), reply)),
+      ).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
+      expect(upstream).not.toHaveBeenCalled();
+    },
+  );
 
   it('does not re-ask after a refusal — a declined round is a dead end', async () => {
-    stubbedPublish();
+    fakeUpstream();
     const declined = ntfyPublishMessage.handler(
       inputWith({ call: '+15551234567' }),
-      consentedCtx({ action: 'decline' }),
+      await approvedCtx(inputWith({ call: '+15551234567' }), { action: 'decline' }),
     );
     await expect(declined).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
     await expect(declined).rejects.not.toMatchObject({ isInputRequiredSignal: true });

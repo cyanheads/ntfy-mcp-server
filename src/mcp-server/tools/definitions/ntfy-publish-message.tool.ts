@@ -4,7 +4,8 @@
  * ride this tool by setting `sequence_id`. Publishes whose side effects leave
  * the notification drawer (`email`, `call`, `broadcast` / `http` buttons) pass
  * through a user-confirmation gate: the first such call returns an input
- * request and the publish only fires once the retried call carries an approval.
+ * request, and the publish only fires on the retried call whose approval
+ * redeems the consent record that request stored for this exact publish.
  * @module mcp-server/tools/definitions/ntfy-publish-message.tool
  */
 
@@ -424,19 +425,6 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       });
     }
 
-    const sideEffects = outOfBandSideEffects(input);
-    if (sideEffects.length > 0) {
-      const consent = confirmAction(
-        ctx,
-        `Publish to ntfy topic \`${topic}\` with ${sideEffects.join(' and ')}?`,
-      );
-      if (consent === 'declined') {
-        throw ctx.fail('consent_declined', `Publish to ${topic} was not confirmed.`, {
-          ...ctx.recoveryFor('consent_declined'),
-        });
-      }
-    }
-
     const requestBody: NtfyPublishRequest = {
       topic,
       message: input.message,
@@ -459,6 +447,20 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     };
 
     const overrideBase = normalizeBaseOverride(input.base_url);
+    const baseUrl = overrideBase ?? getNtfyService().baseUrl;
+
+    const sideEffects = outOfBandSideEffects(input);
+    if (sideEffects.length > 0) {
+      const consent = await confirmAction(ctx, {
+        operation: 'ntfy_publish_message',
+        target: `${baseUrl}/${topic}`,
+        request: { url: `${baseUrl}/`, body: requestBody },
+        message: `Publish to ntfy topic \`${topic}\` with ${sideEffects.join(' and ')}?`,
+      });
+      if (consent === 'declined') {
+        throw ctx.fail('consent_declined', `Publish to ${topic} was not confirmed.`);
+      }
+    }
 
     let response: NtfyPublishResponse;
     try {
@@ -480,7 +482,6 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       scheduled,
     });
 
-    const baseUrl = overrideBase ?? getNtfyService().baseUrl;
     return {
       id: response.id,
       time: new Date(response.time * 1000).toISOString(),
@@ -565,31 +566,23 @@ function classifyPublishError(
   const message = getMessage(err);
 
   if (isAuthCode(code)) {
-    return ctx.fail('forbidden_topic', message || `Forbidden for topic ${topic}`, {
-      ...ctx.recoveryFor('forbidden_topic'),
-    });
+    return ctx.fail('forbidden_topic', message || `Forbidden for topic ${topic}`);
   }
   if (isRateLimitedCode(code)) {
-    return ctx.fail('rate_limited', message || 'ntfy returned 429 after retries.', {
-      ...ctx.recoveryFor('rate_limited'),
-    });
+    return ctx.fail('rate_limited', message || 'ntfy returned 429 after retries.');
   }
   // 413 maps to `InvalidRequest`, which `isInvalidParamsCode` deliberately
   // excludes — read the upstream status directly so an oversize body reaches
   // `payload_too_large` instead of bubbling unclassified.
   if (getDataStatus(err) === 413) {
-    return ctx.fail('payload_too_large', message, {
-      ...ctx.recoveryFor('payload_too_large'),
-    });
+    return ctx.fail('payload_too_large', message);
   }
   if (isInvalidParamsCode(code)) {
     const sub = classifyInvalidParams(err);
-    if (sub) return ctx.fail(sub, message, { ...ctx.recoveryFor(sub) });
+    if (sub) return ctx.fail(sub, message);
   }
   if (isUpstreamUnreachable(err)) {
-    return ctx.fail('upstream_unreachable', message || 'ntfy server is unreachable.', {
-      ...ctx.recoveryFor('upstream_unreachable'),
-    });
+    return ctx.fail('upstream_unreachable', message || 'ntfy server is unreachable.');
   }
   return err;
 }

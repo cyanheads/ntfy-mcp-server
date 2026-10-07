@@ -3,8 +3,10 @@
  * notification by `sequence_id`. Append-only: the original message stays in
  * cache; subscribers receive a `message_clear` or `message_delete` event and
  * update the notification accordingly. Both operations pass through a
- * user-confirmation gate: the first call returns an input request and the
- * clear/delete only fires once the retried call carries an approval.
+ * user-confirmation gate: the first call returns an input request, and the
+ * clear/delete only fires on the retried call whose approval redeems the
+ * consent record that request stored for this exact topic, message, and
+ * operation.
  * @module mcp-server/tools/definitions/ntfy-manage-message.tool
  */
 
@@ -126,19 +128,21 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       });
     }
 
-    const consent = confirmAction(
-      ctx,
-      `${input.operation === 'clear' ? 'Clear' : 'Delete'} ntfy notification \`${input.sequence_id}\` on topic \`${topic}\`? Subscribers receive a message_${input.operation} event.`,
-    );
+    const overrideBase = normalizeBaseOverride(input.base_url);
+    const base = overrideBase ?? getNtfyService().baseUrl;
+
+    const consent = await confirmAction(ctx, {
+      operation: `ntfy_manage_message:${input.operation}`,
+      target: `${base}/${topic}/${input.sequence_id}`,
+      request: { base, topic, sequence_id: input.sequence_id, operation: input.operation },
+      message: `${input.operation === 'clear' ? 'Clear' : 'Delete'} ntfy notification \`${input.sequence_id}\` on topic \`${topic}\`? Subscribers receive a message_${input.operation} event.`,
+    });
     if (consent === 'declined') {
       throw ctx.fail(
         'consent_declined',
         `The ${input.operation} of ${input.sequence_id} on topic ${topic} was not confirmed.`,
-        { ...ctx.recoveryFor('consent_declined') },
       );
     }
-
-    const overrideBase = normalizeBaseOverride(input.base_url);
 
     let response: NtfyManageResponse;
     try {
@@ -150,21 +154,16 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       const code = getCode(err);
       const msg = getMessage(err);
       if (isAuthCode(code)) {
-        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${topic}`, {
-          ...ctx.recoveryFor('forbidden_topic'),
-        });
+        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${topic}`);
       }
       if (isNotFoundCode(code)) {
         throw ctx.fail(
           'not_found',
           msg || `No cached message ${input.sequence_id} on topic ${topic}.`,
-          { ...ctx.recoveryFor('not_found') },
         );
       }
       if (isUpstreamUnreachable(err)) {
-        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.', {
-          ...ctx.recoveryFor('upstream_unreachable'),
-        });
+        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.');
       }
       throw err;
     }
