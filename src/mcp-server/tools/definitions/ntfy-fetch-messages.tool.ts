@@ -63,7 +63,11 @@ const LIMIT_CEILING = 1000;
 const MESSAGE_ID = /^[A-Za-z0-9]{12}$/;
 const GO_DURATION = /^[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+$/;
 
-function isDuration(since: string): boolean {
+/**
+ * Whether ntfy reads `since` as a Go duration, which it measures from its own
+ * clock. Runs on caller-supplied text of any length, in time linear in it.
+ */
+export function isDuration(since: string): boolean {
   return !MESSAGE_ID.test(since) && GO_DURATION.test(since);
 }
 

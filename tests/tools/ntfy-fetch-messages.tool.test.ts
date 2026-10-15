@@ -29,7 +29,10 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
-import { ntfyFetchMessages } from '@/mcp-server/tools/definitions/ntfy-fetch-messages.tool.js';
+import {
+  isDuration,
+  ntfyFetchMessages,
+} from '@/mcp-server/tools/definitions/ntfy-fetch-messages.tool.js';
 import {
   CALL_DEADLINE_MS,
   initNtfyService,
@@ -1417,13 +1420,10 @@ describe('ntfyFetchMessages filters and paging against a fake ntfy window', () =
         },
       );
 
-      it('reads a long almost-duration `since` in linear time and leaves its cursor unpinned', async () => {
-        // A failing tail once backtracked through every way to split each `99` between two digit runs.
+      it('sends a long almost-duration `since` as given and leaves its cursor unpinned', async () => {
         const since = `${'99h'.repeat(25)}x`;
         store = range(1, 30);
-        const started = performance.now();
         const first = await call({ topic: 'alerts', since });
-        expect(performance.now() - started).toBeLessThan(1_000);
         expect(sent[0]?.searchParams.get('since')).toBe(since);
         expect(first.structured.nextCursor).toBe('m001');
       });
@@ -1665,5 +1665,41 @@ describe('ntfyFetchMessages filters and paging against a fake ntfy window', () =
       expect(json).not.toMatch(/`since` to paginate/);
       expect(json).toContain('`cursor`');
     });
+  });
+});
+
+describe('isDuration on caller-sized `since` text', () => {
+  /** Large-input CPU budget; a run past it already fails, so the remaining runs are skipped. */
+  const CPU_LIMIT_MS = 50;
+
+  /** Thread CPU milliseconds for `reps` calls on `input`: the least of up to three runs. */
+  function cpuMs(input: string, reps: number): number {
+    let least = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < 3; run++) {
+      const start = process.threadCpuUsage();
+      for (let i = 0; i < reps; i++) isDuration(input);
+      const { user, system } = process.threadCpuUsage(start);
+      least = Math.min(least, (user + system) / 1000);
+      if (least > CPU_LIMIT_MS * reps) break;
+    }
+    return least;
+  }
+
+  /**
+   * Each case spans 64× in length; a linear matcher grows about 64× and a
+   * quadratic one about 4096×. The segment case stays under ~80k characters,
+   * where Bun's regex engine leaves its JIT for a slower interpreter.
+   */
+  it.each([
+    ['repeated `99h` segments', (chars: number) => `${'99h'.repeat(chars / 3)}x`, 900],
+    ['one long digit run', (chars: number) => `${'9'.repeat(chars)}x`, 5_000],
+  ])('rejects %s in time linear in their length', (_shape, make, small) => {
+    const large = small * 64;
+    expect(isDuration(make(small))).toBe(false);
+    // 64 short calls read as many characters as one long call, so both runs are long enough to time.
+    const smallPerCallMs = cpuMs(make(small), 64) / 64;
+    const largeMs = cpuMs(make(large), 1);
+    expect(largeMs).toBeLessThan(CPU_LIMIT_MS);
+    expect(largeMs / smallPerCallMs).toBeLessThan(256);
   });
 });
