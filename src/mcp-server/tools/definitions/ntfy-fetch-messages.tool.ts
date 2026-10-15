@@ -57,9 +57,11 @@ const LIMIT_CEILING = 1000;
  * ntfy reads `since` in this order: keyword, 12-character message ID, Unix
  * timestamp, then a Go `time.ParseDuration` string. Only the duration is
  * measured from ntfy's "now", so only its lower bound moves between calls.
+ * Each number has one parse (`\d+(?:\.\d*)?`, never `\d+\.?\d*`), so a
+ * caller's `since` that nearly matches cannot backtrack exponentially.
  */
 const MESSAGE_ID = /^[A-Za-z0-9]{12}$/;
-const GO_DURATION = /^[-+]?(?:(?:\d+\.?\d*|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+$/;
+const GO_DURATION = /^[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))+$/;
 
 function isDuration(since: string): boolean {
   return !MESSAGE_ID.test(since) && GO_DURATION.test(since);

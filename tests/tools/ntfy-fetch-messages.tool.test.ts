@@ -1417,6 +1417,17 @@ describe('ntfyFetchMessages filters and paging against a fake ntfy window', () =
         },
       );
 
+      it('reads a long almost-duration `since` in linear time and leaves its cursor unpinned', async () => {
+        // A failing tail once backtracked through every way to split each `99` between two digit runs.
+        const since = `${'99h'.repeat(25)}x`;
+        store = range(1, 30);
+        const started = performance.now();
+        const first = await call({ topic: 'alerts', since });
+        expect(performance.now() - started).toBeLessThan(1_000);
+        expect(sent[0]?.searchParams.get('since')).toBe(since);
+        expect(first.structured.nextCursor).toBe('m001');
+      });
+
       it('offers no "drop `cursor`" shortcut on a pinned page, whose window the duration no longer covers', async () => {
         store = range(1, 30);
         now = env(30).time;
