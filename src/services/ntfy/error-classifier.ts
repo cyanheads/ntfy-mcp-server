@@ -65,12 +65,41 @@ export function isBaseUrlRejection(err: unknown): boolean {
   return (err as { data?: { baseUrlRejected?: unknown } })?.data?.baseUrlRejected === true;
 }
 
+/**
+ * True for the failure `NtfyService` raises when a `200` body is not what ntfy
+ * sends: a poll body that is not its JSON message stream, or a publish or
+ * clear/delete reply that is not its message envelope. It is a
+ * `ServiceUnavailable` that can carry the `(failed after N attempts)` suffix, so
+ * `isUpstreamUnreachable` would claim it too — handlers check this first.
+ */
+export function isUpstreamMalformed(err: unknown): boolean {
+  return (err as { data?: { reason?: unknown } })?.data?.reason === 'upstream_malformed';
+}
+
+function isDeadlineExceeded(err: unknown): boolean {
+  return (
+    getCode(err) === JsonRpcErrorCode.Timeout &&
+    (err as { data?: { reason?: unknown } })?.data?.reason === 'retry_deadline_exceeded'
+  );
+}
+
 export function isAuthCode(code: unknown): boolean {
   return code === JsonRpcErrorCode.Forbidden || code === JsonRpcErrorCode.Unauthorized;
 }
 
 export function isRateLimitedCode(code: unknown): boolean {
   return code === JsonRpcErrorCode.RateLimited;
+}
+
+/**
+ * The upstream `Retry-After` (captured by `httpErrorFromResponse`) as
+ * `ctx.fail` data, or `undefined` when there was none. `ctx.fail` builds a new
+ * error, so without this the one concrete wait the upstream named never
+ * reaches the caller.
+ */
+export function retryAfterData(err: unknown): { retryAfter: string | number } | undefined {
+  const value = (err as { data?: { retryAfter?: unknown } })?.data?.retryAfter;
+  return typeof value === 'string' || typeof value === 'number' ? { retryAfter: value } : undefined;
 }
 
 export function isInvalidParamsCode(code: unknown): boolean {
@@ -92,13 +121,19 @@ export function isNotFoundCode(code: unknown): boolean {
  * stays accepted for the classifier's own fallback on an unrecognized throw.
  *
  * `RateLimited` is excluded even though it is transient and exhausts with the
- * same suffix: a quota is a live server answering, and `ntfy_publish_message`
+ * same suffix: a quota is a live server answering, and every ntfy surface
  * declares a `rate_limited` reason for it. `RequestCancelled` is excluded
  * because the caller is the one who left. Retry exhaustion is also required,
  * never a matching code on its own: a 503 whose `Retry-After` exceeds the retry
  * budget fails fast without ever looping.
+ *
+ * Running out of the call deadline counts as exhaustion too. `withRetry`
+ * reports it as a `Timeout` carrying `data.reason: 'retry_deadline_exceeded'`
+ * and no suffix; the service passes that shape through only when the last
+ * attempt got no answer from ntfy, so it always belongs here.
  */
 export function isUpstreamUnreachable(err: unknown): boolean {
+  if (isDeadlineExceeded(err)) return true;
   if (!/\(failed after \d+ attempts?\)/.test(getMessage(err))) return false;
   const code = getCode(err);
   if (typeof code !== 'number') return true;
@@ -110,21 +145,39 @@ export function isUpstreamUnreachable(err: unknown): boolean {
 }
 
 /**
+ * The `McpError` message ("ntfy returned HTTP …") and the captured upstream body
+ * (`err.data.body`), lowercased — the distinguishing keywords live in the body,
+ * not the status-line message.
+ */
+function rejectionText(err: unknown): string {
+  return `${getMessage(err)} ${getDataBody(err)}`.toLowerCase();
+}
+
+/**
  * Heuristic split of a 4xx-classed error into one of the publish contract
- * sub-reasons. Inspects both the `McpError` message ("ntfy returned HTTP …")
- * and the captured upstream body (`err.data.body`), since the distinguishing
- * keywords live in the body, not the status-line message. Returns `undefined`
- * when no case matches.
+ * sub-reasons, read from both the status-line message and the captured body.
+ * Returns `undefined` when no case matches.
+ *
+ * ntfy's three `delay` rejections (40004 unparseable, 40005 too soon, 40006 too
+ * far out) share the prefix `invalid delay parameter`, matched first because
+ * 40006 also says "too large". Nothing looser is matched: ntfy's other
+ * delay-related rejections (a delayed message with caching off, e-mail, or a
+ * call; an attachment that expires first; a bad timezone) mention a delay or
+ * link the scheduled-delivery docs, but their text already names the conflict.
  *
  * Size rejections are recognized by the phrase "too large" — a bare mention of
  * an attachment is not one, since ntfy's "attachment URL is invalid" rejection
  * needs the opposite advice from "shorten the payload". Oversize *bodies* come
- * back as HTTP 413, which callers classify from `getDataStatus` instead.
+ * back as HTTP 413, which callers classify from `getDataStatus` instead; which
+ * field an oversize 400 names is `oversizedPublishField`'s call.
  */
 export function classifyInvalidParams(
   err: unknown,
-): 'invalid_attachment' | 'payload_too_large' | 'unverified_contact' | undefined {
-  const haystack = `${getMessage(err)} ${getDataBody(err)}`.toLowerCase();
+): 'invalid_delay' | 'invalid_attachment' | 'payload_too_large' | 'unverified_contact' | undefined {
+  const haystack = rejectionText(err);
+  if (haystack.includes('invalid delay parameter')) {
+    return 'invalid_delay';
+  }
   if (haystack.includes('attachment url')) {
     return 'invalid_attachment';
   }
@@ -134,5 +187,19 @@ export function classifyInvalidParams(
   if (haystack.includes('email') || haystack.includes('phone') || haystack.includes('verified')) {
     return 'unverified_contact';
   }
+  return;
+}
+
+/**
+ * The publish field an oversize 400 names: `title` for ntfy's 40057
+ * (`invalid request: title is too large`), `tags` for 40058
+ * (`invalid request: tags are too large`), `undefined` for anything else. The
+ * full phrase is matched, so 40041 ("message or title is too large after
+ * replacing template") is not read as a title overflow.
+ */
+export function oversizedPublishField(err: unknown): 'title' | 'tags' | undefined {
+  const haystack = rejectionText(err);
+  if (haystack.includes('invalid request: title is too large')) return 'title';
+  if (haystack.includes('invalid request: tags are too large')) return 'tags';
   return;
 }

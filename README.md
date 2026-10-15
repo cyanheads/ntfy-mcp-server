@@ -7,9 +7,9 @@
 
 <div align="center">
 
-[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
+[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -69,22 +69,24 @@ Push notifications over the ntfy pub/sub HTTP API. Publish, update, and manage n
 - Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity
 - Comma-separated multi-topic queries (e.g. `alerts,backups,phil_alerts`)
 - Filter by `since` (duration / timestamp / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, scheduled-only
-- Default window `10m`, default limit 20 messages per response, hard cap 100 — over-limit windows keep the newest `limit` messages, listed oldest-first
+- Default window `10m`, default limit 20 messages per response, at most 100 per call (a larger `limit` is served as 100) — over-limit windows return the newest `limit` messages, listed oldest-first, with `totalCount` and a `nextCursor` that pages through the whole window oldest-first when passed back as `cursor` — a duration `since` included, since the cursor holds the window where the walk began
 - Long bodies truncated to ~500 chars with `messageTruncated` reporting the dropped count; refetch with a message `id` to read that one in full
+- Says when ntfy itself capped the replay (`upstreamTruncated`), and fails with `upstream_malformed` when the server answers with something other than ntfy's message stream, rather than returning a partial or empty list
 
 ---
 
 ### `ntfy_search_emoji_tags` <sub>tool</sub>
 
 - Substring match against tag names, case-insensitive; omit `query` to list the reference from the start in its documented order
-- `limit` default 25, max 200; `offset` pages past the cap using the returned `totalCount`
+- `limit` default 25, at most 200 rows per call (a larger `limit` returns 200 and names the next `offset`); `offset` pages past the cap using the returned `totalCount`
 - Returned `tag` strings plug directly into `ntfy_publish_message`'s `tags` field
+- On by default; `NTFY_ENABLE_EMOJI_TAGS=false` disables it for deployments that only send plain alerts — it is absent from `tools/list`, the server instructions and `ntfy_publish_message` stop pointing at it, and it shows only on the startup log line and the HTTP landing page
 
 ---
 
 ### `ntfy://{topic}` <sub>resource</sub>
 
-- Fixed snapshot — latest 20 messages from the past 1 hour, plus the topic's browser URL; same normalized message shape as `ntfy_fetch_messages` (ISO 8601 timestamps, ~500-char body truncation)
+- Fixed snapshot — latest 20 messages from the past 1 hour, plus the topic's browser URL; same normalized message shape as `ntfy_fetch_messages` (ISO 8601 timestamps, ~500-char body truncation) and the same `upstreamTruncated` flag
 - For custom windows, filters, or replay, use `ntfy_fetch_messages` instead
 
 ## Features
@@ -93,7 +95,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 ntfy-specific:
 
-- Wraps ntfy's HTTP API with a retry-aware client (`withRetry` + per-request timeout)
+- Wraps ntfy's HTTP API with a retry-aware client (`withRetry` + a per-attempt timeout that covers the response body), every call's ntfy round trips capped at 50 s so a stalled upstream settles before an MCP client's 60 s default timeout; a publish or clear/delete answered `200` with a reply that is not an ntfy message fails as `upstream_malformed` instead of being sent again
 - Per-server scoped auth — credentials bind to each registered base URL (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); mutually-exclusive bearer-token / basic-auth modes validated at config load; a per-call `base_url` override forwards auth only when it matches a registered server
 - User confirmation before side effects that leave the notification drawer — a clear/delete, or a publish carrying `email`, `call`, or a `broadcast`/`http` action button — enforced on both stdio and Streamable HTTP. An approval counts only on the round that redeems the single-use record the server stored when it asked, bound to the tool, the caller, the target, and the exact request; an unprompted or replayed answer gets a fresh prompt
 - Optional SSRF guard on `base_url` overrides (`NTFY_BLOCK_PRIVATE_HOSTS`) — blocks loopback, RFC 1918, RFC 6598 mesh, link-local, and IPv6 equivalents, then refuses redirects; registered servers are exempt
@@ -102,8 +104,8 @@ ntfy-specific:
 Agent-friendly output:
 
 - Provenance — `ntfy_publish_message` and `ntfy_manage_message` echo back the resolved topic, ID, and timestamp; `ntfy_fetch_messages` also echoes the resolved `since` and applied filters
-- Discriminated outputs — typed `reason` codes (`consent_declined`, `forbidden_topic`, `rate_limited`, `not_found`, `payload_too_large`, and more) on every tool's error contract let callers branch on failure mode instead of parsing error text
-- Truncation and paging guidance — `ntfy_fetch_messages` and `ntfy_search_emoji_tags` report a `truncated` flag plus a `notice` naming the exact next step (widen `since`, raise `limit`, advance `offset`) instead of silently dropping results
+- Discriminated outputs — typed `reason` codes (`consent_declined`, `forbidden_topic`, `rate_limited`, `not_found`, `payload_too_large`, and more) on the error contracts of the publish, manage, and fetch tools and the topic resource let callers branch on failure mode instead of parsing error text
+- Truncation and paging guidance — `ntfy_fetch_messages` and `ntfy_search_emoji_tags` report a `truncated` flag, the window's `totalCount`, and a `notice` naming the exact next step (pass `nextCursor` as `cursor`, advance `offset`) instead of silently dropping results
 
 ## Getting started
 
@@ -213,9 +215,10 @@ cp .env.example .env
 | `NTFY_AUTH_TOKEN` | Bearer access token (`tk_…`) for the single-server shorthand. Mutually exclusive with `NTFY_AUTH_USERNAME` / `NTFY_AUTH_PASSWORD`. | — |
 | `NTFY_AUTH_USERNAME` | Basic-auth username for the single-server shorthand — required together with `NTFY_AUTH_PASSWORD`. | — |
 | `NTFY_AUTH_PASSWORD` | Basic-auth password for the single-server shorthand — required together with `NTFY_AUTH_USERNAME`. | — |
-| `NTFY_REQUEST_TIMEOUT_MS` | Per-request HTTP timeout in milliseconds. | `15000` |
+| `NTFY_REQUEST_TIMEOUT_MS` | Per-attempt HTTP timeout in milliseconds, covering the response body as well as the headers. Each call is also capped at 50 s across all attempts. | `15000` |
 | `NTFY_MAX_RETRIES` | Max retry attempts for transient upstream failures (5xx, network, 429). | `3` |
 | `NTFY_BLOCK_PRIVATE_HOSTS` | When `true`, a per-call `base_url` override must resolve to a public address, and its redirects are not followed. Servers registered under `NTFY_SERVERS` / `NTFY_BASE_URL` are exempt, so a deliberate LAN target still works. Turn it on where callers you don't control can reach the server. | `false` |
+| `NTFY_ENABLE_EMOJI_TAGS` | Set to `false` to disable `ntfy_search_emoji_tags`: it leaves `tools/list`, and the server instructions and `ntfy_publish_message` stop pointing at it. It still appears on the startup log line and the HTTP landing page. Read from the process environment or `./.env`; an unrecognized value such as `maybe` fails startup naming the variable. | `true` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_SESSION_MODE` | HTTP session model: `auto`, `stateful`, or `stateless`. This server requires `stateful` over HTTP — the consent prompt on destructive and outbound calls is a multi-round-trip request that a 2025-era HTTP client can only complete over a live session — so an HTTP start with `stateless` is refused. `auto` resolves to `stateful`; stdio ignores the setting. | `stateful` |
 | `MCP_HTTP_HOST` | HTTP host. | `127.0.0.1` |

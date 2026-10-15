@@ -54,7 +54,7 @@
         },
         {
           "name": "NTFY_REQUEST_TIMEOUT_MS",
-          "description": "Per-request HTTP timeout in milliseconds.",
+          "description": "Per-attempt HTTP timeout in milliseconds, covering the response body. Each call is also capped at 50 s across all attempts.",
           "format": "string",
           "isRequired": false,
           "default": "15000"
@@ -72,6 +72,13 @@
           "format": "string",
           "isRequired": false,
           "default": "false"
+        },
+        {
+          "name": "NTFY_ENABLE_EMOJI_TAGS",
+          "description": "Set to false to disable the ntfy_search_emoji_tags tool: it leaves tools/list, and the server instructions and ntfy_publish_message stop pointing at it.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "MCP_LOG_LEVEL",
@@ -151,7 +158,7 @@
         },
         {
           "name": "NTFY_REQUEST_TIMEOUT_MS",
-          "description": "Per-request HTTP timeout in milliseconds.",
+          "description": "Per-attempt HTTP timeout in milliseconds, covering the response body. Each call is also capped at 50 s across all attempts.",
           "format": "string",
           "isRequired": false,
           "default": "15000"
@@ -169,6 +176,13 @@
           "format": "string",
           "isRequired": false,
           "default": "false"
+        },
+        {
+          "name": "NTFY_ENABLE_EMOJI_TAGS",
+          "description": "Set to false to disable the ntfy_search_emoji_tags tool: it leaves tools/list, and the server instructions and ntfy_publish_message stop pointing at it.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "MCP_SESSION_MODE",

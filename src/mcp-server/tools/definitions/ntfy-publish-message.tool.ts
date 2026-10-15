@@ -6,14 +6,18 @@
  * through a user-confirmation gate: the first such call returns an input
  * request, and the publish only fires on the retried call whose approval
  * redeems the consent record that request stored for this exact publish.
+ * `format()` renders every value ntfy echoes as a code span or fence, so it
+ * reads as literal text; a body ntfy accepted as `text/markdown` is flagged
+ * `markdown: true` and fenced as `markdown`.
  * @module mcp-server/tools/definitions/ntfy-publish-message.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 
-import { getServerConfig } from '@/config/server-config.js';
+import { getServerConfig, isEmojiTagsEnabled } from '@/config/server-config.js';
 import { confirmAction } from '@/mcp-server/tools/utils/confirm-action.js';
+import { literal, literalBlock } from '@/mcp-server/tools/utils/markdown-literal.js';
 import {
   BASE_URL_HINT,
   BASE_URL_PATTERN,
@@ -28,7 +32,10 @@ import {
   isBaseUrlRejection,
   isInvalidParamsCode,
   isRateLimitedCode,
+  isUpstreamMalformed,
   isUpstreamUnreachable,
+  oversizedPublishField,
+  retryAfterData,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type {
@@ -42,6 +49,8 @@ const TOPIC_REGEX = /^[a-zA-Z0-9_-]+$/;
 const SEQUENCE_ID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
 /** ntfy's message-body ceiling. Counted in bytes upstream, not characters. */
 const MESSAGE_MAX_BYTES = 4096;
+/** The pointers at `ntfy_search_emoji_tags` are dropped when that tool is disabled. */
+const EMOJI_TAGS_ENABLED = isEmojiTagsEnabled();
 
 const TopicSchema = z.string().min(1).max(64).regex(TOPIC_REGEX);
 
@@ -171,7 +180,7 @@ const InputSchema = z.object({
     .max(10)
     .optional()
     .describe(
-      'Up to 10 tags. Strings matching ntfy emoji short codes render as emojis prepended to the title; others render as a tag list. Use `ntfy_search_emoji_tags` to discover short codes.',
+      `Up to 10 tags. Strings matching ntfy emoji short codes render as emojis prepended to the title; others render as a tag list.${EMOJI_TAGS_ENABLED ? ' Use `ntfy_search_emoji_tags` to discover short codes.' : ''}`,
     ),
   click: z
     .string()
@@ -207,7 +216,7 @@ const InputSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Schedule delivery for later. Accepts a duration (`30m`, `2h`, `1d`), a Unix timestamp, or natural-language time (`tomorrow, 10am`, `Tuesday, 7am`). Server-enforced 10s minimum, 3-day maximum.',
+      'Schedule delivery for later. Accepts a duration (`30m`, `2h`, `1d`), a Unix timestamp, or natural-language time (`tomorrow, 10am`, `Tuesday, 7am`). 10s minimum; maximum 3 days by default (configurable per ntfy server).',
     ),
   email: z
     .string()
@@ -245,7 +254,7 @@ const InputSchema = z.object({
     .regex(BASE_URL_PATTERN, BASE_URL_HINT)
     .optional()
     .describe(
-      'Override the configured `NTFY_BASE_URL` for this call — an absolute `http(s)://` URL. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override the configured `NTFY_BASE_URL` for this call — an absolute `http(s)://` URL. Server-configured auth credentials are forwarded only when the override matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request goes out unauthenticated.',
     ),
 });
 
@@ -283,6 +292,10 @@ const OutputSchema = z.object({
     .string()
     .optional()
     .describe('Echo of the input message; `triggered` when the input body was empty.'),
+  markdown: z
+    .boolean()
+    .optional()
+    .describe('True when ntfy accepted the body as Markdown; absent for plain text.'),
   priority: PrioritySchema.optional().describe(
     'Echo of the input priority; absent when default (3).',
   ),
@@ -323,28 +336,32 @@ function priorityLabel(p?: number): string {
  * forward, a voice call, an Android broadcast intent, or a button that fires an
  * HTTP request from the recipient's device. Each phrase names its target so the
  * confirmation prompt is specific to what will happen, not a generic
- * "proceed?". A plain notification — or a `view` / `copy` button, which does
- * nothing until the recipient taps it — returns an empty list and never
+ * "proceed?". Each caller-supplied target renders through `literal()`, so a
+ * value such as `[safe](https://evil)` reads in the prompt as the string it is,
+ * never as a link. A plain notification — or a `view` / `copy` button, which
+ * does nothing until the recipient taps it — returns an empty list and never
  * prompts.
  */
 function outOfBandSideEffects(input: Input): string[] {
   const effects: string[] = [];
-  if (input.email) effects.push(`an email forward to ${input.email}`);
-  if (input.call) effects.push(`a voice call to ${input.call}`);
+  if (input.email) effects.push(`an email forward to ${literal(input.email)}`);
+  if (input.call) effects.push(`a voice call to ${literal(input.call)}`);
   for (const action of input.actions ?? []) {
     if (action.action === 'broadcast') {
-      effects.push(`an Android broadcast intent (${action.intent ?? 'default intent'})`);
+      const intent = action.intent ? literal(action.intent) : 'default intent';
+      effects.push(`an Android broadcast intent (${intent})`);
     }
     if (action.action === 'http') {
-      effects.push(`an HTTP ${action.method ?? 'POST'} button targeting ${action.url}`);
+      effects.push(
+        `an HTTP ${literal(action.method ?? 'POST')} button targeting ${literal(action.url)}`,
+      );
     }
   }
   return effects;
 }
 
 export const ntfyPublishMessage = tool('ntfy_publish_message', {
-  description:
-    'Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`. A publish carrying `email`, `call`, or a `broadcast`/`http` action button reaches beyond the notification drawer, so that call always asks the user to confirm the specific target first and comes back requesting that input rather than a result; reissue the same call with the answer attached to send it. Declining fails the call with `consent_declined`. A plain notification publishes on the first call.',
+  description: `Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set \`sequence_id\` to update a previously-published message; otherwise the call creates a new one.${EMOJI_TAGS_ENABLED ? ' Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`.' : ''} A publish carrying \`email\`, \`call\`, or a \`broadcast\`/\`http\` action button reaches beyond the notification drawer, so that call always asks the user to confirm the specific target first and comes back requesting that input rather than a result; reissue the same call with the answer attached to send it. Declining fails the call with \`consent_declined\`. A plain notification publishes on the first call.`,
   annotations: { openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
@@ -376,15 +393,23 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       when: 'Upstream returned 429 after retries were exhausted.',
       retryable: true,
       recovery:
-        "Wait the rate-limit window (typically minutes on ntfy.sh's free tier) before retrying, or reduce publish frequency.",
+        'Wait the rate-limit window before retrying, or reduce publish frequency — `retryAfter` seconds when the error carries it. A request-rate limit (`too many requests`) clears within minutes; a daily quota (`daily … reached`) resets within 24 hours.',
       thrownBy: 'service',
     },
     {
       reason: 'payload_too_large',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Upstream returned 413, or rejected the request as too large — the message body or attachment exceeds server limits.',
+      when: 'Upstream returned 413, or rejected a field as too large — the message body or attachment exceeds server limits, or the `title` or the combined `tags` are longer than ntfy accepts.',
       recovery:
-        'Shorten the message (≤4096 bytes plain) or host the long content as an external URL via `attach`.',
+        'Shorten the field ntfy rejected: the message (≤4096 bytes plain, or host the long content as an external URL via `attach`), the `title`, or the `tags` (ntfy limits their combined length).',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_delay',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'ntfy rejected `delay`: it could not parse the value, or the time it names is less than 10 seconds out or past the server maximum.',
+      recovery:
+        'Resend with `delay` as a duration (`30m`, `2h`, `1d`), a Unix timestamp, or a natural-language time (`tomorrow, 10am`), at least 10 seconds out and within the server maximum (3 days on ntfy.sh).',
       thrownBy: 'service',
     },
     {
@@ -406,10 +431,19 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     {
       reason: 'upstream_unreachable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted.',
+      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted, or no complete answer within the call deadline.',
       retryable: true,
       recovery:
         'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_malformed',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "The server answered the publish with HTTP 200 but a reply that is not an ntfy message (an empty body, an HTML page, JSON without ntfy's message fields). Not retried, since the notification may already be out.",
+      retryable: false,
+      recovery:
+        'The notification may already have been delivered — call `ntfy_fetch_messages` on the topic before resending, so a resend does not deliver it twice. Fetch with the same `base_url` this publish used, and with `scheduled: true` if it set `delay`; without them the fetch cannot see this message. If `base_url` (or the configured `NTFY_BASE_URL`) does not point at an ntfy server, correct it first.',
       thrownBy: 'service',
     },
   ],
@@ -455,10 +489,10 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
         operation: 'ntfy_publish_message',
         target: `${baseUrl}/${topic}`,
         request: { url: `${baseUrl}/`, body: requestBody },
-        message: `Publish to ntfy topic \`${topic}\` with ${sideEffects.join(' and ')}?`,
+        message: `Publish to ntfy topic ${literal(topic)} with ${sideEffects.join(' and ')}?`,
       });
       if (consent === 'declined') {
-        throw ctx.fail('consent_declined', `Publish to ${topic} was not confirmed.`);
+        throw ctx.fail('consent_declined', `Publish to ${literal(topic)} was not confirmed.`);
       }
     }
 
@@ -495,6 +529,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       scheduled: scheduled || undefined,
       title: response.title,
       message: response.message,
+      markdown: response.content_type === 'text/markdown' || undefined,
       priority: response.priority,
       tags: response.tags,
       click: response.click,
@@ -505,11 +540,13 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
 
   format(result) {
     const lines: string[] = [];
-    const banner = result.scheduled
-      ? `**Scheduled** — ntfy queued message \`${result.id}\` on \`${result.topic}\``
-      : `**Sent** — ntfy accepted message \`${result.id}\` on \`${result.topic}\``;
-    lines.push(banner);
-    lines.push(`URL: ${result.url}`);
+    const subject = `message ${literal(result.id)} on ${literal(result.topic)}`;
+    lines.push(
+      result.scheduled
+        ? `**Scheduled** — ntfy queued ${subject}`
+        : `**Sent** — ntfy accepted ${subject}`,
+    );
+    lines.push(`URL: ${literal(result.url)}`);
     // A scheduled publish reports the delivery time in `time`, not the accept
     // time — label it so the agent doesn't relay a future timestamp as "sent at".
     lines.push(result.scheduled ? `Delivers: ${result.time}` : `Time: ${result.time}`);
@@ -517,35 +554,45 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       lines.push(`Cache expires: ${result.expires}`);
     }
     if (result.sequence_id) {
-      lines.push(`Sequence ID: \`${result.sequence_id}\``);
+      lines.push(`Sequence ID: ${literal(result.sequence_id)}`);
     }
-    if (result.title) lines.push(`Title: ${result.title}`);
+    if (result.title) lines.push(`Title: ${literal(result.title)}`);
     if (result.priority !== undefined) {
       lines.push(`Priority: ${result.priority} (${priorityLabel(result.priority)})`);
     }
-    if (result.tags?.length) {
-      lines.push(`Tags: ${result.tags.map((t) => `\`${t}\``).join(' · ')}`);
+    if (result.tags?.length) lines.push(`Tags: ${result.tags.map(literal).join(' · ')}`);
+    if (result.message) {
+      lines.push('', literalBlock(result.message, result.markdown ? 'markdown' : 'text'));
     }
-    if (result.message) lines.push('', result.message);
-    if (result.click) lines.push('', `Click action: [${result.click}](${result.click})`);
+    if (result.click) lines.push('', `Click action: ${literal(result.click)}`);
     if (result.attachment) {
       const a = result.attachment;
       const meta: string[] = [];
-      if (a.type) meta.push(`type: ${a.type}`);
+      if (a.type) meta.push(`type: ${literal(a.type)}`);
       if (a.size !== undefined) meta.push(`size: ${a.size} bytes`);
       if (a.expires !== undefined) meta.push(`expires: ${a.expires}`);
       const suffix = meta.length ? ` (${meta.join(', ')})` : '';
-      lines.push('', `Attachment: [${a.name}](${a.url})${suffix}`);
+      lines.push('', `Attachment: ${literal(a.name)} — ${literal(a.url)}${suffix}`);
     }
     if (result.actions?.length) {
       lines.push('', 'Actions:');
-      for (const a of result.actions) {
-        lines.push(`- \`\`\`json\n${JSON.stringify(a)}\n\`\`\``);
-      }
+      for (const a of result.actions) lines.push(`- ${literal(JSON.stringify(a))}`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });
+
+/**
+ * The hint each `payload_too_large` failure carries: the fix for the one field
+ * ntfy rejected, where the declared `recovery` names all three. A 413 and any
+ * oversize 400 that names no field get the message-body hint.
+ */
+const OVERSIZE_HINTS = {
+  body: `Shorten the message (≤${MESSAGE_MAX_BYTES} bytes plain) or host the long content as an external URL via \`attach\`.`,
+  title:
+    'Shorten `title` and resend — ntfy rejected the title as too long, so shortening the message body will not help.',
+  tags: 'Send fewer or shorter `tags` — ntfy limits their combined length, so shortening the message body will not help.',
+} as const;
 
 /**
  * Translate a thrown error from `NtfyService.publish` into a typed contract
@@ -561,24 +608,35 @@ function classifyPublishError(
   // branches below speak for ntfy, not for this server, and one of them matches
   // on keywords that a rejected URL could contain.
   if (isBaseUrlRejection(err)) return err;
+  // Already carries its declared reason; the unreachable branch below would
+  // claim it once the call deadline has marked it `(failed after N attempts)`.
+  if (isUpstreamMalformed(err)) return err;
 
   const code = getCode(err);
   const message = getMessage(err);
 
   if (isAuthCode(code)) {
-    return ctx.fail('forbidden_topic', message || `Forbidden for topic ${topic}`);
+    return ctx.fail('forbidden_topic', message || `Forbidden for topic ${literal(topic)}`);
   }
   if (isRateLimitedCode(code)) {
-    return ctx.fail('rate_limited', message || 'ntfy returned 429 after retries.');
+    return ctx.fail(
+      'rate_limited',
+      message || 'ntfy returned 429 after retries.',
+      retryAfterData(err),
+    );
   }
   // 413 maps to `InvalidRequest`, which `isInvalidParamsCode` deliberately
   // excludes — read the upstream status directly so an oversize body reaches
   // `payload_too_large` instead of bubbling unclassified.
   if (getDataStatus(err) === 413) {
-    return ctx.fail('payload_too_large', message);
+    return ctx.fail('payload_too_large', message, { recovery: { hint: OVERSIZE_HINTS.body } });
   }
   if (isInvalidParamsCode(code)) {
     const sub = classifyInvalidParams(err);
+    if (sub === 'payload_too_large') {
+      const hint = OVERSIZE_HINTS[oversizedPublishField(err) ?? 'body'];
+      return ctx.fail(sub, message, { recovery: { hint } });
+    }
     if (sub) return ctx.fail(sub, message);
   }
   if (isUpstreamUnreachable(err)) {

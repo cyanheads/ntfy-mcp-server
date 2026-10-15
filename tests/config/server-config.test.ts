@@ -6,13 +6,15 @@
  * deprecated NTFY_API_KEY alias, defaultTopic / numeric-coercion validation,
  * the NTFY_BLOCK_PRIVATE_HOSTS boolean flag, blank / whitespace / whole-value
  * `${…}` placeholder values reading as unset, and the memoization behavior of
- * `getServerConfig` / `resetServerConfig`.
+ * `getServerConfig` / `resetServerConfig`. Also covers `isEmojiTagsEnabled`
+ * (NTFY_ENABLE_EMOJI_TAGS), parsed apart from the rest of the config.
  * @module tests/config/server-config
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getServerConfig, resetServerConfig } from '@/config/server-config.js';
+import { getServerConfig, isEmojiTagsEnabled, resetServerConfig } from '@/config/server-config.js';
 
 const KEYS = [
   'NTFY_SERVERS',
@@ -25,6 +27,7 @@ const KEYS = [
   'NTFY_REQUEST_TIMEOUT_MS',
   'NTFY_MAX_RETRIES',
   'NTFY_BLOCK_PRIVATE_HOSTS',
+  'NTFY_ENABLE_EMOJI_TAGS',
 ] as const;
 
 describe('getServerConfig', () => {
@@ -300,5 +303,64 @@ describe('getServerConfig', () => {
       expect(after.servers[0]?.baseUrl).toBe('https://later.example.com');
       expect(after).not.toBe(before);
     });
+  });
+});
+
+describe('isEmojiTagsEnabled', () => {
+  beforeEach(() => {
+    resetServerConfig();
+    for (const k of KEYS) delete process.env[k];
+  });
+  afterEach(() => {
+    for (const k of KEYS) delete process.env[k];
+    resetServerConfig();
+  });
+
+  it('defaults to on when NTFY_ENABLE_EMOJI_TAGS is unset', () => {
+    expect(isEmojiTagsEnabled()).toBe(true);
+  });
+
+  it.each(['', '   ', `\${NTFY_ENABLE_EMOJI_TAGS}`, `\${user_config.emoji}`])(
+    'reads the blank or placeholder value %j as unset, so on',
+    (value) => {
+      process.env.NTFY_ENABLE_EMOJI_TAGS = value;
+      expect(isEmojiTagsEnabled()).toBe(true);
+    },
+  );
+
+  it.each(['true', '1', 'yes', 'on', 'TRUE'])('reads %j as on', (value) => {
+    process.env.NTFY_ENABLE_EMOJI_TAGS = value;
+    expect(isEmojiTagsEnabled()).toBe(true);
+  });
+
+  it.each(['false', '0', 'no', 'off', 'False'])('reads %j as off', (value) => {
+    process.env.NTFY_ENABLE_EMOJI_TAGS = value;
+    expect(isEmojiTagsEnabled()).toBe(false);
+  });
+
+  it('fails with a ConfigurationError naming the variable for an unrecognized value', () => {
+    process.env.NTFY_ENABLE_EMOJI_TAGS = 'maybe';
+    expect(() => isEmojiTagsEnabled()).toThrow(
+      expect.objectContaining({
+        code: JsonRpcErrorCode.ConfigurationError,
+        message: expect.stringContaining('NTFY_ENABLE_EMOJI_TAGS'),
+      }),
+    );
+  });
+
+  it('reads only its own variable, so another invalid NTFY_* value is left for getServerConfig', () => {
+    process.env.NTFY_BASE_URL = 'not-a-url';
+    process.env.NTFY_ENABLE_EMOJI_TAGS = 'false';
+    expect(isEmojiTagsEnabled()).toBe(false);
+    expect(() => getServerConfig()).toThrow(/NTFY_BASE_URL/);
+  });
+
+  it('caches the first parse until resetServerConfig', () => {
+    process.env.NTFY_ENABLE_EMOJI_TAGS = 'false';
+    expect(isEmojiTagsEnabled()).toBe(false);
+    process.env.NTFY_ENABLE_EMOJI_TAGS = 'true';
+    expect(isEmojiTagsEnabled()).toBe(false);
+    resetServerConfig();
+    expect(isEmojiTagsEnabled()).toBe(true);
   });
 });

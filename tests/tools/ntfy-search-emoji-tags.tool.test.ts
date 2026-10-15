@@ -1,19 +1,25 @@
 /**
  * @fileoverview Tests for `ntfy_search_emoji_tags` — service wiring, default
  * limit, offset paging past the limit cap, enrichment (query echo, total,
- * truncation, next-page and empty-result notices), and format-rendering of
- * matches.
+ * truncation, next-page and empty-result notices, the query rendered
+ * literally), format-rendering of matches, and the `NTFY_ENABLE_EMOJI_TAGS`
+ * gate that wraps the definition in `disabledTool()`.
  * @module tests/tools/ntfy-search-emoji-tags.tool
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { type AnyToolDefinition, disabledTool } from '@cyanheads/mcp-ts-core';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ntfySearchEmojiTags } from '@/mcp-server/tools/definitions/ntfy-search-emoji-tags.tool.js';
 import {
   initEmojiTagService,
   resetEmojiTagService,
 } from '@/services/emoji-tags/emoji-tag-service.js';
+
+/** Every text block of a `CallToolResult`, joined. */
+const contentText = (result: { content: Array<{ type: string; text?: string }> }) =>
+  result.content.map((block) => block.text ?? '').join('\n');
 
 describe('ntfySearchEmojiTags handler', () => {
   beforeEach(() => {
@@ -65,6 +71,21 @@ describe('ntfySearchEmojiTags handler', () => {
     const overlap = new Set(first.matches.map((m) => m.tag));
     expect(second.matches.some((m) => overlap.has(m.tag))).toBe(false);
     expect(getEnrichment(secondCtx).totalCount).toBe(getEnrichment(firstCtx).totalCount);
+  });
+
+  it('serves a `limit` above the page size as a 200-row page that names the next offset', async () => {
+    const ctx = createMockContext();
+    const result = await ntfySearchEmojiTags.handler(
+      ntfySearchEmojiTags.input.parse({ limit: 500 }),
+      ctx,
+    );
+
+    expect(result.matches).toHaveLength(200);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.notice).toContain('200-row page size');
+    expect(enrichment.notice).toContain('offset: 200');
+    expect(ntfySearchEmojiTags.input.safeParse({ limit: 1001 }).success).toBe(false);
   });
 
   it('defaults offset to 0, so an unpaged call starts at the first row', async () => {
@@ -131,5 +152,73 @@ describe('ntfySearchEmojiTags handler', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('warning');
     expect(text).toContain('tada');
+  });
+
+  it('renders the table rows byte-for-byte as before the literal() sweep', () => {
+    const blocks = ntfySearchEmojiTags.format!({
+      matches: [
+        { tag: 'warning', emoji: '⚠️' },
+        { tag: '+1', emoji: '👍' },
+      ],
+    });
+    expect((blocks[0] as { text: string }).text).toBe(
+      '| Tag | Emoji |\n|:----|:------|\n| `warning` | ⚠️ |\n| `+1` | 👍 |',
+    );
+  });
+
+  it('keeps a query holding backticks and emphasis inside one code span of the empty-result notice', async () => {
+    const result = await runToolContract(ntfySearchEmojiTags, { query: 'x`*y*' });
+    const notice =
+      'No emoji tags matched query ``x`*y*``. Try a shorter substring or omit the query to list the reference from the start.';
+
+    expect(result.structuredContent).toMatchObject({ matches: [], totalCount: 0, notice });
+    expect(contentText(result)).toContain(notice);
+  });
+
+  it('moves a query with a line break into its own `text` fence in the notice', async () => {
+    const result = await runToolContract(ntfySearchEmojiTags, { query: 'zz\n# forged' });
+    expect((result.structuredContent as { notice: string }).notice).toContain(
+      'query \n```text\nzz\n# forged\n```\n. Try',
+    );
+  });
+});
+
+describe('ntfySearchEmojiTags behind NTFY_ENABLE_EMOJI_TAGS', () => {
+  /** The marker `disabledTool()` attaches, read through the public wrapper rather than named. */
+  const MARKER = Object.keys(disabledTool({} as AnyToolDefinition, { reason: 'probe' }));
+
+  /** Re-evaluate the definition module, since the flag is read when it loads. */
+  async function loadWith(value: string | undefined) {
+    if (value !== undefined) vi.stubEnv('NTFY_ENABLE_EMOJI_TAGS', value);
+    vi.resetModules();
+    const mod = await import('@/mcp-server/tools/definitions/ntfy-search-emoji-tags.tool.js');
+    return mod.ntfySearchEmojiTags as object;
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([undefined, '', 'true'])(
+    'is an ordinary definition when the flag is %j',
+    async (value) => {
+      const def = await loadWith(value);
+      expect(MARKER.some((key) => key in def)).toBe(false);
+    },
+  );
+
+  it('is wrapped in disabledTool() with the operator reason and hint when the flag is false', async () => {
+    const def = await loadWith('false');
+    expect(def).toMatchObject(
+      disabledTool({} as AnyToolDefinition, {
+        reason: 'Emoji tag lookup is turned off in this deployment.',
+        hint: 'NTFY_ENABLE_EMOJI_TAGS=true',
+      }),
+    );
+    expect(def).toMatchObject({ name: 'ntfy_search_emoji_tags' });
+  });
+
+  it('fails to load, naming the variable, on an unrecognized value', async () => {
+    await expect(loadWith('maybe')).rejects.toThrow(/NTFY_ENABLE_EMOJI_TAGS/);
   });
 });

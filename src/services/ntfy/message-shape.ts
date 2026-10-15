@@ -1,7 +1,8 @@
 /**
  * @fileoverview Normalizes a raw `NtfyMessage` poll envelope into the shape the
- * MCP surfaces hand back: Unix-second timestamps converted to ISO 8601 strings
- * and long bodies truncated to a bounded length unless the caller opts out.
+ * MCP surfaces hand back: Unix-second timestamps converted to ISO 8601 strings,
+ * ntfy's `content_type: "text/markdown"` reduced to a `markdown: true` flag, and
+ * long bodies truncated to a bounded length unless the caller opts out.
  * Lives in the service layer so `ntfy_fetch_messages` and the `ntfy://{topic}`
  * resource — peers, not dependents — normalize identically instead of one
  * importing the other's internals.
@@ -21,6 +22,8 @@ export interface ShapedNtfyMessage {
   event: MessageEvent;
   expires?: string | undefined;
   id: string;
+  /** `true` when ntfy marked the body `text/markdown`; absent for plain text. */
+  markdown?: true | undefined;
   message?: string | undefined;
   /** Count of characters dropped from `message`; absent when nothing was cut. */
   messageTruncated?: number | undefined;
@@ -72,6 +75,7 @@ export function shapeMessage(
     title: raw.title,
     message: truncation.message,
     messageTruncated: truncation.messageTruncated,
+    markdown: raw.content_type === 'text/markdown' || undefined,
     priority: raw.priority,
     tags: raw.tags,
     click: raw.click,

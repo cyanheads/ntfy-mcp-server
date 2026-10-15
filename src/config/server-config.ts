@@ -12,11 +12,14 @@
  *  - Single-server shorthand (`NTFY_BASE_URL`, `NTFY_AUTH_TOKEN`,
  *    `NTFY_AUTH_USERNAME`, `NTFY_AUTH_PASSWORD`) — convenience for the
  *    common one-server case, expressed internally as a single-entry registry.
+ *
+ * `NTFY_ENABLE_EMOJI_TAGS` is parsed on its own by `isEmojiTagsEnabled()`,
+ * since it is read at module load rather than inside `createApp()`.
  * @module config/server-config
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { normalizeEnv } from '@cyanheads/mcp-ts-core/config';
+import { normalizeEnv, parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 import { configurationError } from '@cyanheads/mcp-ts-core/errors';
 
 const NtfyServerEntrySchema = z
@@ -103,16 +106,40 @@ const ServerConfigSchema = z.object({
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 
+const EmojiTagsFlagSchema = z.object({
+  enabled: z
+    .stringbool()
+    .default(true)
+    .describe('When false, `ntfy_search_emoji_tags` is disabled and no other surface names it.'),
+});
+
 let _config: ServerConfig | undefined;
+let _emojiTagsEnabled: boolean | undefined;
 
 export function getServerConfig(): ServerConfig {
   _config ??= loadFromEnv(typeof process !== 'undefined' ? process.env : {});
   return _config;
 }
 
-/** Test/setup hook — drop the cached parse so the next call re-reads `process.env`. */
+/**
+ * Whether `ntfy_search_emoji_tags` is offered (`NTFY_ENABLE_EMOJI_TAGS`,
+ * default `true`). Parsed apart from `getServerConfig()` because definition
+ * modules read it at load, before `createApp()` can render a
+ * `ConfigurationError` as the startup banner — so an invalid value of any
+ * other `NTFY_*` variable must not surface here. `parseEnvConfig` reads blank
+ * and whole-value `${…}` placeholder values as unset, as `normalizeEnv` does.
+ */
+export function isEmojiTagsEnabled(): boolean {
+  _emojiTagsEnabled ??= parseEnvConfig(EmojiTagsFlagSchema, {
+    enabled: 'NTFY_ENABLE_EMOJI_TAGS',
+  }).enabled;
+  return _emojiTagsEnabled;
+}
+
+/** Test/setup hook — drop the cached parses so the next call re-reads `process.env`. */
 export function resetServerConfig(): void {
   _config = undefined;
+  _emojiTagsEnabled = undefined;
 }
 
 interface RawEnv {

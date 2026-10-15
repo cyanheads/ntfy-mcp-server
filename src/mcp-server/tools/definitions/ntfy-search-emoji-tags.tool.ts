@@ -4,16 +4,23 @@
  * into `ntfy_publish_message`'s `tags` field, paged by `limit`/`offset`. The
  * parsed query, true match total, truncation flag, and empty-result or
  * next-page guidance ride the `enrichment` block so they reach both
- * `structuredContent` and `content[]` without a `format()` entry.
+ * `structuredContent` and `content[]` without a `format()` entry. Wrapped in
+ * `disabledTool()` when `NTFY_ENABLE_EMOJI_TAGS=false`: absent from
+ * `tools/list`, shown only on the startup line and the HTTP landing page.
  * @module mcp-server/tools/definitions/ntfy-search-emoji-tags.tool
  */
 
-import { tool, z } from '@cyanheads/mcp-ts-core';
+import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
 
+import { isEmojiTagsEnabled } from '@/config/server-config.js';
+import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import { getEmojiTagService } from '@/services/emoji-tags/emoji-tag-service.js';
 
 const DEFAULT_LIMIT = 25;
+/** Rows one call returns; a larger `limit` is served up to this and names the next page. */
 const MAX_LIMIT = 200;
+/** Hard ceiling on `limit` itself — rejects absurd input, not an over-cap page request. */
+const LIMIT_CEILING = 1000;
 
 const InputSchema = z.object({
   query: z
@@ -26,9 +33,11 @@ const InputSchema = z.object({
     .number()
     .int()
     .positive()
-    .max(MAX_LIMIT)
+    .max(LIMIT_CEILING)
     .default(DEFAULT_LIMIT)
-    .describe('Maximum number of matches to return. Default 25, max 200.'),
+    .describe(
+      'Maximum number of matches to return. Default 25. One call returns at most 200; a larger value returns 200 and names the next `offset`.',
+    ),
   offset: z
     .number()
     .int()
@@ -56,7 +65,7 @@ const OutputSchema = z.object({
     .describe('Tag → emoji rows in the order they appear in the upstream reference.'),
 });
 
-export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
+const definition = tool('ntfy_search_emoji_tags', {
   description:
     "Look up ntfy emoji tag short codes. Use the returned `tag` strings in `ntfy_publish_message`'s `tags` field to render emojis on the recipient's device. Without a query, returns the first slice of the full reference; pass a substring (e.g., `warning`, `tada`, `cd`) to filter, and `offset` to page through matches beyond `limit`.",
   annotations: { readOnlyHint: true, openWorldHint: false },
@@ -84,9 +93,10 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
   },
 
   handler(input, ctx) {
+    const limit = Math.min(input.limit, MAX_LIMIT);
     const { matches, total, truncated } = getEmojiTagService().search(
       input.query,
-      input.limit,
+      limit,
       input.offset,
     );
 
@@ -98,13 +108,17 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
         input.offset >= total && total > 0
           ? `\`offset\` ${input.offset} is past the last of ${total} matches — lower it to page back into range.`
           : input.query
-            ? `No emoji tags matched query \`${input.query}\`. Try a shorter substring or omit the query to list the reference from the start.`
+            ? `No emoji tags matched query ${literal(input.query)}. Try a shorter substring or omit the query to list the reference from the start.`
             : 'The bundled reference is empty — this should not happen; report it.',
       );
     } else if (truncated) {
       const next = input.offset + matches.length;
+      const capped =
+        input.limit > MAX_LIMIT
+          ? ` \`limit\` ${input.limit} is above the ${MAX_LIMIT}-row page size, so this page holds ${MAX_LIMIT}.`
+          : '';
       ctx.enrich.notice(
-        `Showing matches ${input.offset + 1}–${next} of ${total}. Pass \`offset: ${next}\` (same \`query\`) for the next page, or narrow the query.`,
+        `Showing matches ${input.offset + 1}–${next} of ${total}.${capped} Pass \`offset: ${next}\` (same \`query\`) for the next page, or narrow the query.`,
       );
     }
 
@@ -116,7 +130,14 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
       return [{ type: 'text', text: 'No emoji tags matched.' }];
     }
     const header = '| Tag | Emoji |\n|:----|:------|';
-    const rows = result.matches.map((m) => `| \`${m.tag}\` | ${m.emoji} |`);
+    const rows = result.matches.map((m) => `| ${literal(m.tag)} | ${m.emoji} |`);
     return [{ type: 'text', text: `${header}\n${rows.join('\n')}` }];
   },
 });
+
+export const ntfySearchEmojiTags = isEmojiTagsEnabled()
+  ? definition
+  : disabledTool(definition, {
+      reason: 'Emoji tag lookup is turned off in this deployment.',
+      hint: 'NTFY_ENABLE_EMOJI_TAGS=true',
+    });

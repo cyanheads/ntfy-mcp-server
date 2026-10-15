@@ -6,7 +6,8 @@
  * user-confirmation gate: the first call returns an input request, and the
  * clear/delete only fires on the retried call whose approval redeems the
  * consent record that request stored for this exact topic, message, and
- * operation.
+ * operation. The prompt, `format()`, and failure messages render every topic,
+ * sequence ID, and event ID through `literal()`, so each reads as literal text.
  * @module mcp-server/tools/definitions/ntfy-manage-message.tool
  */
 
@@ -15,6 +16,7 @@ import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors
 
 import { getServerConfig } from '@/config/server-config.js';
 import { confirmAction } from '@/mcp-server/tools/utils/confirm-action.js';
+import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import {
   BASE_URL_HINT,
   BASE_URL_PATTERN,
@@ -25,7 +27,10 @@ import {
   getMessage,
   isAuthCode,
   isNotFoundCode,
+  isRateLimitedCode,
+  isUpstreamMalformed,
   isUpstreamUnreachable,
+  retryAfterData,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyManageResponse } from '@/services/ntfy/types.js';
@@ -57,7 +62,7 @@ const InputSchema = z.object({
     .regex(BASE_URL_PATTERN, BASE_URL_HINT)
     .optional()
     .describe(
-      'Override the configured `NTFY_BASE_URL` for this call — an absolute `http(s)://` URL. When the override differs from the configured base URL, server-configured auth credentials are NOT forwarded.',
+      'Override the configured `NTFY_BASE_URL` for this call — an absolute `http(s)://` URL. Server-configured auth credentials are forwarded only when the override matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request goes out unauthenticated.',
     ),
 });
 
@@ -76,9 +81,10 @@ const OutputSchema = z.object({
 export const ntfyManageMessage = tool('ntfy_manage_message', {
   description:
     'Clear (mark read & dismiss) or delete a previously-sent ntfy notification by `sequence_id`. Append-only: the original message stays in cache and a `message_clear`/`message_delete` event is emitted to subscribers. Re-issuing the same operation is safe — message state does not change, but a fresh event fires each time. ntfy.sh accepts unknown sequence IDs without error; stricter ntfy variants surface a `not_found` failure. The first call always asks the user to confirm the topic, `sequence_id`, and operation and comes back requesting that input rather than a result; reissue the same call with the answer attached to carry it out. Declining fails the call with `consent_declined`.',
+  // Not idempotent: message state settles after one call, but every call
+  // appends a fresh event that is delivered, cached, and counted against quota.
   annotations: {
     destructiveHint: true,
-    idempotentHint: true,
     openWorldHint: true,
   },
   input: InputSchema,
@@ -108,12 +114,29 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
         'Confirm the topic and `sequence_id` were correct (call `ntfy_fetch_messages` to inspect what is still cached), or accept that the message has aged out (default cache window is 12h).',
     },
     {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'ntfy answered 429 and was still answering it when retries ran out.',
+      retryable: true,
+      recovery:
+        "Wait for ntfy's rate-limit window to pass before reissuing the clear or delete — `retryAfter` seconds when the error carries it. A request-rate limit (`too many requests`) clears within minutes; a daily quota (`daily … reached`) resets within 24 hours.",
+    },
+    {
       reason: 'upstream_unreachable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted.',
+      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted, or no complete answer within the call deadline.',
       retryable: true,
       recovery:
         'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
+    },
+    {
+      reason: 'upstream_malformed',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "The server answered the clear or delete with HTTP 200 but a reply that is not an ntfy event (an empty body, an HTML page, JSON without ntfy's message fields or the `sequence_id`). Not retried, since the event may already be out.",
+      retryable: false,
+      thrownBy: 'service',
+      recovery:
+        'The clear or delete may already have taken effect — call `ntfy_fetch_messages` on the topic, with the same `base_url` this call used, and look for a `message_clear` / `message_delete` event carrying this `sequence_id` before reissuing it. If `base_url` (or the configured `NTFY_BASE_URL`) does not point at an ntfy server, correct it first.',
     },
   ],
 
@@ -135,12 +158,12 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       operation: `ntfy_manage_message:${input.operation}`,
       target: `${base}/${topic}/${input.sequence_id}`,
       request: { base, topic, sequence_id: input.sequence_id, operation: input.operation },
-      message: `${input.operation === 'clear' ? 'Clear' : 'Delete'} ntfy notification \`${input.sequence_id}\` on topic \`${topic}\`? Subscribers receive a message_${input.operation} event.`,
+      message: `${input.operation === 'clear' ? 'Clear' : 'Delete'} ntfy notification ${literal(input.sequence_id)} on topic ${literal(topic)}? Subscribers receive a message_${input.operation} event.`,
     });
     if (consent === 'declined') {
       throw ctx.fail(
         'consent_declined',
-        `The ${input.operation} of ${input.sequence_id} on topic ${topic} was not confirmed.`,
+        `The ${input.operation} of ${literal(input.sequence_id)} on topic ${literal(topic)} was not confirmed.`,
       );
     }
 
@@ -151,15 +174,25 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
         signal: ctx.signal,
       });
     } catch (err) {
+      // Already carries its declared reason; the unreachable branch below would
+      // claim it once the call deadline has marked it `(failed after N attempts)`.
+      if (isUpstreamMalformed(err)) throw err;
       const code = getCode(err);
       const msg = getMessage(err);
       if (isAuthCode(code)) {
-        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${topic}`);
+        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${literal(topic)}`);
       }
       if (isNotFoundCode(code)) {
         throw ctx.fail(
           'not_found',
-          msg || `No cached message ${input.sequence_id} on topic ${topic}.`,
+          msg || `No cached message ${literal(input.sequence_id)} on topic ${literal(topic)}.`,
+        );
+      }
+      if (isRateLimitedCode(code)) {
+        throw ctx.fail(
+          'rate_limited',
+          msg || 'ntfy returned 429 after retries.',
+          retryAfterData(err),
         );
       }
       if (isUpstreamUnreachable(err)) {
@@ -185,8 +218,8 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
   format(result) {
     const verb = result.operation === 'clear' ? 'cleared' : 'deleted';
     const lines = [
-      `**${verb.toUpperCase()}** sequence \`${result.sequence_id}\` on topic \`${result.topic}\``,
-      `Event ID: \`${result.event_id}\``,
+      `**${verb.toUpperCase()}** sequence ${literal(result.sequence_id)} on topic ${literal(result.topic)}`,
+      `Event ID: ${literal(result.event_id)}`,
       `Operation: ${result.operation}`,
       `Time: ${result.time}`,
     ];

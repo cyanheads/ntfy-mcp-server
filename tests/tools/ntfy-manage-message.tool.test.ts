@@ -1,7 +1,10 @@
 /**
  * @fileoverview Tests for `ntfy_manage_message` — clear and delete dispatch,
- * reason mapping (not_found / forbidden_topic / upstream_unreachable / generic
- * rethrow), default-topic resolution, missing-topic ValidationError,
+ * reason mapping (not_found / forbidden_topic / rate_limited /
+ * upstream_unreachable / upstream_malformed without a resend / generic
+ * rethrow), the advertised annotations and the
+ * no-dedupe guarantee they reflect, default-topic resolution,
+ * missing-topic ValidationError,
  * base_url override plus its scheme validation, format() rendering for both
  * operations, and the consent gate across both round trips — the first round's
  * `input_required` result, its prompt contents, and the consent record it
@@ -13,7 +16,15 @@
  */
 
 import type { AuthContext, InputRequiredResult } from '@cyanheads/mcp-ts-core';
-import { forbidden, invalidParams, type McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
+import {
+  forbidden,
+  invalidParams,
+  JsonRpcErrorCode,
+  type McpError,
+  notFound,
+  serviceUnavailable,
+  timeout,
+} from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext,
   expectInputRequired,
@@ -256,6 +267,75 @@ describe('ntfyManageMessage handler', () => {
     expect(text).toContain('Operation: clear');
   });
 
+  it('renders plain identifiers in format() exactly as before the literal() sweep', () => {
+    const blocks = ntfyManageMessage.format!({
+      event_id: 'evt_1',
+      topic: 'alerts',
+      sequence_id: 'seq_1',
+      operation: 'delete',
+      time: '2023-11-14T22:13:20.000Z',
+    });
+    expect((blocks[0] as { text: string }).text).toBe(
+      '**DELETED** sequence `seq_1` on topic `alerts`\nEvent ID: `evt_1`\nOperation: delete\nTime: 2023-11-14T22:13:20.000Z',
+    );
+  });
+
+  it('renders the topic, sequence, and event ID ntfy echoes as code spans, keeping structuredContent raw', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'manage').mockResolvedValue({
+      id: '<i>e</i>',
+      time: 1700000000,
+      event: 'message_delete',
+      topic: '[x](y)',
+      sequence_id: 'a`b',
+    });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_1',
+      operation: 'delete',
+    });
+    const result = await ntfyManageMessage.handler(input, await approvedCtx(input));
+
+    expect(result).toMatchObject({ event_id: '<i>e</i>', topic: '[x](y)', sequence_id: 'a`b' });
+    const text = (ntfyManageMessage.format!(result)[0] as { text: string }).text;
+    expect(text.split('\n').slice(0, 2)).toEqual([
+      '**DELETED** sequence ``a`b`` on topic `[x](y)`',
+      'Event ID: `<i>e</i>`',
+    ]);
+  });
+
+  it('moves an echoed value with a line break into its own `text` fence', () => {
+    const blocks = ntfyManageMessage.format!({
+      event_id: 'evt_1',
+      topic: 'alerts',
+      sequence_id: 'seq\n# forged',
+      operation: 'clear',
+      time: '2023-11-14T22:13:20.000Z',
+    });
+    expect((blocks[0] as { text: string }).text).toContain(
+      '**CLEARED** sequence \n```text\nseq\n# forged\n```\n on topic `alerts`',
+    );
+  });
+
+  it.each([
+    ['forbidden_topic', forbidden(''), 'Forbidden for topic `_secret_`'],
+    ['not_found', notFound(''), 'No cached message `_seq_` on topic `_secret_`.'],
+  ])(
+    'names the topic in a code span when ntfy gave no %s explanation',
+    async (reason, upstreamErr, message) => {
+      const svc = freshService();
+      vi.spyOn(svc, 'manage').mockRejectedValue(upstreamErr);
+      const input = ntfyManageMessage.input.parse({
+        topic: '_secret_',
+        sequence_id: '_seq_',
+        operation: 'delete',
+      });
+      await expect(
+        ntfyManageMessage.handler(input, await approvedCtx(input)),
+      ).rejects.toMatchObject({ message, data: { reason } });
+    },
+  );
+
   it('throws ValidationError when neither topic nor NTFY_DEFAULT_TOPIC is set', async () => {
     freshService();
     const ctx = createMockContext({ errors: ntfyManageMessage.errors });
@@ -283,6 +363,13 @@ describe('ntfyManageMessage handler', () => {
     });
     await ntfyManageMessage.handler(input, await approvedCtx(input));
     expect(manage.mock.calls[0]?.[3]).toMatchObject({ baseUrl: 'https://other.example.com' });
+  });
+
+  it('describes `base_url` credential forwarding as keyed on every registered server', () => {
+    const description = ntfyManageMessage.input.shape.base_url.description ?? '';
+    expect(description).toContain('only when the override matches a registered server');
+    expect(description).toContain('`NTFY_SERVERS` entry');
+    expect(description).not.toContain('differs from the configured base URL');
   });
 
   it.each(['ftp://ntfy.example.com', 'ntfy.example.com', 'https://ntfy example.com'])(
@@ -331,6 +418,129 @@ describe('ntfyManageMessage handler', () => {
     });
   });
 
+  it('maps a call that ran out of its deadline to `upstream_unreachable`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'manage').mockRejectedValue(
+      timeout('ntfy clear exceeded its 50000ms retry deadline after 4 attempts.', {
+        reason: 'retry_deadline_exceeded',
+      }),
+    );
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_x',
+      operation: 'clear',
+    });
+    await expect(ntfyManageMessage.handler(input, await approvedCtx(input))).rejects.toMatchObject({
+      data: { reason: 'upstream_unreachable' },
+    });
+  });
+
+  it('maps a 429 that outlasts the retries to `rate_limited`, through the real service', async () => {
+    initNtfyService({
+      servers: [{ baseUrl: 'https://ntfy.test' }],
+      requestTimeoutMs: 1000,
+      maxRetries: 1,
+    } as never);
+    const upstream = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      if (new URL(String(url)).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+      return new Response('{"code":42901,"http":429,"error":"limit reached: too many requests"}', {
+        status: 429,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_x',
+      operation: 'delete',
+    });
+    const err = (await Promise.resolve(
+      ntfyManageMessage.handler(input, await approvedCtx(input)),
+    ).catch((e: unknown) => e)) as McpError;
+    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(err.code).toBe(JsonRpcErrorCode.RateLimited);
+    expect(err.data).toMatchObject({ reason: 'rate_limited', retryable: true });
+    expect(err.message).toContain('limit reached: too many requests');
+    expect(err.message).toContain('(failed after 2 attempts)');
+    expect(ntfyManageMessage.errors?.find((e) => e.reason === 'rate_limited')).toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      recovery: expect.stringContaining('rate-limit window'),
+    });
+  });
+
+  /**
+   * A `200` whose body is not ntfy's event reply (#39), through the real service
+   * with `NTFY_MAX_RETRIES` at 3: the request count is how many
+   * `message_clear` / `message_delete` events went out.
+   */
+  it.each([
+    ['clear', 'an empty body', '', undefined],
+    ['delete', 'an HTML page', '<!doctype html><html>Captive portal</html>', 'text/html'],
+    ['clear', 'JSON `null`', 'null', 'application/json'],
+    [
+      'delete',
+      'an event with no `sequence_id`',
+      '{"id":"e1","time":1,"event":"message_delete","topic":"alerts"}',
+      'application/json',
+    ],
+  ] as const)(
+    'fails a %s answered with %s as `upstream_malformed`, sending it once',
+    async (operation, _label, text, contentType) => {
+      initNtfyService({
+        servers: [{ baseUrl: 'https://ntfy.test' }],
+        requestTimeoutMs: 1000,
+        maxRetries: 3,
+      } as never);
+      const upstream = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        if (new URL(String(url)).hostname !== 'ntfy.test')
+          throw new Error(`Unmocked fetch: ${url}`);
+        return new Response(text, {
+          status: 200,
+          ...(contentType ? { headers: { 'content-type': contentType } } : {}),
+        });
+      });
+      const input = ntfyManageMessage.input.parse({
+        topic: 'alerts',
+        sequence_id: 'seq_x',
+        operation,
+      });
+      const err = (await Promise.resolve(
+        ntfyManageMessage.handler(input, await approvedCtx(input)),
+      ).catch((e: unknown) => e)) as McpError;
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(err.data).toMatchObject({ reason: 'upstream_malformed', retryable: false });
+      expect(err.message).toContain(`${operation} was answered with HTTP 200`);
+    },
+  );
+
+  it('declares `upstream_malformed` as not retryable, pointing at the cached event before a reissue', () => {
+    const entry = ntfyManageMessage.errors?.find((e) => e.reason === 'upstream_malformed');
+    expect(entry).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable, retryable: false });
+    expect(entry?.recovery).toContain('`ntfy_fetch_messages`');
+    expect(entry?.recovery).toContain('`message_clear` / `message_delete`');
+    // An event emitted through an override is cached only on that server.
+    expect(entry?.recovery).toContain('same `base_url`');
+  });
+
+  it('keeps `upstream_malformed` when the call deadline landed on the malformed reply', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'manage').mockRejectedValue(
+      serviceUnavailable(
+        'The clear was answered with HTTP 200, but the reply is not an ntfy message: the body is empty. (failed after 1 attempt)',
+        { reason: 'upstream_malformed', retryable: false, retryAttempts: 1, deadlineMs: 50_000 },
+      ),
+    );
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_x',
+      operation: 'clear',
+    });
+    await expect(ntfyManageMessage.handler(input, await approvedCtx(input))).rejects.toMatchObject({
+      data: { reason: 'upstream_malformed', retryable: false },
+    });
+  });
+
   it('rethrows unclassified errors so the framework auto-classifier handles them', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(invalidParams('weird upstream complaint'));
@@ -344,6 +554,45 @@ describe('ntfyManageMessage handler', () => {
     ).rejects.not.toMatchObject({
       data: expect.objectContaining({ reason: expect.any(String) }),
     });
+  });
+
+  it('advertises destructive and open-world, never idempotent — each call appends an event', () => {
+    expect(ntfyManageMessage.annotations).toEqual({
+      destructiveHint: true,
+      openWorldHint: true,
+    });
+  });
+
+  it('sends every confirmed repeat of the same clear to ntfy, with no dedupe', async () => {
+    freshService();
+    let events = 0;
+    const upstream = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      if (new URL(String(url)).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+      expect(init?.method).toBe('PUT');
+      events += 1;
+      return Response.json({
+        id: `evt_${events}`,
+        time: 1700000000 + events,
+        event: 'message_clear',
+        topic: 'alerts',
+        sequence_id: 's1',
+      });
+    });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 's1',
+      operation: 'clear',
+    });
+
+    const first = await ntfyManageMessage.handler(input, await approvedCtx(input));
+    const second = await ntfyManageMessage.handler(input, await approvedCtx(input));
+
+    expect(upstream).toHaveBeenCalledTimes(2);
+    for (const call of upstream.mock.calls) {
+      expect(String(call[0])).toBe('https://ntfy.test/alerts/s1/clear');
+    }
+    expect([first.event_id, second.event_id]).toEqual(['evt_1', 'evt_2']);
+    expect(second.sequence_id).toBe('s1');
   });
 });
 
@@ -444,6 +693,27 @@ describe('ntfyManageMessage consent gate', () => {
     const { message } = confirmRequest(asked);
     expect(message).toMatch(/^Clear/);
     expect(message).toContain('message_clear');
+  });
+
+  it('names the sequence and topic in code spans in the prompt and in a decline', async () => {
+    const upstream = fakeUpstream();
+    const gated = input({ topic: '_secret_', sequence_id: '__seq__' });
+
+    const { message } = confirmRequest(
+      await expectInputRequired(() =>
+        ntfyManageMessage.handler(gated, createMockContext({ errors: ntfyManageMessage.errors })),
+      ),
+    );
+    expect(message).toBe(
+      'Delete ntfy notification `__seq__` on topic `_secret_`? Subscribers receive a message_delete event.',
+    );
+
+    await expect(
+      ntfyManageMessage.handler(gated, await approvedCtx(gated, { action: 'decline' })),
+    ).rejects.toMatchObject({
+      message: 'The delete of `__seq__` on topic `_secret_` was not confirmed.',
+    });
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it('carries out the operation once, on the round that redeems its own record', async () => {

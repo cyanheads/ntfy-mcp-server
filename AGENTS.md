@@ -2,10 +2,10 @@
 
 **Server:** ntfy-mcp-server
 **Version:** 2.3.6
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.13`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0 (via the framework)
-**Zod:** ^4.6.5
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1 (via the framework)
+**Zod:** ^4.6.6
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 >
@@ -36,7 +36,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 - **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch` for control flow. The narrow `try/catch` blocks in this codebase exist solely to translate upstream ntfy errors into typed contract failures via `ctx.fail()` before re-throwing; everything else bubbles for framework auto-classification. Use error factories (`notFound()`, `forbidden()`, `validationError()`, …) when no contract entry fits.
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
-- **Auth scope is the configured `NTFY_BASE_URL`.** When a tool's `base_url` argument differs from the configured base, `NtfyService` strips the auth header before sending — never widen this to "always forward credentials" without explicit operator opt-in.
+- **Auth scope is the registered base URL.** Credentials bind to the base they were configured with (`NTFY_BASE_URL`, or each `NTFY_SERVERS` entry); when a tool's `base_url` argument matches no registered base, `NtfyService` sends no auth header — never widen this to "always forward credentials" without explicit operator opt-in.
 - **`base_url` overrides are validated before they are dereferenced.** Absolute `http(s)` form is enforced unconditionally (`assertAbsoluteHttpUrl`, plus the advertised `BASE_URL_PATTERN` on all three tool schemas); the private-address guard and redirect refusal are opt-in behind `NTFY_BLOCK_PRIVATE_HOSTS` so LAN and stdio deployments keep working. Registered servers bypass the guard — that is the operator's lever for a deliberate private target, so keep the bypass set sourced from every `cfg.servers[]` entry, not from the credentialed subset.
 - **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. The gate is a multi-round-trip flow that redeems a server record: asking stores `{ operation, clientId, subject, target, contentHash }` in `ctx.state` under a random id (600 s TTL) and returns `input_required` carrying an `elicitation/create` request that names the exact target, with only that id as `requestState`. Every call first reads and deletes the record its `requestState` names, and the operation runs only when that record equals what this call would confirm — same tool and manage action, same `ctx.auth` caller, same base URL + topic (+ `sequence_id`), same hash of the outbound request — and the answer is an accepted `confirm: true`. Any other round asks again under a fresh record: no `requestState`; an unknown, spent, expired, or malformed id; a record minted for another operation, tool, caller, target, or content. An answer on `ctx.inputs` alone never proceeds — a client can send one unprompted, or replay one. Against a matching record, a declined, cancelled, or unparseable response fails with `consent_declined` — and so does a refusal of any other shape, since `accepted()` collapses them all. There is no proceed-anyway branch, and `ctx.clientCapabilities` never skips the prompt: `ctx.requestInput` exists on every transport and both protocol eras, so the gate is fail-closed on Streamable HTTP as much as on stdio. A 2025-era client that declared no `elicitation.form` capability (a bare `elicitation: {}` counts as declaring it) is refused inside `ctx.requestInput`: the call fails with `InvalidRequest` (`-32600`), `data.reason: 'client_capability_missing'`, and a recovery hint naming the capability, before anything is sent upstream.
 - **Consent records live where every instance a retry reaches can read them.** The default `STORAGE_PROVIDER_TYPE=in-memory` suits one process; a multi-instance HTTP deployment needs `filesystem`, `supabase`, or `cloudflare-d1` — never `cloudflare-kv`, whose eventual consistency lets a replay outrun the delete. Redeeming stops sequential replays only: `ctx.state` has no atomic take (cyanheads/mcp-ts-core#593), so concurrent retries carrying one id can each proceed, and ntfy offers no idempotency key to pin the action to the record — a duplicate clear/delete re-emits its event, a duplicate publish delivers again. HTTP deployments should also set `MCP_REQUEST_STATE_KEY` (≥ 32 bytes, the same on every instance), which rejects a forged or tampered `requestState` before the handler runs.
@@ -106,6 +106,7 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 
 export const ntfyPublishMessage = tool('ntfy_publish_message', {
@@ -136,7 +137,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       return { id: response.id, /* … */ };
     } catch (err) {
       if (isAuthCode(getCode(err))) {
-        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${topic}`);
+        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${literal(topic)}`);
       }
       throw err; // Let framework auto-classify the rest
     }
@@ -150,7 +151,8 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
 
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { forbidden } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 
 export const ntfyTopicResource = resource('ntfy://{topic}', {
@@ -161,18 +163,29 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
     topic: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/).describe('Topic name.'),
   }),
 
+  errors: [
+    { reason: 'forbidden_topic', code: JsonRpcErrorCode.Forbidden,
+      when: 'Auth required for the target topic.',
+      recovery: 'Try an unprotected topic; if this topic must stay protected, ask the operator to configure ntfy auth.' },
+    { reason: 'rate_limited', code: JsonRpcErrorCode.RateLimited,
+      when: 'ntfy answered 429 and was still answering it when retries ran out.',
+      retryable: true,
+      recovery: "Wait for ntfy's rate-limit window to pass before reading the topic again." },
+  ],
+
   async handler(params, ctx) {
     try {
-      const raw = await getNtfyService().fetch(
+      const { messages, upstreamTruncated } = await getNtfyService().fetch(
         { topic: params.topic, since: '1h' },
         { signal: ctx.signal },
       );
-      return { topic: params.topic, messages: raw, /* … */ };
+      return { topic: params.topic, messages, upstreamTruncated, /* … */ };
     } catch (err) {
-      if (isAuthCode(getCode(err))) {
-        throw forbidden(getMessage(err) || `Forbidden for topic ${params.topic}`, {
-          recovery: { hint: 'Try an unprotected topic.' },
-        }, { cause: err });
+      const code = getCode(err);
+      if (isRateLimitedCode(code)) throw ctx.fail('rate_limited', getMessage(err));
+      if (isAuthCode(code)) {
+        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${literal(params.topic)}`,
+          undefined, { cause: err });
       }
       throw err;
     }
@@ -241,7 +254,7 @@ Handlers receive a unified `ctx` object. Key properties this server uses today (
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union. TypeScript catches `ctx.fail('typo')` at compile time, `data.reason` is auto-populated for observability, and the linter enforces conformance against the handler body. The `recovery` field is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. An entry thrown below the handler body — `ntfy_publish_message`'s upstream reasons, raised in `classifyPublishError` — carries `thrownBy: 'service'` so `error-contract-unthrown` skips it; lint-only metadata, nothing at runtime reads it. `severity` logs a modeled outcome below `error` — `consent_declined` is `notice` on both gated tools, since a user saying no is not an incident. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union. TypeScript catches `ctx.fail('typo')` at compile time, `data.reason` is auto-populated for observability, and the linter enforces conformance against the handler body. The `recovery` field is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. An entry thrown below the handler body — `ntfy_publish_message`'s upstream reasons, raised in `classifyPublishError`, and every surface's `upstream_malformed`, raised in `NtfyService` — carries `thrownBy: 'service'` so `error-contract-unthrown` skips it; lint-only metadata, nothing at runtime reads it. `severity` logs a modeled outcome below `error` — `consent_declined` is `notice` on both gated tools, since a user saying no is not an incident. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 errors: [
@@ -286,6 +299,7 @@ src/
   index.ts                              # createApp() entry point
   config/
     server-config.ts                    # NTFY_* env vars (Zod schema, lazy-parsed)
+    load-env-file.ts                    # Loads ./.env; index.ts imports it first
   services/
     ntfy/
       ntfy-service.ts                   # HTTP client (publish, manage, fetch)
@@ -304,6 +318,7 @@ src/
       ntfy-search-emoji-tags.tool.ts    # Look up emoji short codes
     tools/utils/
       confirm-action.ts                 # Multi-round-trip consent gate for side effects
+      markdown-literal.ts               # Render values as literal Markdown (code span / fence)
     resources/definitions/
       ntfy-topic.resource.ts            # ntfy://{topic} snapshot
 ```
@@ -469,7 +484,7 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] ntfy-specific: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
 - [ ] ntfy-specific: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] ntfy-specific: tests include at least one sparse payload case with omitted upstream fields
-- [ ] ntfy-specific: per-call `base_url` overrides go out unauthenticated when they differ from the configured base — never widen this without explicit operator opt-in
+- [ ] ntfy-specific: per-call `base_url` overrides go out unauthenticated when they match no registered server — never widen this without explicit operator opt-in
 - [ ] Registered in `createApp()` arrays in `src/index.ts`
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description

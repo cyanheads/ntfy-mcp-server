@@ -57,6 +57,8 @@ export interface NtfyPublishResponse {
   actions?: NtfyAction[];
   attachment?: NtfyAttachment;
   click?: string;
+  /** `text/markdown` when the body was published as Markdown; absent for plain text. */
+  content_type?: string;
   expires?: number;
   id: string;
   message?: string;
@@ -78,6 +80,8 @@ export interface NtfyMessage {
   actions?: NtfyAction[];
   attachment?: NtfyAttachment;
   click?: string;
+  /** `text/markdown` when the body was published as Markdown; absent for plain text. */
+  content_type?: string;
   event: MessageEvent | 'open' | 'keepalive';
   expires?: number;
   id: string;
@@ -124,6 +128,18 @@ export interface NtfyFetchParams {
   topic: string;
 }
 
+/** What one `<topic>/json?poll=1` round trip yields. */
+export interface NtfyFetchResult {
+  /** Every envelope in the poll body, oldest-first, `open` / `keepalive` frames included. */
+  messages: NtfyMessage[];
+  /**
+   * ntfy answered with `X-Messages-Truncated: 1`: the replay exceeded its
+   * per-topic poll size cap, so it kept only the newest messages and dropped
+   * the older ones before responding.
+   */
+  upstreamTruncated: boolean;
+}
+
 export type ManageOperation = 'clear' | 'delete';
 
 export interface NtfyManageResponse {
@@ -136,9 +152,9 @@ export interface NtfyManageResponse {
 
 export interface NtfyCallOptions {
   /**
-   * Per-call override of the configured base URL. When set to anything other
-   * than the configured `NTFY_BASE_URL`, configured auth credentials are not
-   * forwarded — see the design doc for rationale.
+   * Per-call override of the configured base URL. When it matches no
+   * registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry), configured
+   * auth credentials are not forwarded — see the design doc for rationale.
    */
   baseUrl?: string | undefined;
   signal?: AbortSignal | undefined;

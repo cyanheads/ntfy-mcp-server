@@ -10,9 +10,11 @@
  * round that must ask again instead of publishing — replay, pre-answer,
  * fabricated or malformed id, a record minted for other content, target, tool,
  * or caller), and the full contract error mapping
- * (forbidden / rate-limit / payload-too-large from a 413 / invalid-attachment /
+ * (forbidden / rate-limit / payload-too-large from a 413 or an oversize title or
+ * tags, each with its own hint / invalid-delay / invalid-attachment /
  * unverified-contact / upstream-unreachable / generic rethrow) with the upstream
- * explanation preserved on the error message.
+ * explanation preserved on the error message, and a 200 reply that is not an
+ * ntfy message failing as `upstream_malformed` without a resend.
  * @module tests/tools/ntfy-publish-message.tool
  */
 
@@ -24,6 +26,7 @@ import {
   McpError,
   notFound,
   rateLimited,
+  timeout,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import {
@@ -242,6 +245,17 @@ describe('ntfyPublishMessage handler', () => {
     });
   });
 
+  it('names the topic in a code span when ntfy gave no `forbidden_topic` explanation', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockRejectedValue(forbidden(''));
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({ topic: '_secret_', message: 'x' });
+    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
+      message: 'Forbidden for topic `_secret_`',
+      data: { reason: 'forbidden_topic' },
+    });
+  });
+
   it('maps a RateLimited upstream to reason `rate_limited`', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'publish').mockRejectedValue(rateLimited('Slow down'));
@@ -303,7 +317,7 @@ describe('ntfyPublishMessage handler', () => {
         'ntfy returned HTTP 400 Bad Request: invalid request: attachment URL is invalid',
         {
           status: 400,
-          body: '{"code":40023,"http":400,"error":"invalid request: attachment URL is invalid"}',
+          body: '{"code":40013,"http":400,"error":"invalid request: attachment URL is invalid"}',
         },
       ),
     );
@@ -345,10 +359,10 @@ describe('ntfyPublishMessage handler', () => {
     vi.spyOn(svc, 'publish').mockRejectedValue(
       new McpError(
         JsonRpcErrorCode.InvalidParams,
-        'ntfy returned HTTP 400 Bad Request: invalid delay parameter: unable to parse delay (see https://ntfy.sh/docs/publish/#scheduled-delivery)',
+        'ntfy returned HTTP 400 Bad Request: cannot disable cache for delayed message',
         {
           status: 400,
-          body: '{"code":40004,"http":400,"error":"invalid delay parameter: unable to parse delay"}',
+          body: '{"code":40002,"http":400,"error":"cannot disable cache for delayed message"}',
         },
       ),
     );
@@ -356,13 +370,163 @@ describe('ntfyPublishMessage handler', () => {
     const input = ntfyPublishMessage.input.parse({
       topic: 'alerts',
       message: 'x',
-      delay: '9 fortnights',
+      delay: '30m',
+      cache: false,
     });
     const err = (await Promise.resolve(ntfyPublishMessage.handler(input, ctx)).catch(
       (e: unknown) => e,
     )) as McpError;
-    expect(err.message).toContain('invalid delay parameter: unable to parse delay');
+    expect(err.message).toContain('cannot disable cache for delayed message');
     expect(err.data?.reason).toBeUndefined();
+  });
+
+  describe('ntfy 400 rejections read through the contract', () => {
+    /** An ntfy 400 as `httpErrorFromResponse` raises it: status-line message plus the JSON body. */
+    function ntfy400(code: number, error: string, link?: string) {
+      return new McpError(
+        JsonRpcErrorCode.InvalidParams,
+        `ntfy returned HTTP 400 Bad Request: ${error}${link ? ` (see ${link})` : ''}`,
+        {
+          status: 400,
+          body: JSON.stringify({ code, http: 400, error, ...(link ? { link } : {}) }),
+        },
+      );
+    }
+
+    /** The contract envelope of one failed publish: the JSON error and the `content[]` text. */
+    async function failedPublish(rejection: McpError, input: Record<string, unknown>) {
+      const svc = freshService();
+      vi.spyOn(svc, 'publish').mockRejectedValue(rejection);
+      const result = await runToolContract(ntfyPublishMessage, { topic: 'alerts', ...input });
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as {
+        error: {
+          code: number;
+          message: string;
+          data: { reason?: string; recovery?: { hint: string } };
+        };
+      };
+      const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      return { error, text };
+    }
+
+    const DELAY_DOCS = 'https://ntfy.sh/docs/publish/#scheduled-delivery';
+    const DELAY_HINT = ntfyPublishMessage.errors?.find((e) => e.reason === 'invalid_delay')
+      ?.recovery as string;
+
+    it.each([
+      [40004, 'invalid delay parameter: unable to parse delay', '9 fortnights'],
+      [40005, 'invalid delay parameter: too small, please refer to the docs', '1s'],
+      [40006, 'invalid delay parameter: too large, please refer to the docs', '4d'],
+    ])(
+      'maps %i to `invalid_delay` with its hint on both surfaces',
+      async (code, upstream, delay) => {
+        const { error, text } = await failedPublish(ntfy400(code, upstream, DELAY_DOCS), {
+          message: 'x',
+          delay,
+        });
+        expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+        expect(error.data.reason).toBe('invalid_delay');
+        expect(error.data.recovery?.hint).toBe(DELAY_HINT);
+        // The upstream explanation and its docs link stay in the message.
+        expect(error.message).toContain(upstream);
+        expect(error.message).toContain(DELAY_DOCS);
+        expect(text).toContain(`Recovery: ${DELAY_HINT}`);
+        expect(text).toContain('reason invalid_delay');
+      },
+    );
+
+    it('declares a delay hint that names the accepted forms and both bounds', () => {
+      expect(DELAY_HINT).toContain('`1d`');
+      expect(DELAY_HINT).toContain('10 seconds');
+      expect(DELAY_HINT).toContain('3 days');
+      expect(DELAY_HINT).not.toContain('Shorten the message');
+    });
+
+    it.each([
+      [40002, 'cannot disable cache for delayed message', { delay: '30m', cache: false }],
+      [40003, 'delayed e-mail notifications are not supported', { delay: '30m' }],
+      [
+        40015,
+        'invalid request: attachment expiry before delayed delivery date',
+        { delay: '30m', attach: 'https://example.com/a.jpg' },
+      ],
+      [40037, 'invalid request: delayed call notifications are not supported', { delay: '30m' }],
+      [40059, 'invalid request: invalid timezone', { delay: '30m' }],
+    ])(
+      'never maps %i to `invalid_delay` — it reaches the caller as ntfy worded it',
+      async (code, upstream, input) => {
+        const { error, text } = await failedPublish(ntfy400(code, upstream, DELAY_DOCS), {
+          message: 'x',
+          ...input,
+        });
+        // Unclassified: ntfy's own 400, with no contract reason or hint borrowed
+        // from another entry.
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.data.reason).toBeUndefined();
+        expect(error.data.recovery).toBeUndefined();
+        expect(error.message).toContain(upstream);
+        expect(text).toContain(upstream);
+      },
+    );
+
+    const LIMITS_DOCS = 'https://ntfy.sh/docs/publish/#limitations';
+
+    it('names the title, not the message body, when ntfy rejects the title as too large (40057)', async () => {
+      const { error, text } = await failedPublish(
+        ntfy400(40057, 'invalid request: title is too large', LIMITS_DOCS),
+        { message: 'x', title: 'T'.repeat(5000) },
+      );
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.data.reason).toBe('payload_too_large');
+      expect(error.message).toContain('title is too large');
+      const hint = error.data.recovery?.hint ?? '';
+      expect(hint).toContain('`title`');
+      expect(hint).not.toContain('`tags`');
+      expect(hint).not.toContain('Shorten the message');
+      expect(hint).not.toContain('`attach`');
+      expect(text).toContain(`Recovery: ${hint}`);
+    });
+
+    it('names the tags, not the message body, when ntfy rejects the tags as too large (40058)', async () => {
+      const { error, text } = await failedPublish(
+        ntfy400(40058, 'invalid request: tags are too large', LIMITS_DOCS),
+        { message: 'x', tags: Array.from({ length: 10 }, () => 'a'.repeat(200)) },
+      );
+      expect(error.data.reason).toBe('payload_too_large');
+      expect(error.message).toContain('tags are too large');
+      const hint = error.data.recovery?.hint ?? '';
+      expect(hint).toContain('`tags`');
+      expect(hint).not.toContain('`title`');
+      expect(hint).not.toContain('Shorten the message');
+      expect(hint).not.toContain('`attach`');
+      expect(text).toContain(`Recovery: ${hint}`);
+    });
+
+    it('keeps the message-body hint on a 413, on both surfaces', async () => {
+      const { error, text } = await failedPublish(
+        new McpError(
+          JsonRpcErrorCode.InvalidRequest,
+          'ntfy returned HTTP 413 Request Entity Too Large: JSON body too large',
+          { status: 413, body: '{"code":41303,"http":413,"error":"JSON body too large"}' },
+        ),
+        { message: 'x' },
+      );
+      const bodyHint =
+        'Shorten the message (≤4096 bytes plain) or host the long content as an external URL via `attach`.';
+      expect(error.data.reason).toBe('payload_too_large');
+      expect(error.data.recovery?.hint).toBe(bodyHint);
+      expect(text).toContain(`Recovery: ${bodyHint}`);
+    });
+
+    it('declares a `payload_too_large` entry that covers the body, the title, and the tags', () => {
+      const entry = ntfyPublishMessage.errors?.find((e) => e.reason === 'payload_too_large');
+      for (const field of ['title', 'tags']) {
+        expect(entry?.when).toContain(`\`${field}\``);
+        expect(entry?.recovery).toContain(`\`${field}\``);
+      }
+      expect(entry?.recovery).toContain('`attach`');
+    });
   });
 
   it('maps a 4xx with email/phone-verification hint to `unverified_contact`', async () => {
@@ -480,6 +644,13 @@ describe('ntfyPublishMessage handler', () => {
     expect(result.url).toBe('https://other.example.com/alerts');
   });
 
+  it('describes `base_url` credential forwarding as keyed on every registered server', () => {
+    const description = ntfyPublishMessage.input.shape.base_url.description ?? '';
+    expect(description).toContain('only when the override matches a registered server');
+    expect(description).toContain('`NTFY_SERVERS` entry');
+    expect(description).not.toContain('differs from the configured base URL');
+  });
+
   it('passes a rejected `base_url` through even when it reads like another failure', async () => {
     const svc = freshService();
     // The rejection message embeds the URL, and the upstream 4xx classifier
@@ -543,6 +714,110 @@ describe('ntfyPublishMessage handler', () => {
     });
   });
 
+  it('maps a call that ran out of its deadline to `upstream_unreachable`', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'publish').mockRejectedValue(
+      timeout('ntfy publish exceeded its 50000ms retry deadline after 4 attempts.', {
+        reason: 'retry_deadline_exceeded',
+      }),
+    );
+    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'x' });
+    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'upstream_unreachable' },
+    });
+  });
+
+  /**
+   * A `200` whose body is not ntfy's reply (#39). Only the network is stubbed, so
+   * the service's reply parse and its retry boundary run; `NTFY_MAX_RETRIES` is
+   * 3, and the request count is how many notifications went out.
+   */
+  describe('a 200 reply that is not an ntfy message (#39)', () => {
+    function stubReply(text: string, contentType?: string) {
+      initNtfyService({
+        servers: [{ baseUrl: 'https://ntfy.test' }],
+        requestTimeoutMs: 1000,
+        maxRetries: 3,
+      } as never);
+      return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+        return new Response(text, {
+          status: 200,
+          ...(contentType ? { headers: { 'content-type': contentType } } : {}),
+        });
+      });
+    }
+
+    const HINT = ntfyPublishMessage.errors?.find((e) => e.reason === 'upstream_malformed')
+      ?.recovery as string;
+
+    it.each([
+      ['an empty body', '', undefined],
+      ['an HTML page', '<!doctype html><html>Captive portal</html>', 'text/html'],
+      ['JSON `null`', 'null', 'application/json'],
+      ['JSON without the message fields', '{"ok":true}', 'application/json'],
+    ])(
+      'fails %s with `upstream_malformed` on both surfaces and publishes once',
+      async (_label, text, contentType) => {
+        const upstream = stubReply(text, contentType);
+        const result = await runToolContract(ntfyPublishMessage, { topic: 'alerts', message: 'x' });
+        expect(upstream).toHaveBeenCalledTimes(1);
+        expect(result.isError).toBe(true);
+        const { error } = result.structuredContent as {
+          error: {
+            code: number;
+            message: string;
+            data: { reason?: string; retryable?: boolean; recovery?: { hint: string } };
+          };
+        };
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data.reason).toBe('upstream_malformed');
+        expect(error.data.retryable).toBe(false);
+        expect(error.data.recovery?.hint).toBe(HINT);
+        expect(error.message).toContain('publish was answered with HTTP 200');
+        const textOut = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        expect(textOut).toContain('publish was answered with HTTP 200');
+        expect(textOut).toContain(`Recovery: ${HINT}`);
+        expect(textOut).toContain('reason upstream_malformed');
+        expect(textOut).toContain('not retryable');
+      },
+    );
+
+    it('declares the reason as not retryable, pointing at `ntfy_fetch_messages` before a resend', () => {
+      expect(
+        ntfyPublishMessage.errors?.find((e) => e.reason === 'upstream_malformed'),
+      ).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable, retryable: false });
+      expect(HINT).toContain('`ntfy_fetch_messages`');
+      expect(HINT).toContain('before resending');
+    });
+
+    it('names the fetch levers a delayed or `base_url` publish needs to be found', () => {
+      // A delayed publish is invisible to a poll without `scheduled: true`, and
+      // one sent through an override exists only on that server.
+      expect(HINT).toContain('`scheduled: true`');
+      expect(HINT).toContain('`delay`');
+      expect(HINT).toContain('same `base_url`');
+    });
+
+    it('keeps `upstream_malformed` when the call deadline landed on the malformed reply', async () => {
+      const svc = freshService();
+      vi.spyOn(svc, 'publish').mockRejectedValue(
+        new McpError(
+          JsonRpcErrorCode.ServiceUnavailable,
+          'The publish was answered with HTTP 200, but the reply is not an ntfy message: the body is empty. (failed after 1 attempt)',
+          { reason: 'upstream_malformed', retryable: false, retryAttempts: 1, deadlineMs: 50_000 },
+        ),
+      );
+      const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
+      const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'x' });
+      await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
+        data: { reason: 'upstream_malformed', retryable: false },
+      });
+    });
+  });
+
   it('rethrows unclassified errors (not auth/rate/invalid/unreachable) for the framework auto-classifier', async () => {
     const svc = freshService();
     // NotFound is not in the publish contract — it must not be silently
@@ -580,6 +855,136 @@ describe('ntfyPublishMessage handler', () => {
     expect(text).toContain('Delivers: 2026-07-28T13:00:13.000Z');
     expect(text).not.toContain('Time:');
   });
+
+  /**
+   * The publish echo reaches `content[]` as code spans and fences, never as live
+   * Markdown, while `structuredContent` keeps every value as ntfy echoed it (#28).
+   * Only the network is stubbed, so the service's response parse runs.
+   */
+  describe('upstream text renders as literal Markdown (#28)', () => {
+    /** Answers `ntfy.test` with `echo` as the publish response; any other host rejects. */
+    function stubPublish(echo: Record<string, unknown>) {
+      freshService();
+      return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+        return new Response(
+          JSON.stringify({ id: 'mid_1', time: 1_700_000_000, event: 'message', ...echo }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      });
+    }
+    const domainText = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (result.content[0] as { text: string }).text;
+
+    const PLAIN = {
+      title: 'Review <title> *literal*',
+      message: '*literal* <admin@example.com> [text](https://example.invalid) `code`',
+      click: 'https://example.invalid/a)b',
+    };
+    const ATTACHMENT = { name: 'report](x) (draft).txt', url: 'https://example.invalid/file.txt' };
+
+    it('renders every value of a plain publish as a code span or a `text` fence, exact lines', async () => {
+      stubPublish({ topic: 'alerts', ...PLAIN, attachment: ATTACHMENT });
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        ...PLAIN,
+        attach: ATTACHMENT.url,
+        filename: ATTACHMENT.name,
+      });
+      expect(domainText(result)).toBe(
+        [
+          '**Sent** — ntfy accepted message `mid_1` on `alerts`',
+          'URL: `https://ntfy.test/alerts`',
+          'Time: 2023-11-14T22:13:20.000Z',
+          'Title: `Review <title> *literal*`',
+          '',
+          '```text',
+          '*literal* <admin@example.com> [text](https://example.invalid) `code`',
+          '```',
+          '',
+          'Click action: `https://example.invalid/a)b`',
+          '',
+          'Attachment: `report](x) (draft).txt` — `https://example.invalid/file.txt`',
+        ].join('\n'),
+      );
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ ...PLAIN, attachment: ATTACHMENT });
+      expect(structured.markdown).toBeUndefined();
+      expect(JSON.parse(JSON.stringify(structured))).not.toHaveProperty('markdown');
+    });
+
+    it('renders each action button as its own JSON code span and tags as sized spans', async () => {
+      const actions = [
+        { action: 'view' as const, label: 'Open `now`', url: 'https://example.com' },
+        { action: 'copy' as const, label: 'Copy', value: 'x' },
+      ];
+      stubPublish({
+        topic: 'alerts',
+        message: 'body',
+        sequence_id: 'seq`1',
+        tags: ['warning', 'a`b'],
+        actions,
+      });
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'body',
+        tags: ['warning', 'a`b'],
+        actions,
+      });
+      expect(domainText(result)).toBe(
+        [
+          '**Sent** — ntfy accepted message `mid_1` on `alerts`',
+          'URL: `https://ntfy.test/alerts`',
+          'Time: 2023-11-14T22:13:20.000Z',
+          'Sequence ID: ``seq`1``',
+          'Tags: `warning` · ``a`b``',
+          '',
+          '```text',
+          'body',
+          '```',
+          '',
+          'Actions:',
+          '- ``{"action":"view","label":"Open `now`","url":"https://example.com"}``',
+          '- `{"action":"copy","label":"Copy","value":"x"}`',
+        ].join('\n'),
+      );
+      expect((result.structuredContent as { actions?: unknown }).actions).toEqual(actions);
+    });
+
+    it('marks a `text/markdown` echo on both surfaces and fences its source unescaped', async () => {
+      stubPublish({
+        topic: 'alerts',
+        message: '**bold** md',
+        content_type: 'text/markdown',
+      });
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: '**bold** md',
+        markdown: true,
+      });
+      expect(result.structuredContent).toMatchObject({ message: '**bold** md', markdown: true });
+      expect(domainText(result)).toContain('\n```markdown\n**bold** md\n```');
+    });
+
+    it('moves a title or tag with a line break into its own `text` fence', async () => {
+      stubPublish({
+        topic: 'alerts',
+        title: 'a\r\n# Forged heading',
+        tags: ['ok', 'two\nlines'],
+        message: 'body',
+      });
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        title: 'a\r\n# Forged heading',
+        tags: ['ok', 'two\nlines'],
+        message: 'body',
+      });
+      const text = domainText(result);
+      expect(text).toContain('Title: \n```text\na\r\n# Forged heading\n```\n');
+      expect(text).toContain('Tags: `ok` · \n```text\ntwo\nlines\n```\n');
+    });
+  });
 });
 
 describe('ntfyPublishMessage consent gate', () => {
@@ -606,7 +1011,7 @@ describe('ntfyPublishMessage consent gate', () => {
     return vi
       .spyOn(globalThis, 'fetch')
       .mockImplementation(async () =>
-        Response.json({ id: 'mid_1', time: 1700000000, topic: 'alerts' }),
+        Response.json({ id: 'mid_1', time: 1700000000, event: 'message', topic: 'alerts' }),
       );
   }
 
@@ -674,7 +1079,42 @@ describe('ntfyPublishMessage consent gate', () => {
   it('names the method of an http action button', async () => {
     fakeUpstream();
     const { message } = confirmRequest(await firstRound({ actions: [HTTP_ACTION] }));
-    expect(message).toContain('HTTP DELETE');
+    expect(message).toContain('HTTP `DELETE`');
+  });
+
+  it('renders every caller-supplied target in the prompt as a code span, never as Markdown', async () => {
+    fakeUpstream();
+    const { message } = confirmRequest(
+      await firstRound({
+        email: '[safe](https://evil)',
+        call: '*+1555*',
+        actions: [
+          { action: 'http', label: 'Go', url: 'https://e.x/`a`', method: '<b>PATCH</b>' },
+          { action: 'broadcast', label: 'Run', intent: '_io.custom_' },
+          { action: 'broadcast', label: 'Default' },
+        ],
+      }),
+    );
+
+    expect(message).toBe(
+      'Publish to ntfy topic `alerts` with an email forward to `[safe](https://evil)` and a voice call to `*+1555*` and an HTTP `<b>PATCH</b>` button targeting `` https://e.x/`a` `` and an Android broadcast intent (`_io.custom_`) and an Android broadcast intent (default intent)?',
+    );
+  });
+
+  it('moves a target with a line break into its own `text` fence in the prompt', async () => {
+    fakeUpstream();
+    const { message } = confirmRequest(await firstRound({ email: 'ops@example.com\n# forged' }));
+    expect(message).toContain('an email forward to \n```text\nops@example.com\n# forged\n```\n?');
+  });
+
+  it('names the topic in a code span when the user declines', async () => {
+    fakeUpstream();
+    await expect(
+      ntfyPublishMessage.handler(
+        inputWith(EMAIL),
+        await approvedCtx(inputWith(EMAIL), { action: 'decline' }),
+      ),
+    ).rejects.toMatchObject({ message: 'Publish to `alerts` was not confirmed.' });
   });
 
   it('lists every side effect when a publish carries more than one', async () => {
@@ -883,5 +1323,49 @@ describe('ntfyPublishMessage consent gate', () => {
     );
     await expect(declined).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
     await expect(declined).rejects.not.toMatchObject({ isInputRequiredSignal: true });
+  });
+});
+
+describe('ntfyPublishMessage pointers at ntfy_search_emoji_tags', () => {
+  /** Both strings as shipped before NTFY_ENABLE_EMOJI_TAGS existed. */
+  const DESCRIPTION =
+    'Send or update a push notification on an ntfy topic. Topics are created on first publish — treat the topic name as a secret because anyone who knows it can publish or subscribe. Set `sequence_id` to update a previously-published message; otherwise the call creates a new one. Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`. A publish carrying `email`, `call`, or a `broadcast`/`http` action button reaches beyond the notification drawer, so that call always asks the user to confirm the specific target first and comes back requesting that input rather than a result; reissue the same call with the answer attached to send it. Declining fails the call with `consent_declined`. A plain notification publishes on the first call.';
+  const TAGS =
+    'Up to 10 tags. Strings matching ntfy emoji short codes render as emojis prepended to the title; others render as a tag list. Use `ntfy_search_emoji_tags` to discover short codes.';
+
+  /** Re-evaluate the definition module, since the flag is read when it loads. */
+  async function loadWith(value: string | undefined) {
+    if (value !== undefined) vi.stubEnv('NTFY_ENABLE_EMOJI_TAGS', value);
+    vi.resetModules();
+    const mod = await import('@/mcp-server/tools/definitions/ntfy-publish-message.tool.js');
+    return mod.ntfyPublishMessage;
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([undefined, '', 'true'])(
+    'keeps the description and `tags` text unchanged when the flag is %j',
+    async (value) => {
+      const def = await loadWith(value);
+      expect(def.description).toBe(DESCRIPTION);
+      expect(def.input.shape.tags.description).toBe(TAGS);
+    },
+  );
+
+  it('drops both pointer sentences, and nothing else, when the flag is false', async () => {
+    const def = await loadWith('false');
+    expect(def.description).toBe(
+      DESCRIPTION.replace(
+        ' Use `ntfy_search_emoji_tags` to look up emoji short codes for `tags`.',
+        '',
+      ),
+    );
+    expect(def.input.shape.tags.description).toBe(
+      TAGS.replace(' Use `ntfy_search_emoji_tags` to discover short codes.', ''),
+    );
+    expect(JSON.stringify(z.toJSONSchema(def.input))).not.toContain('ntfy_search_emoji_tags');
+    expect(JSON.stringify(z.toJSONSchema(def.output))).not.toContain('ntfy_search_emoji_tags');
   });
 });
