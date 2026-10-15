@@ -14,7 +14,7 @@
 # output. A stage that compiles a native addon needs the target-arch toolchain
 # and cannot cross-compile this way — drop the flag there.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS build
 
 WORKDIR /usr/src/app
 
@@ -46,7 +46,7 @@ RUN bun run build
 # A clean image rather than `FROM build`: the build stage's node_modules holds
 # devDependencies.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS deps
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS deps
 
 WORKDIR /usr/src/app
 
@@ -111,10 +111,10 @@ RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 #
 # This stage creates a minimal, optimized, and secure image for running the
 # application. It uses a slim base image and only includes production
-# dependencies and build artifacts. Its only Bun invocation is CMD, which runs
-# on the real target at container start.
+# dependencies and build artifacts. Its only Bun invocations are HEALTHCHECK
+# and CMD, which run on the real target at container start.
 # ==============================================================================
-FROM oven/bun:1.4.2-slim AS production
+FROM oven/bun:1.4.3-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -166,6 +166,9 @@ ENV LOGS_DIR="/var/log/ntfy-mcp-server"
 
 # Expose the port the server listens on
 EXPOSE ${MCP_HTTP_PORT}
+
+# Health check using a bun-native fetch (slim image ships no curl/wget)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD bun -e "fetch('http://localhost:'+(process.env.MCP_HTTP_PORT??'3010')+'/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # The command to start the server
 CMD ["bun", "run", "dist/index.js"]
