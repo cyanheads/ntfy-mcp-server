@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.3.7](changelog/2.3.x/2.3.7.md) — 2026-10-14
+
+ntfy_fetch_messages pages through a whole window with a cursor and reports ntfy's replay cap; damaged ntfy replies fail with upstream_malformed instead of a short list, and every call settles within 50 s; blank filters no longer widen a query; ntfy values render as literal text; NTFY_ENABLE_EMOJI_TAGS added.
+
 ## [2.3.6](changelog/2.3.x/2.3.6.md) — 2026-10-07 · 🛡️ Security
 
 Consent prompts on ntfy_manage_message and gated ntfy_publish_message act only on an answer to a prompt the server recorded, single-use and bound to the exact request; mcp-ts-core 0.13.6 → 0.13.13 adds request ids to tool errors and fixes the registry HTTP entry.

@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-10-07 11:21:45
+Generated on: 2026-10-15 01:03:50
 
 ```text
 ntfy-mcp-server/
@@ -149,6 +149,7 @@ ntfy-mcp-server/
 │   └── tree.ts
 ├── src/
 │   ├── config/
+│   │   ├── load-env-file.ts
 │   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── resources/
@@ -161,7 +162,8 @@ ntfy-mcp-server/
 │   │       │   ├── ntfy-publish-message.tool.ts
 │   │       │   └── ntfy-search-emoji-tags.tool.ts
 │   │       └── utils/
-│   │           └── confirm-action.ts
+│   │           ├── confirm-action.ts
+│   │           └── markdown-literal.ts
 │   ├── services/
 │   │   ├── emoji-tags/
 │   │   │   ├── data.generated.ts
@@ -184,11 +186,14 @@ ntfy-mcp-server/
 │   │   │   ├── error-classifier.test.ts
 │   │   │   └── ntfy-service.test.ts
 │   │   └── emoji-tag-service.test.ts
-│   └── tools/
-│       ├── ntfy-fetch-messages.tool.test.ts
-│       ├── ntfy-manage-message.tool.test.ts
-│       ├── ntfy-publish-message.tool.test.ts
-│       └── ntfy-search-emoji-tags.tool.test.ts
+│   ├── tools/
+│   │   ├── utils/
+│   │   │   └── markdown-literal.test.ts
+│   │   ├── ntfy-fetch-messages.tool.test.ts
+│   │   ├── ntfy-manage-message.tool.test.ts
+│   │   ├── ntfy-publish-message.tool.test.ts
+│   │   └── ntfy-search-emoji-tags.tool.test.ts
+│   └── index.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
