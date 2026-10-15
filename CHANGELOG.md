@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [2.3.7](changelog/2.3.x/2.3.7.md) — 2026-10-14
 
-ntfy_fetch_messages pages through a whole window with a cursor and reports ntfy's replay cap; damaged ntfy replies fail with upstream_malformed instead of a short list, and every call settles within 50 s; blank filters no longer widen a query; ntfy values render as literal text; NTFY_ENABLE_EMOJI_TAGS added.
+ntfy_fetch_messages pages through a whole window with a cursor and reports ntfy's replay cap; damaged ntfy replies fail with upstream_malformed instead of a short list, and ntfy round trips settle within 50 s; blank filters no longer widen a query; ntfy values render as literal text; NTFY_ENABLE_EMOJI_TAGS added.
 
 ## [2.3.6](changelog/2.3.x/2.3.6.md) — 2026-10-07 · 🛡️ Security
 
