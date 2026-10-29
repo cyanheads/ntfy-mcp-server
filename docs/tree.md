@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 17:06:11
+Generated on: 2026-10-29 17:32:59
 
 ```text
 ntfy-mcp-server/
@@ -29,6 +29,7 @@ ntfy-mcp-server/
 │   ├── 2.1.x/
 │   ├── 2.2.x/
 │   ├── 2.3.x/
+│   ├── 2.4.x/
 │   └── template.md
 ├── docs/
 │   ├── ntfy/

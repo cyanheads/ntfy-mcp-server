@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.4.0](changelog/2.4.x/2.4.0.md) — 2026-10-29
+
+Publishes the ntfy-guide skill as skill://ntfy-guide/SKILL.md. A 5xx with a Retry-After the call cannot wait out fails fast as upstream_unreachable, and a failed read of a 2xx reply is upstream_malformed and never resends a publish, clear, or delete. Error labels follow ntfy's own codes; fetch caps each topic at 64 characters.
+
 ## [2.3.7](changelog/2.3.x/2.3.7.md) — 2026-10-14
 
 ntfy_fetch_messages pages through a whole window with a cursor and reports ntfy's replay cap; damaged ntfy replies fail with upstream_malformed instead of a short list, and ntfy round trips settle within 50 s; blank filters no longer widen a query; ntfy values render as literal text; NTFY_ENABLE_EMOJI_TAGS added.
