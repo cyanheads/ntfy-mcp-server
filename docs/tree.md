@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-10-15 01:03:50
+Generated on: 2026-10-29 17:06:11
 
 ```text
 ntfy-mcp-server/
@@ -48,6 +48,8 @@ ntfy-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -147,6 +149,9 @@ ntfy-mcp-server/
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
+├── skills/
+│   └── ntfy-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   ├── load-env-file.ts
@@ -178,8 +183,12 @@ ntfy-mcp-server/
 ├── tests/
 │   ├── config/
 │   │   └── server-config.test.ts
+│   ├── helpers/
+│   │   └── commonmark.ts
 │   ├── resources/
 │   │   └── ntfy-topic.resource.test.ts
+│   ├── scripts/
+│   │   └── clean-mcpb.test.ts
 │   ├── services/
 │   │   ├── ntfy/
 │   │   │   ├── base-url-guard.test.ts
@@ -209,7 +218,9 @@ ntfy-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

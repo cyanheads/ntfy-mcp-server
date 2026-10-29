@@ -1,21 +1,21 @@
 <div align="center">
   <h1>ntfy-mcp-server</h1>
   <p><b>Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.</b>
-  <div>4 Tools • 1 Resource</div>
+  <div>4 Tools • 1 Resource • 1 Skill</div>
   </p>
 </div>
 
 <div align="center">
 
-[![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![Version](https://img.shields.io/badge/Version-2.3.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/)
-
-[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-2.3.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/ntfy-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/ntfy-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/ntfy-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
 <div align="center">
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/ntfy-mcp-server/releases/latest/download/ntfy-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=ntfy-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIm50ZnktbWNwLXNlcnZlciJdfQ==) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22ntfy-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22ntfy-mcp-server%22%5D%7D)
+
+[![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-67E8F9?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 </div>
 
@@ -42,14 +42,23 @@ Push notifications to your phone or desktop through ntfy. Publish, update, and m
 
 `ntfy_fetch_messages` covers the same topic data with custom windows and filters when the resource's fixed defaults aren't enough.
 
+### Skills
+
+| Skill | Description |
+|:---|:---|
+| [`ntfy-guide`](./skills/ntfy-guide/SKILL.md) | Using the `ntfy_*` tools: choosing the topic, carrying one sequence id through a notification's updates, clear, and delete, scheduling and cancelling reminders, and reading fetched history without miscounting |
+
+Plugin, npm, Docker, and MCPB installs ship it from `skills/`; MCP clients that support the Skills extension read it as `skill://ntfy-guide/SKILL.md`.
+
 ## Capability reference
 
 ### `ntfy_publish_message` <sub>tool</sub>
 
 - Topics are created on first publish — treat the topic name as a secret; anyone who knows it can publish or subscribe
 - Takes `title`, `priority` (1–5), `tags`, `click`, `attach`, `icon`, `filename`, `markdown`, `delay`, `email`, `call`, `cache`, `firebase`, and up to three action buttons (`view`, `broadcast`, `http`, `copy`); body capped at 4096 bytes, empty body defaults to `triggered`; pass the original `sequence_id` to update a sent message
-- Publishes with `email`, `call`, or a `broadcast`/`http` button ask the user to confirm the target before sending
+- Publishes with `email`, `call`, or a `broadcast`/`http` button ask the user to confirm the target before sending; declining fails with `consent_declined`
 - A per-call `base_url` gets credentials only if it matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request is unauthenticated
+- Failures carry typed reasons: `payload_too_large` (body, attachment, `title`, or combined `tags` over ntfy's limits), `invalid_delay`, `invalid_attachment` (malformed `attach` URL), and `unverified_contact` (`email`/`call` without a verified address or number, or without auth), alongside the shared reasons under Features
 
 ---
 
@@ -63,10 +72,9 @@ Push notifications to your phone or desktop through ntfy. Publish, update, and m
 
 ### `ntfy_fetch_messages` <sub>tool</sub>
 
-- Returns a snapshot, not a live stream; accepts comma-separated topics (e.g. `alerts,backups`) and filters `since` (duration / timestamp / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, scheduled-only
-- Default window `10m`, default limit 20, at most 100 per call; a larger window returns the newest `limit` messages with `totalCount` and a `nextCursor` to pass back as `cursor`
-- Bodies truncate at ~500 chars (`messageTruncated` gives the dropped count); refetch with `id` for the full text
-- Flags `upstreamTruncated` when ntfy capped the replay, and fails with `upstream_malformed` if the server doesn't return an ntfy message stream
+- Returns a snapshot, not a live stream; accepts comma-separated topics (e.g. `alerts,backups`, each 1–64 characters) and filters `since` (duration / timestamp / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, plus `scheduled` to include delayed messages
+- Default window `10m`, default limit 20, at most 100 per call; a larger window returns the newest `limit` messages with `totalCount` and a `nextCursor` to pass back as `cursor`. Bodies truncate at ~500 chars (`messageTruncated` gives the dropped count); refetch with `id` for the full text. `upstreamTruncated` flags a replay ntfy capped
+- Failures carry typed reasons: `invalid_since` (malformed `since` value), `cursor_not_found` (the cursor's message expired, or came from a call with different topics, `since`, or filters), and `upstream_malformed` (the response wasn't an ntfy message stream), alongside the shared reasons under Features
 
 ---
 
@@ -99,106 +107,31 @@ ntfy-specific:
 Agent-friendly output:
 
 - Publish and manage echo the resolved topic, ID, and timestamp; fetch also echoes the resolved `since` and applied filters
-- Typed `reason` codes (`consent_declined`, `forbidden_topic`, `rate_limited`, `not_found`, `payload_too_large`, and more) let callers branch on failure mode
+- Typed `reason` codes let callers branch on failure mode. Shared across the tools and the resource: `forbidden_topic` (ntfy refused the topic with 401/403: missing or insufficient credentials), `rate_limited` (429 after retries), `upstream_unreachable` (network failure, a 5xx that outlasted retries or whose `Retry-After` the call can't wait out, or no complete answer within the 50 s call deadline; carries `retryAfter` when ntfy sent one), `upstream_malformed` (a reply that isn't ntfy's message format or couldn't be read in full; publish and manage don't retry it, since the event may already be out). `consent_declined`, `not_found`, and the rest are listed per entry
 - Fetch and emoji search report `truncated`, `totalCount`, and a `notice` naming the next step (pass `nextCursor` as `cursor`, advance `offset`)
 
 ## Getting started
 
-Add the following to your MCP client configuration file. Public ntfy.sh works out of the box without an account; for protected topics, generate an access token at <https://ntfy.sh/account>.
+Add it to Claude Code:
 
-```json
-{
-  "mcpServers": {
-    "ntfy-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["ntfy-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "NTFY_DEFAULT_TOPIC": "your-topic-name"
-      }
-    }
-  }
-}
+```sh
+claude mcp add ntfy-mcp-server -- npx -y ntfy-mcp-server
 ```
 
-Or with npx (no Bun required):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "ntfy-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "ntfy-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "NTFY_DEFAULT_TOPIC": "your-topic-name"
-      }
+      "args": ["-y", "ntfy-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "ntfy-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "-e", "NTFY_DEFAULT_TOPIC=your-topic-name",
-        "ghcr.io/cyanheads/ntfy-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 NTFY_DEFAULT_TOPIC=your-topic bun run start:http
-# Server listens at http://127.0.0.1:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- A topic name on an ntfy server. Public `ntfy.sh` requires no account; self-hosted instances and protected topics may need a bearer token or basic-auth credentials.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/ntfy-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd ntfy-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env and set NTFY_DEFAULT_TOPIC (and auth, if needed)
-```
+Public ntfy.sh works without an account. Set `NTFY_DEFAULT_TOPIC` so calls can omit `topic`; for protected topics, add `NTFY_AUTH_TOKEN` (generate one at <https://ntfy.sh/account>). With `claude mcp add`, pass each as `-e NAME=value` after the server name; in JSON, put them under `env`. For Docker, a source build, or Streamable HTTP, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -233,6 +166,16 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+) and a topic on an ntfy server. Public `ntfy.sh` needs no account; self-hosted instances and protected topics may need a bearer token or basic-auth credentials.
+
+- **Clone and install:**
+
+  ```sh
+  git clone https://github.com/cyanheads/ntfy-mcp-server.git
+  cd ntfy-mcp-server && bun install
+  cp .env.example .env   # set NTFY_DEFAULT_TOPIC (and auth, if needed)
+  ```
+
 - **Build and run:**
 
   ```sh
@@ -243,6 +186,13 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
   bun run start:stdio
   # or
   bun run start:http
+  ```
+
+  For Streamable HTTP:
+
+  ```sh
+  MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 NTFY_DEFAULT_TOPIC=your-topic bun run start:http
+  # Server listens at http://127.0.0.1:3010/mcp
   ```
 
 - **Run checks and tests:**
@@ -256,11 +206,10 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ### Docker
 
 ```sh
-docker build -t ntfy-mcp-server .
-docker run --rm -e NTFY_DEFAULT_TOPIC=your-topic -p 3010:3010 ntfy-mcp-server
+docker run --rm -e NTFY_DEFAULT_TOPIC=your-topic -p 3010:3010 ghcr.io/cyanheads/ntfy-mcp-server:latest
 ```
 
-The Dockerfile defaults to HTTP transport, stateful session mode, and logs to `/var/log/ntfy-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The image defaults to HTTP transport, stateful session mode, and logs to `/var/log/ntfy-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "-e", "NTFY_DEFAULT_TOPIC=your-topic", "ghcr.io/cyanheads/ntfy-mcp-server:latest"]`. To build locally, `docker build -t ntfy-mcp-server .`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 
@@ -272,6 +221,7 @@ The Dockerfile defaults to HTTP transport, stateful session mode, and logs to `/
 | `src/mcp-server/resources` | Resource definitions (`*.resource.ts`). |
 | `src/services/ntfy` | ntfy HTTP client, types, and error classifier. |
 | `src/services/emoji-tags` | Bundled emoji short-code reference and lookup service. |
+| `skills/` | Agent Skills the server publishes (`ntfy-guide`), served over MCP via `createApp({ skills: 'skills' })`. |
 | `docs/ntfy` | Mirrored upstream ntfy API docs (pinned commit in `SOURCES.md`). |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 

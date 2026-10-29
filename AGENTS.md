@@ -2,10 +2,10 @@
 
 **Server:** ntfy-mcp-server
 **Version:** 2.3.7
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1 (via the framework)
-**Zod:** ^4.6.6
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0 (via the framework)
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 >
@@ -38,7 +38,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
 - **Auth scope is the registered base URL.** Credentials bind to the base they were configured with (`NTFY_BASE_URL`, or each `NTFY_SERVERS` entry); when a tool's `base_url` argument matches no registered base, `NtfyService` sends no auth header — never widen this to "always forward credentials" without explicit operator opt-in.
 - **`base_url` overrides are validated before they are dereferenced.** Absolute `http(s)` form is enforced unconditionally (`assertAbsoluteHttpUrl`, plus the advertised `BASE_URL_PATTERN` on all three tool schemas); the private-address guard and redirect refusal are opt-in behind `NTFY_BLOCK_PRIVATE_HOSTS` so LAN and stdio deployments keep working. Registered servers bypass the guard — that is the operator's lever for a deliberate private target, so keep the bypass set sourced from every `cfg.servers[]` entry, not from the credentialed subset.
-- **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. The gate is a multi-round-trip flow that redeems a server record: asking stores `{ operation, clientId, subject, target, contentHash }` in `ctx.state` under a random id (600 s TTL) and returns `input_required` carrying an `elicitation/create` request that names the exact target, with only that id as `requestState`. Every call first reads and deletes the record its `requestState` names, and the operation runs only when that record equals what this call would confirm — same tool and manage action, same `ctx.auth` caller, same base URL + topic (+ `sequence_id`), same hash of the outbound request — and the answer is an accepted `confirm: true`. Any other round asks again under a fresh record: no `requestState`; an unknown, spent, expired, or malformed id; a record minted for another operation, tool, caller, target, or content. An answer on `ctx.inputs` alone never proceeds — a client can send one unprompted, or replay one. Against a matching record, a declined, cancelled, or unparseable response fails with `consent_declined` — and so does a refusal of any other shape, since `accepted()` collapses them all. There is no proceed-anyway branch, and `ctx.clientCapabilities` never skips the prompt: `ctx.requestInput` exists on every transport and both protocol eras, so the gate is fail-closed on Streamable HTTP as much as on stdio. A 2025-era client that declared no `elicitation.form` capability (a bare `elicitation: {}` counts as declaring it) is refused inside `ctx.requestInput`: the call fails with `InvalidRequest` (`-32600`), `data.reason: 'client_capability_missing'`, and a recovery hint naming the capability, before anything is sent upstream.
+- **Side effects that leave the notification drawer ask the user first.** A clear/delete, or a publish carrying `email` / `call` / a `broadcast` or `http` action, routes through `confirmAction` before the upstream call. The gate is a multi-round-trip flow that redeems a server record: asking stores `{ operation, clientId, subject, target, contentHash }` in `ctx.state` under a random id (600 s TTL) and returns `input_required` carrying an `elicitation/create` request that names the exact target, with only that id as `requestState`. Every call first reads and deletes the record its `requestState` names, and the operation runs only when that record equals what this call would confirm — same tool and manage action, same `ctx.auth` caller, same base URL + topic (+ `sequence_id`), same hash of the outbound request — and the answer is an accepted `confirm: true`. Any other round asks again under a fresh record: no `requestState`; an unknown, spent, expired, or malformed id; a record minted for another operation, tool, caller, target, or content. An answer on `ctx.inputs` alone never proceeds — a client can send one unprompted, or replay one. Against a matching record, a declined, cancelled, or unparseable response fails with `consent_declined` — and so does a refusal of any other shape, since `accepted()` collapses them all. There is no proceed-anyway branch, and `ctx.clientCapabilities` never skips the prompt: `ctx.requestInput` exists on every transport and both protocol eras, so the gate is fail-closed on Streamable HTTP as much as on stdio. A 2025-era client that declared no `elicitation.form` capability (a bare `elicitation: {}` counts as declaring it) is refused inside `ctx.requestInput`: the call fails with `InvalidRequest` (`-32600`), `data.reason: 'client_capability_missing'`, and a recovery hint naming the capability, before anything is sent upstream. A 2026-era request whose `clientCapabilities` lack elicitation is refused by the SDK the same way, as JSON-RPC error `-32021` carrying `data.requiredCapabilities` and no `reason`.
 - **Consent records live where every instance a retry reaches can read them.** The default `STORAGE_PROVIDER_TYPE=in-memory` suits one process; a multi-instance HTTP deployment needs `filesystem`, `supabase`, or `cloudflare-d1` — never `cloudflare-kv`, whose eventual consistency lets a replay outrun the delete. Redeeming stops sequential replays only: `ctx.state` has no atomic take (cyanheads/mcp-ts-core#593), so concurrent retries carrying one id can each proceed, and ntfy offers no idempotency key to pin the action to the record — a duplicate clear/delete re-emits its event, a duplicate publish delivers again. HTTP deployments should also set `MCP_REQUEST_STATE_KEY` (≥ 32 bytes, the same on every instance), which rejects a forged or tampered `requestState` before the handler runs.
 - **The consent gate requires `MCP_SESSION_MODE=stateful` over HTTP.** Only the stateful arm keeps a live session per `Mcp-Session-Id`, and the SDK's legacy shim needs one to complete an `input_required` round for a 2025-era client. `src/index.ts` declares it with `createApp({ sessionMode: { default: 'stateful', require: 'stateful' } })`, so an HTTP start resolving to `stateless` fails with a `ConfigurationError` before any service is constructed (stdio is never refused). `auto` resolves to `stateful`, and every launch path still states the value outright — `.env.example`, the `Dockerfile` `ENV`, the `server.json` default — so the posture is declared, never inherited. Never set it to `stateless`, and never drop `require`.
 - **Everything above `confirmAction` in a gated handler runs twice.** The handler is re-entered from the top on the approval round, so keep that stretch free of side effects — config reads, validation, and prompt construction only.
@@ -106,7 +106,6 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
-import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 
 export const ntfyPublishMessage = tool('ntfy_publish_message', {
@@ -117,7 +116,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
 
   errors: [
     { reason: 'forbidden_topic', code: JsonRpcErrorCode.Forbidden,
-      when: 'Auth required for the target topic.',
+      when: 'ntfy refused access to the topic with its own 401 or 403 error.',
       recovery: 'Try a public topic instead; if this topic must stay protected, ask the operator to provision ntfy auth credentials.' },
     { reason: 'rate_limited', code: JsonRpcErrorCode.RateLimited,
       when: 'Upstream returned 429 after retries were exhausted.',
@@ -136,8 +135,10 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       const response = await getNtfyService().publish({ topic, ...input }, { signal: ctx.signal });
       return { id: response.id, /* … */ };
     } catch (err) {
-      if (isAuthCode(getCode(err))) {
-        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${literal(topic)}`);
+      // Keyed on ntfy's own error envelope, never the status: a proxy's HTML 403 stays unlabeled.
+      // Values in a thrown message are quoted plain text — the framework escapes Markdown there.
+      if (isAuthRejection(err)) {
+        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic "${topic}"`);
       }
       throw err; // Let framework auto-classify the rest
     }
@@ -152,7 +153,6 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 
 export const ntfyTopicResource = resource('ntfy://{topic}', {
@@ -165,7 +165,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
 
   errors: [
     { reason: 'forbidden_topic', code: JsonRpcErrorCode.Forbidden,
-      when: 'Auth required for the target topic.',
+      when: 'ntfy refused access to the topic with its own 401 or 403 error.',
       recovery: 'Try an unprotected topic; if this topic must stay protected, ask the operator to configure ntfy auth.' },
     { reason: 'rate_limited', code: JsonRpcErrorCode.RateLimited,
       when: 'ntfy answered 429 and was still answering it when retries ran out.',
@@ -183,8 +183,8 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
     } catch (err) {
       const code = getCode(err);
       if (isRateLimitedCode(code)) throw ctx.fail('rate_limited', getMessage(err));
-      if (isAuthCode(code)) {
-        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic ${literal(params.topic)}`,
+      if (isAuthRejection(err)) {
+        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic "${params.topic}"`,
           undefined, { cause: err });
       }
       throw err;
@@ -338,9 +338,18 @@ src/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Two skill trees live at the project root, written for different readers:
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
+| Tree | For | Written by |
+|:-----|:----|:-----------|
+| `framework-skills/` | The agent developing this server — framework skills (`metadata.audience: external`) plus any development-time skills of the server's own | `init` and the `maintenance` sync (framework skills); you (your own) |
+| `skills/` | The agents that install the server and call its tools — tool chains, identifier sources, gates | You, deliberately, with the `add-skill` skill. Absent by default; usually none is needed |
+
+Development skills are modular instructions. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Their directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand them to every agent that installs it.
+
+A published skill in root `skills/` reaches plugin installs and the `.mcpb` bundle as-is, ships in the npm package and the Docker image, and reaches MCP clients when the server opts in with `createApp({ skills: 'skills' })`. `lint:packaging` validates the tree.
+
+**Agent skill directory:** Copy `framework-skills/` into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
 Available skills:
 
@@ -352,6 +361,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author a skill the server publishes in root `skills/` for the agents that use it — when one earns its place, structure, validation, delivery |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
@@ -403,7 +413,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run format` | Auto-fix formatting (Biome, safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run lint:mcp` | Validate MCP definitions against the spec (rule catalog: `api-linter` skill) |
-| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
+| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity, `.mcpbignore` coverage, plugin manifests, the published `skills/` tree (run by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
 | `bun run start:stdio` | Production mode (stdio) |
@@ -418,7 +428,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/` at a package's root, and `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp`, which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases. The agent-doc match is anchored to a package's root because a nested `skills/` can be runtime code: the MCP SDK imports its `dist/ext/skills/` modules at startup (cyanheads/mcp-ts-core#794). The selector lives in both `scripts/clean-mcpb.ts` and `scripts/lint-packaging.ts`, and `tests/scripts/clean-mcpb.test.ts` holds the pair together — re-apply it if a framework script resync reverts it. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected.
 
 **Adding an env var:** `server.json` always (registry discovery, `environmentVariables[]`). `manifest.json` only when the var is required with no default, or when bundle users should be prompted for it — then it needs both `mcp_config.env` and a `user_config` field. `lint:packaging` (run by `devcheck`) enforces exactly that pairing and checks the names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`. Optional vars carrying a default stay out of `manifest.json`, which is why `user_config` is empty today.
 
@@ -490,4 +500,7 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
 - [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
 - [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `author`, `repository`, `license`, `keywords` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name. Every user-supplied variable is declared under `userConfig` (`type`, `title`, `description`; `sensitive: true` for keys and tokens; `required: true` or `default: ""`) and referenced from `env` as `"KEY": "${user_config.<option>}"` — mirror the `user_config` block in `manifest.json`. Never write `"KEY": ""` into `env`
+- [ ] `plugin.json` + `mcp.json` (Agent Plugins 1.0.0 — read by Codex, Cursor, GitHub Copilot, VS Code, Kiro) populated — `plugin.json` `name` = the unscoped repo name; `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords` from `package.json`; no other top-level field. `mcp.json` holds one `"type": "stdio"` entry keyed by the unscoped name, `npx -y ntfy-mcp-server`, and the same fixed `env` as `.codex-plugin/mcp.json`. Neither file carries a user-supplied variable: those reach Codex through `.codex-plugin/mcp.json` `env_vars`, which works only while `.codex-plugin/plugin.json` keeps `"mcpServers": "./.codex-plugin/mcp.json"`
+- [ ] Any new root dev path has a root-anchored line in `.mcpbignore`; `bun run bundle` and `lint:packaging` pass
+- [ ] If the server publishes a skill in root `skills/`: `lint:packaging` passes, and `field-test` verified every gate and identifier claim in it against live tool behavior
 - [ ] `bun run devcheck` passes
