@@ -1,0 +1,25 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ntfy-mcp-server",
+  "version": "2.3.7",
+  "description": "Send, manage, and replay ntfy push notifications via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/ntfy-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/ntfy-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "ntfy",
+    "notifications",
+    "ai-agent",
+    "typescript",
+    "stdio",
+    "streamable-http"
+  ]
+}
