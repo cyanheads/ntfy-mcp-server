@@ -1,10 +1,11 @@
 /**
  * @fileoverview Tests for the pure-data error classifiers — code/message/status
- * extraction, upstream JSON error-body parsing, the auth/rate/invalid/not-found
- * predicates, the malformed-poll-body marker, the "retry-exhausted" heuristic
- * (call-deadline expiry included), the keyword-based 4xx sub-reason split
- * (`invalid_delay` vs `invalid_attachment` vs `payload_too_large` vs
- * `unverified_contact`), and which publish field an oversize rejection names.
+ * extraction, upstream JSON error-body parsing, the auth rejection read from
+ * ntfy's own error envelope, the rate/invalid/not-found predicates, the
+ * malformed-poll-body marker, the "retry-exhausted" heuristic (call-deadline
+ * expiry included), the phrase-based 4xx sub-reason split (`invalid_delay` vs
+ * `invalid_attachment` vs `payload_too_large` vs `unverified_contact`), the
+ * anonymous-sender refusal, and which publish field an oversize rejection names.
  * @module tests/services/ntfy/error-classifier
  */
 
@@ -17,7 +18,8 @@ import {
   getDataBody,
   getDataStatus,
   getMessage,
-  isAuthCode,
+  isAnonymousSenderRejection,
+  isAuthRejection,
   isInvalidParamsCode,
   isNotFoundCode,
   isRateLimitedCode,
@@ -26,6 +28,29 @@ import {
   oversizedPublishField,
   upstreamErrorDetail,
 } from '@/services/ntfy/error-classifier.js';
+
+const RPC_CODE_BY_STATUS: Record<number, JsonRpcErrorCode> = {
+  400: JsonRpcErrorCode.InvalidParams,
+  401: JsonRpcErrorCode.Unauthorized,
+  403: JsonRpcErrorCode.Forbidden,
+  413: JsonRpcErrorCode.InvalidRequest,
+};
+
+/**
+ * An ntfy rejection as `ntfyHttpError` raises it: the status line with ntfy's
+ * `error (see link)` folded in, and the `{ code, http, error, link }` envelope
+ * (texts from ntfy's `server/errors.go`) captured as `data.body`.
+ */
+function ntfyRejection(status: number, code: number, error: string, link?: string) {
+  return new McpError(
+    RPC_CODE_BY_STATUS[status] ?? JsonRpcErrorCode.InternalError,
+    `ntfy returned HTTP ${status}: ${error}${link ? ` (see ${link})` : ''}`,
+    {
+      status,
+      body: JSON.stringify({ code, http: status, error, ...(link ? { link } : {}) }),
+    },
+  );
+}
 
 describe('error-classifier shape extractors', () => {
   it('getCode returns the code field on McpError', () => {
@@ -113,14 +138,70 @@ describe('upstreamErrorDetail', () => {
   });
 });
 
-describe('error-classifier predicates', () => {
-  it('isAuthCode matches Forbidden and Unauthorized', () => {
-    expect(isAuthCode(JsonRpcErrorCode.Forbidden)).toBe(true);
-    expect(isAuthCode(JsonRpcErrorCode.Unauthorized)).toBe(true);
-    expect(isAuthCode(JsonRpcErrorCode.NotFound)).toBe(false);
-    expect(isAuthCode(undefined)).toBe(false);
+describe('isAuthRejection', () => {
+  const AUTH_DOCS = 'https://ntfy.sh/docs/publish/#authentication';
+
+  it.each([
+    [401, 40101, 'unauthorized'],
+    [403, 40301, 'forbidden'],
+  ])("matches ntfy's own %i envelope (%i)", (status, code, error) => {
+    expect(isAuthRejection(ntfyRejection(status, code, error, AUTH_DOCS))).toBe(true);
   });
 
+  it("rejects a 403 with no ntfy envelope — a proxy's HTML page", () => {
+    const err = new McpError(JsonRpcErrorCode.Forbidden, 'ntfy returned HTTP 403 Forbidden.', {
+      status: 403,
+      body: '<html>\n<head><title>403 Forbidden</title></head>\n<body>\n<center><h1>403 Forbidden</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>\n',
+    });
+    expect(isAuthRejection(err)).toBe(false);
+  });
+
+  it('rejects a 401 or 403 that carries no body, a plain-text body, or a cut-off envelope', () => {
+    expect(isAuthRejection(new McpError(JsonRpcErrorCode.Forbidden, 'Topic forbidden'))).toBe(
+      false,
+    );
+    expect(
+      isAuthRejection(
+        new McpError(JsonRpcErrorCode.Unauthorized, 'x', { status: 401, body: 'unauthorized' }),
+      ),
+    ).toBe(false);
+    expect(
+      isAuthRejection(
+        new McpError(JsonRpcErrorCode.Forbidden, 'x', { status: 403, body: '{"code":40301,"ht' }),
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects an envelope whose code is not an ntfy 401xx/403xx', () => {
+    expect(isAuthRejection(ntfyRejection(400, 40001, 'e-mail notifications are not enabled'))).toBe(
+      false,
+    );
+    expect(isAuthRejection(ntfyRejection(429, 42901, 'limit reached: too many requests'))).toBe(
+      false,
+    );
+    expect(isAuthRejection(ntfyRejection(404, 40401, 'page not found'))).toBe(false);
+    // A string code, or a JSON value that is not an envelope object, is no ntfy code.
+    for (const body of ['{"code":"40301","http":403}', '40301', 'null', '[40301]']) {
+      expect(
+        isAuthRejection(new McpError(JsonRpcErrorCode.Forbidden, 'x', { status: 403, body })),
+      ).toBe(false);
+    }
+  });
+
+  it('rejects an auth code carried on a status ntfy never pairs it with', () => {
+    for (const status of [400, 404, 429, 503]) {
+      expect(isAuthRejection(ntfyRejection(status, 40301, 'forbidden'))).toBe(false);
+    }
+    expect(isAuthRejection(ntfyRejection(403, 40101, 'unauthorized'))).toBe(false);
+  });
+
+  it('is null-safe', () => {
+    expect(isAuthRejection(undefined)).toBe(false);
+    expect(isAuthRejection(new Error('forbidden'))).toBe(false);
+  });
+});
+
+describe('error-classifier predicates', () => {
   it('isRateLimitedCode matches RateLimited', () => {
     expect(isRateLimitedCode(JsonRpcErrorCode.RateLimited)).toBe(true);
     expect(isRateLimitedCode(JsonRpcErrorCode.InvalidParams)).toBe(false);
@@ -262,10 +343,54 @@ describe('isUpstreamUnreachable', () => {
   it('rejects errors that lack the retry-exhausted suffix', () => {
     expect(isUpstreamUnreachable(new Error('connection refused'))).toBe(false);
     expect(isUpstreamUnreachable(new Error(''))).toBe(false);
-    // A transient code alone is not enough — a 503 that failed fast on an
-    // over-cap `Retry-After` never went through the retry loop.
+    // A transient code alone is not enough: with no suffix and no `Retry-After`,
+    // nothing says the retry boundary gave up on it.
     expect(
       isUpstreamUnreachable(new McpError(JsonRpcErrorCode.ServiceUnavailable, 'ntfy is down')),
+    ).toBe(false);
+  });
+
+  it.each([
+    ['a 503', JsonRpcErrorCode.ServiceUnavailable, '120'],
+    [
+      'a 503 with an HTTP-date',
+      JsonRpcErrorCode.ServiceUnavailable,
+      'Thu, 29 Oct 2026 16:06:04 GMT',
+    ],
+    ['a 504', JsonRpcErrorCode.Timeout, '45'],
+    ['a numeric wait', JsonRpcErrorCode.ServiceUnavailable, 120],
+  ])(
+    'matches %s that failed fast on a Retry-After the call could not wait out',
+    (_label, code, retryAfter) => {
+      const err = new McpError(code, 'ntfy returned HTTP 503 Service Unavailable', {
+        status: 503,
+        retryAfter,
+      });
+      expect(isUpstreamUnreachable(err)).toBe(true);
+    },
+  );
+
+  it('rejects a Retry-After on an answer that is not a transient 5xx', () => {
+    for (const code of [
+      JsonRpcErrorCode.RateLimited,
+      JsonRpcErrorCode.RequestCancelled,
+      JsonRpcErrorCode.Forbidden,
+      JsonRpcErrorCode.InvalidRequest,
+    ]) {
+      expect(isUpstreamUnreachable(new McpError(code, 'nope', { retryAfter: '120' }))).toBe(false);
+    }
+    // A 501 is marked not retryable: withRetry never meant to retry it, Retry-After or not.
+    expect(
+      isUpstreamUnreachable(
+        new McpError(JsonRpcErrorCode.ServiceUnavailable, 'ntfy returned HTTP 501', {
+          retryAfter: '120',
+          retryable: false,
+        }),
+      ),
+    ).toBe(false);
+    // Neither is a Retry-After on a plain Error, which carries no code at all.
+    expect(
+      isUpstreamUnreachable(Object.assign(new Error('x'), { data: { retryAfter: '1' } })),
     ).toBe(false);
   });
 });
@@ -308,26 +433,53 @@ describe('classifyInvalidParams', () => {
     expect(classifyInvalidParams(err)).not.toBe('payload_too_large');
   });
 
-  it('returns `unverified_contact` for email-verification phrasing', () => {
-    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'email address is not verified');
-    expect(classifyInvalidParams(err)).toBe('unverified_contact');
+  const PHONE_DOCS = 'https://ntfy.sh/docs/publish/#phone-calls';
+  const EMAIL_DOCS = 'https://ntfy.sh/docs/publish/#e-mail-notifications';
+
+  it.each([
+    [
+      40034,
+      'invalid request: phone number not verified, or no matching verified numbers found',
+      PHONE_DOCS,
+    ],
+    [40035, 'invalid request: anonymous phone calls are not allowed', PHONE_DOCS],
+    [40052, 'invalid request: email address not verified', EMAIL_DOCS],
+    [40053, 'invalid request: anonymous email sending is not allowed', EMAIL_DOCS],
+  ])("returns `unverified_contact` for ntfy's %i", (code, error, link) => {
+    expect(classifyInvalidParams(ntfyRejection(400, code, error, link))).toBe('unverified_contact');
   });
 
-  it('returns `unverified_contact` for phone-verification phrasing', () => {
-    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'phone number is not verified');
+  it.each([
+    [40032, 'invalid request: calling is disabled', 'https://ntfy.sh/docs/config/#phone-calls'],
+    [40033, 'invalid request: phone number invalid', PHONE_DOCS],
+    [
+      40001,
+      'e-mail notifications are not enabled',
+      'https://ntfy.sh/docs/config/#e-mail-notifications',
+    ],
+    [40050, 'invalid request: invalid e-mail address', EMAIL_DOCS],
+  ])(
+    "returns no sub-reason for ntfy's %i, whose own text names the fix — not its docs link or a bare `phone`",
+    (code, error, link) => {
+      expect(classifyInvalidParams(ntfyRejection(400, code, error, link))).toBeUndefined();
+    },
+  );
+
+  it('reads a contact refusal from the captured body alone', () => {
+    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ntfy returned HTTP 400 Bad Request', {
+      body: '{"code":40052,"http":400,"error":"invalid request: email address not verified"}',
+    });
     expect(classifyInvalidParams(err)).toBe('unverified_contact');
   });
 
   it('matches case-insensitively', () => {
     const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ATTACHMENT TOO LARGE');
     expect(classifyInvalidParams(err)).toBe('payload_too_large');
-  });
-
-  it('checks both the message and the captured body', () => {
-    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'request rejected', {
-      body: 'unverified email address on this account',
-    });
-    expect(classifyInvalidParams(err)).toBe('unverified_contact');
+    expect(
+      classifyInvalidParams(
+        new McpError(JsonRpcErrorCode.InvalidParams, 'Invalid request: Email address not verified'),
+      ),
+    ).toBe('unverified_contact');
   });
 
   it('returns undefined when neither pattern matches', () => {
@@ -335,12 +487,12 @@ describe('classifyInvalidParams', () => {
     expect(classifyInvalidParams(err)).toBeUndefined();
   });
 
-  it('payload_too_large takes precedence when both keywords are present', () => {
-    // Order in the implementation: delay, attachment URL, then "too large", then
-    // email/phone/verified. Lock that in so a refactor doesn't silently flip it.
+  it('payload_too_large takes precedence when both phrases are present', () => {
+    // Order in the implementation: delay, attachment URL, "too large", then the
+    // contact refusals. Lock that in so a refactor doesn't silently flip it.
     const err = new McpError(
       JsonRpcErrorCode.InvalidParams,
-      'attachment too large; email recipient also unverified',
+      'title is too large; email address not verified',
     );
     expect(classifyInvalidParams(err)).toBe('payload_too_large');
   });
@@ -395,6 +547,23 @@ describe('classifyInvalidParams', () => {
   });
 });
 
+describe('isAnonymousSenderRejection', () => {
+  it.each([
+    [40035, 'invalid request: anonymous phone calls are not allowed'],
+    [40053, 'invalid request: anonymous email sending is not allowed'],
+  ])("matches ntfy's %i refusal of a sender with no credentials", (code, error) => {
+    expect(isAnonymousSenderRejection(ntfyRejection(400, code, error))).toBe(true);
+  });
+
+  it.each([
+    [40034, 'invalid request: phone number not verified, or no matching verified numbers found'],
+    [40052, 'invalid request: email address not verified'],
+    [40033, 'invalid request: phone number invalid'],
+  ])('does not match %i', (code, error) => {
+    expect(isAnonymousSenderRejection(ntfyRejection(400, code, error))).toBe(false);
+  });
+});
+
 describe('oversizedPublishField', () => {
   const ntfy400 = (code: number, error: string) =>
     new McpError(JsonRpcErrorCode.InvalidParams, `ntfy returned HTTP 400 Bad Request: ${error}`, {
@@ -419,6 +588,26 @@ describe('oversizedPublishField', () => {
       body: '{"code":40058,"http":400,"error":"invalid request: tags are too large"}',
     });
     expect(oversizedPublishField(err)).toBe('tags');
+  });
+
+  it("names the attachment for ntfy's 41301, which the body or the 400 phrasing never trips", () => {
+    expect(
+      oversizedPublishField(
+        ntfyRejection(
+          413,
+          41301,
+          'attachment too large, or bandwidth limit reached',
+          'https://ntfy.sh/docs/publish/#limitations',
+        ),
+      ),
+    ).toBe('attachment');
+    // 41302 (Matrix) and 41303 (JSON body) are body overflows, not attachments.
+    expect(
+      oversizedPublishField(
+        ntfyRejection(413, 41302, 'Matrix request is larger than the max allowed length'),
+      ),
+    ).toBeUndefined();
+    expect(oversizedPublishField(ntfyRejection(413, 41303, 'JSON body too large'))).toBeUndefined();
   });
 
   it('names no field for a body overflow, a templated overflow, or another rejection', () => {

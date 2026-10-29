@@ -9,14 +9,16 @@
  * rest oldest-first; under a duration `since` the cursor also carries the
  * walk's window start, so its pages poll from a bound that does not move. A
  * repeated message ID is kept once. A call pinned to one message by `id`
- * returns that body untruncated. The resolved topic/since, returned and window counts, the
- * continuation cursor, truncation flags, active filters, and empty/truncated
+ * returns that body untruncated. The resolved topic/since, returned and window
+ * counts, the continuation cursor, truncation flags, active filters, and empty/truncated
  * guidance ride the `enrichment` block so they reach both `structuredContent`
  * and `content[]` without a `format()` entry. A poll body that is not ntfy's
  * JSON message stream fails as `upstream_malformed`. Every ntfy- or
  * caller-supplied string reaches `content[]` as a code span or fence, so it
- * renders as literal text; a body ntfy marks `text/markdown` is flagged
- * `markdown: true` and fenced as `markdown`.
+ * renders as literal text — except in a failure message, which quotes it in
+ * double quotes as plain text, since the framework escapes Markdown there; a
+ * body ntfy marks `text/markdown` is flagged `markdown: true` and fenced as
+ * `markdown`.
  * @module mcp-server/tools/definitions/ntfy-fetch-messages.tool
  */
 
@@ -33,19 +35,31 @@ import {
 import {
   getCode,
   getMessage,
-  isAuthCode,
+  isAuthRejection,
   isBaseUrlRejection,
   isInvalidParamsCode,
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
   retryAfterData,
+  unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { MESSAGE_TRUNCATE_AT, shapeMessage } from '@/services/ntfy/message-shape.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyFetchResult, Priority } from '@/services/ntfy/types.js';
 
-const TOPIC_LIST_REGEX = /^[a-zA-Z0-9_-]+(?:,[a-zA-Z0-9_-]+)*$/;
+/**
+ * Comma-separated topics, each 1–64 characters — ntfy's own per-topic limit,
+ * which this server's other topic inputs enforce with `.max(64)`. The cap
+ * lives in the pattern because it applies per topic and `tools/list`
+ * advertises the pattern; the topic count stays uncapped, since ntfy servers
+ * before v2.33.0 answer lists longer than the 150 topics later ones allow.
+ */
+const TOPIC_LIST_REGEX = /^[a-zA-Z0-9_-]{1,64}(?:,[a-zA-Z0-9_-]{1,64})*$/;
+const TOPIC_LIST_ERROR =
+  'Each comma-separated topic must be 1 to 64 characters of letters, digits, underscore, or hyphen.';
+/** ntfy's error text for 40008, which the service folds into the error message. */
+const INVALID_SINCE_TEXT = 'invalid since parameter';
 const DEFAULT_SINCE = '10m';
 const DEFAULT_LIMIT = 20;
 /** Messages one call returns; a larger `limit` is served up to this and says so. */
@@ -174,10 +188,10 @@ const InputSchema = z.object({
   topic: z
     .string()
     .min(1)
-    .regex(TOPIC_LIST_REGEX)
+    .regex(TOPIC_LIST_REGEX, TOPIC_LIST_ERROR)
     .optional()
     .describe(
-      'Single topic or comma-separated list (e.g., `alerts` or `alerts,backups,phil_alerts`). Required unless `NTFY_DEFAULT_TOPIC` is set.',
+      'Single topic or comma-separated list (e.g., `alerts` or `alerts,backups,phil_alerts`), each topic 1–64 characters of `[a-zA-Z0-9_-]`. Required unless `NTFY_DEFAULT_TOPIC` is set.',
     ),
   since: z
     .string()
@@ -233,7 +247,7 @@ const MessageSchema = z
     id: z
       .string()
       .describe(
-        'Message ID — pass back as `id` to fetch this message with its whole body, or as `sequence_id` to manage it. To page through a window, pass the `nextCursor` enrichment value as `cursor`.',
+        "Message ID — pass back as `id` to fetch this message with its whole body. To update, clear, or delete the notification it belongs to, pass this row's `sequence_id` when it has one (update, clear, and delete rows do), otherwise this `id`. To page through a window, pass the `nextCursor` enrichment value as `cursor`.",
       ),
     time: z.string().describe('ISO 8601 timestamp when ntfy accepted the message.'),
     event: z
@@ -269,7 +283,9 @@ const MessageSchema = z
       .describe(
         'True when the message was published as Markdown, so `message` is Markdown source; absent for plain text.',
       ),
-    priority: PrioritySchema.optional().describe('Notification priority; absent when default (3).'),
+    priority: PrioritySchema.optional().describe(
+      'Notification priority as published; absent when the publish set none, which ntfy delivers at the default (3). An explicit 3 is returned as 3.',
+    ),
     tags: z
       .array(z.string())
       .optional()
@@ -405,14 +421,14 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     {
       reason: 'forbidden_topic',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'Auth required for the target topic.',
+      when: 'ntfy refused access to the topic with its own 401 or 403 error: the topic needs credentials this server did not send, or the ones it sent lack access.',
       recovery:
         'Try an unprotected topic instead; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`) before retrying.',
     },
     {
       reason: 'invalid_since',
       code: JsonRpcErrorCode.ValidationError,
-      when: '`since` value could not be parsed by ntfy (a malformed duration or timestamp, or a duration unit other than `s`, `m`, `h`).',
+      when: "ntfy rejected `since` as `invalid since parameter` (a malformed duration or timestamp, or a duration unit other than `s`, `m`, `h`). Any other 400 keeps ntfy's own text and carries no reason.",
       recovery:
         'Use one of: `all`, `latest`, a duration like `10m` / `2h` / `24h` (units `s`, `m`, `h`), a Unix timestamp (seconds), or a message ID.',
     },
@@ -434,10 +450,10 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     {
       reason: 'upstream_unreachable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted, or no complete answer within the call deadline.',
+      when: 'A DNS, connection, or network failure or a 5xx answer that outlasted the retries, no complete answer within the call deadline, or a 5xx whose `Retry-After` is longer than the call can wait.',
       retryable: true,
       recovery:
-        'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
+        'When the error carries `retryAfter`, the ntfy server is answering and asked for that wait: poll again once it has passed. Otherwise verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
     },
     {
       reason: 'upstream_malformed',
@@ -516,8 +532,8 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       if (isUpstreamMalformed(err)) throw err;
       const code = getCode(err);
       const msg = getMessage(err);
-      if (isAuthCode(code)) {
-        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${literal(topic)}`);
+      if (isAuthRejection(err)) {
+        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic "${topic}"`);
       }
       if (isRateLimitedCode(code)) {
         throw ctx.fail(
@@ -526,11 +542,18 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
           retryAfterData(err),
         );
       }
-      if (isInvalidParamsCode(code)) {
-        throw ctx.fail('invalid_since', msg || `Could not parse \`since\` ${literal(since)}.`);
+      // ntfy's 40008 is the one poll 400 about `since`; any other (a disallowed
+      // topic, too many topics) keeps ntfy's own text and no `since` advice.
+      if (isInvalidParamsCode(code) && msg.includes(INVALID_SINCE_TEXT)) {
+        throw ctx.fail('invalid_since', msg, undefined, { cause: err });
       }
       if (isUpstreamUnreachable(err)) {
-        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.');
+        throw ctx.fail(
+          'upstream_unreachable',
+          msg || 'ntfy server is unreachable.',
+          unreachableWaitData(err, 'poll again'),
+          { cause: err },
+        );
       }
       throw err;
     }
@@ -571,7 +594,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       if (start === -1) {
         throw ctx.fail(
           'cursor_not_found',
-          `Cursor ${literal(rawCursor as string)} names none of the ${totalCount} messages in the window for topic ${literal(topic)} (since ${literal(since)}${pinned === undefined ? '' : ', where the walk began'}).`,
+          `Cursor "${rawCursor}" names none of the ${totalCount} messages in the window for topic "${topic}" (since "${since}"${pinned === undefined ? '' : ', where the walk began'}).`,
         );
       }
     }
@@ -624,7 +647,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       notices.push(
         `No messages on topic ${literal(topic)} (since ${literal(since)})${
           hasFilters ? ` with filters ${filterSummary(filters)}` : ''
-        }. Try a wider \`since\` window${hasFilters ? ', drop filters,' : ''} or verify the topic name.`,
+        }. Try a wider \`since\` window${hasFilters ? ', drop filters,' : ''} or verify the topic name. A message published in the last few seconds may not be returned yet, so retry shortly before concluding it is missing.`,
       );
     } else if (nextCursor !== undefined) {
       const continuation = `call again with \`cursor\` set to ${literal(nextCursor)} and the same \`topic\`, \`since\`, and filters`;

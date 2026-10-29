@@ -107,13 +107,13 @@ export function assertAbsoluteHttpUrl(raw: string): URL {
   try {
     url = new URL(raw);
   } catch {
-    throw validationError(`base_url is not an absolute URL: ${raw}`, {
+    throw validationError(`base_url is not an absolute URL: "${raw}"`, {
       ...REJECTION_MARKER,
       recovery: { hint: BASE_URL_HINT },
     });
   }
   if (!ALLOWED_PROTOCOLS.has(url.protocol)) {
-    throw validationError(`base_url uses an unsupported scheme (${url.protocol}): ${raw}`, {
+    throw validationError(`base_url uses an unsupported scheme (${url.protocol}): "${raw}"`, {
       ...REJECTION_MARKER,
       recovery: { hint: BASE_URL_HINT },
     });
@@ -143,7 +143,7 @@ export async function assertPublicHost(url: URL): Promise<void> {
     addresses = await lookup(hostname, { all: true });
   } catch (err) {
     throw serviceUnavailable(
-      `Could not resolve base_url host ${hostname}.`,
+      `Could not resolve base_url host "${hostname}".`,
       { ...REJECTION_MARKER, hostname },
       { cause: err },
     );
@@ -152,7 +152,7 @@ export async function assertPublicHost(url: URL): Promise<void> {
   const blocked = addresses.find(({ address }) => isReservedAddress(address));
   if (blocked) {
     throw validationError(
-      `base_url host ${hostname} resolves to a non-public address (${blocked.address}); private, loopback, and link-local destinations are blocked.`,
+      `base_url host "${hostname}" resolves to a non-public address (${blocked.address}); private, loopback, and link-local destinations are blocked.`,
       {
         ...REJECTION_MARKER,
         recovery: {

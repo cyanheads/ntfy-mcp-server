@@ -50,17 +50,19 @@ export const CALL_DEADLINE_MS = 50_000;
  * the `withRetry` attempt signal (the call deadline and the caller's signal) —
  * so a body that stalls after the headers is cut off by the same clocks as
  * headers that never arrive. Aborting the request signal errors a body still
- * being read, in Bun and Node alike.
+ * being read with the abort reason itself, in Bun and Node alike.
  *
  * Bypasses the framework's `fetchWithTimeout` because that helper throws
  * `ServiceUnavailable` on every non-ok response, which would erase the
  * upstream's actual status code from `httpErrorFromResponse` — and we need
  * that for the error contract mapping (`forbidden_topic` ← 403, `not_found`
- * ← 404, `invalid_since` ← 400, etc.).
+ * ← 404, `invalid_since` ← a 400 whose text is ntfy's `invalid since
+ * parameter`, etc.).
  *
- * The per-attempt timer aborts with a plain `Timeout` error, which the retry
+ * The per-attempt timer aborts with an {@link AttemptTimeout}, which the retry
  * boundary treats as transient. Which abort fired is sorted out above: a
- * deadline expiry by `withRetry`, a caller abort by `NtfyService.run`.
+ * deadline expiry by `withRetry`, a caller abort by `NtfyService.run`, and a
+ * failed read of a publish or clear/delete reply by `parseReply`.
  */
 async function timedFetch<T>(
   url: string,
@@ -70,7 +72,7 @@ async function timedFetch<T>(
   read: (response: Response) => Promise<T>,
 ): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('Timeout')), timeoutMs);
+  const timer = setTimeout(() => controller.abort(new AttemptTimeout(timeoutMs)), timeoutMs);
   try {
     let response: Response;
     try {
@@ -90,13 +92,28 @@ async function timedFetch<T>(
 }
 
 /**
+ * The per-attempt timer's abort reason, which `fetch` and a body still being
+ * read both reject with. Its message stays the bare `Timeout` a retried-out
+ * round trip has always reported; the class lets a failed reply read name the
+ * clock that cut it off.
+ */
+class AttemptTimeout extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super('Timeout');
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
  * A refused redirect is a deliberate block, not a transient network fault:
  * name it, and give it a non-retryable code so the retry boundary doesn't burn
  * its attempts re-refusing the same hop.
  */
 function refusedRedirect(url: string, cause: unknown): McpError {
   return validationError(
-    `base_url redirected away from ${new URL(url).host}; redirects are not followed for unregistered base URLs while NTFY_BLOCK_PRIVATE_HOSTS is on.`,
+    `base_url redirected away from "${new URL(url).host}"; redirects are not followed for unregistered base URLs while NTFY_BLOCK_PRIVATE_HOSTS is on.`,
     {
       ...REJECTION_MARKER,
       recovery: {
@@ -231,8 +248,8 @@ export class NtfyService {
   /**
    * `POST /` with a JSON body. Returns the upstream message envelope echoing
    * the published values plus the server-assigned `id`/`time`/`expires`. A
-   * `200` whose body is not that envelope fails without a resend — see
-   * `parseReply`.
+   * `200` whose body is not that envelope, or cannot be read in full, fails
+   * without a resend — see `parseReply`.
    */
   async publish(
     body: NtfyPublishRequest,
@@ -265,7 +282,7 @@ export class NtfyService {
             if (!response.ok) {
               throw await ntfyHttpError(response, { operation: 'publish', topic: body.topic });
             }
-            return parseReply<NtfyPublishResponse>(response, await response.text(), 'publish');
+            return await parseReply<NtfyPublishResponse>(response, 'publish');
           },
         ),
       'ntfy publish',
@@ -276,7 +293,8 @@ export class NtfyService {
   /**
    * `PUT /<topic>/<id>/clear` or `DELETE /<topic>/<id>`. Returns the event
    * envelope subscribers see; a `200` whose body is not that envelope, with the
-   * `sequence_id` it references, fails without a resend — see `parseReply`.
+   * `sequence_id` it references, or cannot be read in full, fails without a
+   * resend — see `parseReply`.
    */
   async manage(
     topic: string,
@@ -305,9 +323,7 @@ export class NtfyService {
             if (!response.ok) {
               throw await ntfyHttpError(response, { operation, topic, sequenceId });
             }
-            return parseReply<NtfyManageResponse>(response, await response.text(), operation, [
-              'sequence_id',
-            ]);
+            return await parseReply<NtfyManageResponse>(response, operation, ['sequence_id']);
           },
         ),
       `ntfy ${operation}`,
@@ -433,7 +449,8 @@ function untilCancelled<T>(work: Promise<T>, signal: AbortSignal | undefined): P
  * with no `(failed after N attempts)` suffix — so a 503 that was retried and
  * still answering would escape the handlers' exhaustion check. Mark it
  * exhausted the way running out of attempts does. A first attempt that failed
- * fast on a long `Retry-After` stays as it was: nothing was retried.
+ * fast on a long `Retry-After` stays as it was — nothing was retried, so
+ * nothing claims it was; `isUpstreamUnreachable` reads its `retryAfter`.
  */
 function retryAfterCutShort(err: unknown, attempts: number): unknown {
   if (!(err instanceof McpError) || attempts < 2) return err;
@@ -449,11 +466,14 @@ function retryAfterCutShort(err: unknown, attempts: number): unknown {
 /**
  * When the deadline ends the ladder because the next backoff would outlast
  * it, the last attempt already got ntfy's answer — a 429, a 5xx, a damaged
- * poll body or reply. Report that answer, marked exhausted the way running out
- * of attempts marks it, so it classifies as what ntfy said (`rate_limited`,
- * `upstream_malformed`) rather than as an unreachable server. A deadline that
- * fired mid-attempt has no answer to report and stays the framework's
- * `Timeout` (`data.reason: 'retry_deadline_exceeded'`).
+ * poll body or reply. The same holds when the deadline fires while a publish
+ * or clear/delete `200` is still being read: `parseReply` has already turned
+ * that read into the `upstream_malformed` answer. Report the answer, marked
+ * exhausted the way running out of attempts marks it, so it classifies as what
+ * ntfy said (`rate_limited`, `upstream_malformed`) rather than as an
+ * unreachable server. A deadline that fired before any answer has none to
+ * report and stays the framework's `Timeout`
+ * (`data.reason: 'retry_deadline_exceeded'`).
  */
 function lastAnswerOnDeadline(err: unknown): unknown {
   if (!(err instanceof McpError) || err.data?.reason !== 'retry_deadline_exceeded') return err;
@@ -503,26 +523,38 @@ function isMessageEnvelope(value: unknown): value is NtfyMessage {
 }
 
 /**
- * Parse the `200` reply to a publish or a clear/delete: one message envelope,
- * plus each of `fields` as a string. Anything else — an empty body, an HTML
- * page, JSON without the envelope fields — fails as `ServiceUnavailable` with
- * the reason a damaged poll body takes, `upstream_malformed`, but marked
- * `retryable: false`: ntfy answered `200`, so the notification or event may
+ * Read and parse the `200` reply to a publish or a clear/delete: one message
+ * envelope, plus each of `fields` as a string. Anything else — an empty body,
+ * an HTML page, JSON without the envelope fields, or a body that fails partway
+ * through being read (a reset connection, the per-attempt timeout, the call
+ * deadline) — fails as `ServiceUnavailable` with the reason a damaged poll
+ * body takes, `upstream_malformed`, but marked `retryable: false`: ntfy writes
+ * the `200` only after it has dispatched the message or event, so it may
  * already be out, and a resend would deliver it twice. `withRetry` fails that
- * flag on the first attempt instead of re-sending the request.
+ * flag on the first attempt instead of re-sending the request; a deadline that
+ * cut the read off is reported as this answer by `lastAnswerOnDeadline`, and a
+ * caller abort still surfaces as `RequestCancelled` through `NtfyService.run`.
  */
-function parseReply<T>(
+async function parseReply<T>(
   response: Response,
-  text: string,
   operation: string,
   fields: readonly string[] = [],
-): T {
+): Promise<T> {
+  const failed = (problem: string, cause?: unknown) =>
+    serviceUnavailable(
+      `The ${operation} was answered with HTTP ${response.status}, but ${problem}.`,
+      { reason: 'upstream_malformed', retryable: false },
+      cause === undefined ? undefined : { cause },
+    );
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (err) {
+    throw failed(`reading the reply failed: ${readFailureCause(err)}`, err);
+  }
   const contentType = response.headers.get('content-type');
   const malformed = (problem: string) =>
-    serviceUnavailable(
-      `The ${operation} was answered with HTTP 200, but the reply${contentType ? ` (content-type ${contentType})` : ''} ${problem}.`,
-      { reason: 'upstream_malformed', retryable: false },
-    );
+    failed(`the reply${contentType ? ` (content-type ${contentType})` : ''} ${problem}`);
   if (!text.trim()) throw malformed('is empty');
   let parsed: unknown;
   try {
@@ -537,6 +569,24 @@ function parseReply<T>(
     }
   }
   return parsed as T;
+}
+
+/**
+ * What cut a reply read short, for the error message: the per-attempt timer by
+ * its setting, the call deadline by `withRetry`'s own wording, and a transport
+ * failure by the runtime's error plus the cause it nests — Node's undici says
+ * only `terminated` and keeps the reason (`other side closed`) on `cause`. Bun's
+ * advice to pass `verbose: true` to `fetch()` is dropped: the caller reading this
+ * cannot act on it.
+ */
+function readFailureCause(err: unknown): string {
+  if (err instanceof AttemptTimeout) {
+    return `it did not finish within the ${err.timeoutMs} ms request timeout (NTFY_REQUEST_TIMEOUT_MS)`;
+  }
+  if (!(err instanceof Error)) return String(err);
+  const nested = err.cause instanceof Error ? ` (${err.cause.message})` : '';
+  const message = err.message.replace(/\s*For more information, pass `verbose: true`.*$/s, '');
+  return `${message.replace(/\.$/, '')}${nested}`;
 }
 
 function malformedPollBody(line: number, problem: string, contentType: string | null): McpError {

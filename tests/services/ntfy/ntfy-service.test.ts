@@ -4,7 +4,8 @@
  * body), NDJSON parsing edge cases and the poll-body validation that fails a
  * damaged body as `upstream_malformed` (or surfaces a mid-stream ntfy error
  * line), the publish and clear/delete reply validation that fails a `200` that
- * is not an ntfy message as `upstream_malformed` without resending it, the
+ * is not an ntfy message — or fails partway through being read — as
+ * `upstream_malformed` without resending it, the
  * `X-Messages-Truncated` replay-cap flag, upstream error propagation including the
  * JSON error body folded into the message and the request URL kept off
  * `error.data`, the module-level init/get/reset
@@ -1203,7 +1204,7 @@ describe('NtfyService body reads stay inside the request deadline', () => {
     vi.restoreAllMocks();
   });
 
-  it.each(ROUND_TRIPS)('%s: times out a body that stalls after the headers', async (_op, call) => {
+  it.each(ROUND_TRIPS)('%s: times out a body that stalls after the headers', async (op, call) => {
     const svc = new NtfyService({
       ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
       requestTimeoutMs: 50,
@@ -1212,10 +1213,16 @@ describe('NtfyService body reads stay inside the request deadline', () => {
     const { elapsed, outcome } = await runOnFakeClock(call(svc));
     // Cut off by the 50 ms per-attempt timer, not left for the 50 s call deadline.
     expect(elapsed).toBe(50);
-    const { error } = outcome as { error: Error };
+    const { error } = outcome as { error: Error & { data?: Record<string, unknown> } };
     expect(getErrorCode(error)).not.toBe(JsonRpcErrorCode.RequestCancelled);
-    expect(error.message).toMatch(/\(failed after 1 attempt\)/);
-    expect(isUpstreamUnreachable(error)).toBe(true);
+    if (op === 'fetch') {
+      expect(error.message).toMatch(/\(failed after 1 attempt\)/);
+      expect(isUpstreamUnreachable(error)).toBe(true);
+    } else {
+      // ntfy answered 200 — see 'a 200 reply that fails mid-read' below.
+      expect(error.data).toMatchObject({ reason: 'upstream_malformed', retryable: false });
+      expect(isUpstreamUnreachable(error)).toBe(false);
+    }
   });
 
   it.each(ROUND_TRIPS)(
@@ -1236,6 +1243,7 @@ describe('NtfyService body reads stay inside the request deadline', () => {
       expect(elapsed).toBe(20);
       const { error } = outcome as { error: Error };
       expect(getErrorCode(error)).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(error.message).toBe('The ntfy request was cancelled by the caller.');
       expect(calls).toHaveLength(1);
     },
   );
@@ -1257,6 +1265,180 @@ describe('NtfyService body reads stay inside the request deadline', () => {
     const { error } = outcome as { error: Error };
     expect(getErrorCode(error)).toBe(JsonRpcErrorCode.RequestCancelled);
     expect(calls).toHaveLength(0);
+  });
+});
+
+/** Bun's `fetch` body error on a reset connection: the transport code on the error itself. */
+const BUN_RESET = () =>
+  Object.assign(
+    new TypeError(
+      'ECONNRESET: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+    ),
+    { code: 'ECONNRESET' },
+  );
+/** Node's (undici) body error on a reset connection: a bare `terminated`, the reason on `cause`. */
+const NODE_RESET = () =>
+  new TypeError('terminated', {
+    cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+  });
+
+/**
+ * A responder that models a reply cut off mid-body: `200` headers and the
+ * first bytes of the message envelope, then the body stream errors with
+ * `transportError` — what `fetch` does when the connection resets partway
+ * through reading it.
+ */
+function resetBodyResponder(transportError: () => Error) {
+  return (): Response =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"id":"m1","ti'));
+          queueMicrotask(() => controller.error(transportError()));
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+}
+
+/**
+ * ntfy writes the `200` to a publish, clear, or delete only after it has
+ * dispatched the message or event (#43), so a reply that fails partway through
+ * being read is never resent: it fails as `upstream_malformed`, not retryable.
+ * A poll is idempotent and keeps retrying the same failure.
+ */
+describe('NtfyService a 200 reply that fails mid-read', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const ANSWERED = [
+    ['publish', (svc: NtfyService) => svc.publish(PUBLISH_BODY)],
+    ['clear', (svc: NtfyService) => svc.manage('alerts', 'seq_1', 'clear')],
+    ['delete', (svc: NtfyService) => svc.manage('alerts', 'seq_1', 'delete')],
+  ] as const;
+
+  function retryingService(requestTimeoutMs: number) {
+    return new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      requestTimeoutMs,
+      maxRetries: 3,
+    });
+  }
+
+  type Failure = Error & { cause?: unknown; data?: Record<string, unknown> };
+
+  describe.each(ANSWERED)('%s', (operation, call) => {
+    it.each([
+      ['Bun', BUN_RESET, 'ECONNRESET: The socket connection was closed unexpectedly'],
+      ['Node', NODE_RESET, 'terminated (other side closed)'],
+    ] as const)(
+      'fails a reply reset mid-body (%s) as `upstream_malformed`, sent once',
+      async (_runtime, transportError, cause) => {
+        const { calls } = captureFetch(resetBodyResponder(transportError));
+        const { outcome } = await runOnFakeClock(call(retryingService(1000)));
+        expect(calls).toHaveLength(1);
+        const { error } = outcome as { error: Failure };
+        expect(getErrorCode(error)).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data).toMatchObject({ reason: 'upstream_malformed', retryable: false });
+        expect(error.message).toContain(
+          `The ${operation} was answered with HTTP 200, but reading the reply failed: ${cause}`,
+        );
+        expect(error.message).not.toMatch(/failed after/);
+        // Bun's `pass verbose: true to fetch()` advice is nothing the caller can act on.
+        expect(error.message).not.toContain('verbose');
+        expect(error.message).toMatch(/\.$/);
+        expect(error.cause).toBeInstanceOf(TypeError);
+        expect(isUpstreamUnreachable(error)).toBe(false);
+      },
+    );
+
+    it('names the 2xx status a reply that is not an ntfy message actually came with', async () => {
+      const { calls } = captureFetch(() => new Response(null, { status: 204 }));
+      const { outcome } = await runOnFakeClock(call(retryingService(1000)));
+      expect(calls).toHaveLength(1);
+      const { error } = outcome as { error: Failure };
+      expect(error.data).toMatchObject({ reason: 'upstream_malformed', retryable: false });
+      expect(error.message).toBe(
+        `The ${operation} was answered with HTTP 204, but the reply is empty.`,
+      );
+    });
+
+    it('fails a reply that stalls past the per-attempt timeout as `upstream_malformed`, sent once', async () => {
+      const { calls } = captureFetch(stalledBodyResponder);
+      const { elapsed, outcome } = await runOnFakeClock(call(retryingService(50)));
+      expect(elapsed).toBe(50);
+      expect(calls).toHaveLength(1);
+      const { error } = outcome as { error: Failure };
+      expect(error.data).toMatchObject({ reason: 'upstream_malformed', retryable: false });
+      expect(error.message).toBe(
+        `The ${operation} was answered with HTTP 200, but reading the reply failed: it did not finish within the 50 ms request timeout (NTFY_REQUEST_TIMEOUT_MS).`,
+      );
+    });
+
+    it('reports a reply the call deadline cuts off as `upstream_malformed`, sent once', async () => {
+      // A per-attempt timeout past the 50 s call deadline, so the deadline is the clock that fires.
+      const { calls } = captureFetch(stalledBodyResponder);
+      const { elapsed, outcome } = await runOnFakeClock(call(retryingService(60_000)));
+      expect(elapsed).toBe(CALL_DEADLINE_MS);
+      expect(calls).toHaveLength(1);
+      const { error } = outcome as { error: Failure };
+      expect(getErrorCode(error)).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data).toMatchObject({
+        reason: 'upstream_malformed',
+        retryable: false,
+        retryAttempts: 1,
+        deadlineMs: CALL_DEADLINE_MS,
+      });
+      expect(error.message).toBe(
+        `The ${operation} was answered with HTTP 200, but reading the reply failed: ntfy ${operation} exceeded its 50000ms retry deadline. (failed after 1 attempt)`,
+      );
+    });
+  });
+
+  it('reports a reply the deadline cuts off after earlier attempts got no answer', async () => {
+    // Three 15 s attempts that never see headers, then a 200 whose body stalls into the deadline.
+    let attempt = 0;
+    const { calls } = captureFetch((captured) => {
+      attempt += 1;
+      return attempt < 4 ? abortAwareResponder(captured) : stalledBodyResponder(captured);
+    });
+    const { elapsed, outcome } = await runOnFakeClock(
+      retryingService(15_000).publish(PUBLISH_BODY),
+    );
+    expect(elapsed).toBe(CALL_DEADLINE_MS);
+    expect(calls).toHaveLength(4);
+    const { error } = outcome as { error: Failure };
+    expect(error.data).toMatchObject({ reason: 'upstream_malformed', retryable: false });
+    expect(error.message).toMatch(/^The publish was answered with HTTP 200, but reading the reply/);
+    expect(error.message).toMatch(/\(failed after 4 attempts\)$/);
+  });
+
+  it('keeps a headers-less timeout on a publish retried, as unreachable', async () => {
+    // Non-goal of #43: before any status line, ntfy may never have taken the request.
+    const { calls } = captureFetch(abortAwareResponder);
+    const { outcome } = await runOnFakeClock(retryingService(50).publish(PUBLISH_BODY));
+    expect(calls).toHaveLength(4);
+    const { error } = outcome as { error: Failure };
+    expect(error.message).toMatch(/^Timeout \(failed after 4 attempts\)$/);
+    expect(isUpstreamUnreachable(error)).toBe(true);
+  });
+
+  it.each([
+    ['reset mid-body', resetBodyResponder(NODE_RESET)],
+    ['stalled past the per-attempt timeout', stalledBodyResponder],
+  ] as const)('keeps retrying a poll whose body is %s', async (_label, responder) => {
+    const { calls } = captureFetch(responder);
+    const { outcome } = await runOnFakeClock(retryingService(50).fetch({ topic: 'alerts' }));
+    expect(calls).toHaveLength(4);
+    const { error } = outcome as { error: Failure };
+    expect(error.message).toMatch(/\(failed after 4 attempts\)$/);
+    expect(error.data?.reason).toBeUndefined();
+    expect(isUpstreamUnreachable(error)).toBe(true);
   });
 });
 
@@ -1431,18 +1613,52 @@ describe('NtfyService call deadline', () => {
     expect(isUpstreamUnreachable(error)).toBe(true);
   });
 
-  it('leaves a Retry-After that fails the first attempt fast untouched', async () => {
+  it.each([
+    ['delta-seconds over the 30 s single-wait cap', () => '40'],
+    ['delta-seconds one second over the cap', () => '31'],
+    ['an HTTP-date 120 s out', () => new Date(Date.now() + 120_000).toUTCString()],
+  ])(
+    'fails a first attempt fast on a Retry-After (%s), unmarked but unreachable',
+    async (_label, retryAfter) => {
+      const svc = new NtfyService({
+        ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+        requestTimeoutMs: 15_000,
+        maxRetries: 3,
+      });
+      const header = retryAfter();
+      const { calls } = captureFetch(unavailable(header));
+      const { elapsed, outcome } = await runOnFakeClock(svc.fetch({ topic: 'alerts' }));
+      expect(elapsed).toBe(0);
+      expect(calls).toHaveLength(1);
+      const { error } = outcome as { error: Error & { data?: Record<string, unknown> } };
+      // Nothing was retried, so nothing claims it was.
+      expect(error.message).not.toMatch(/failed after/);
+      expect(error.data).not.toHaveProperty('retryAttempts');
+      expect(error.data?.retryAfter).toBe(header);
+      expect(isUpstreamUnreachable(error)).toBe(true);
+    },
+  );
+
+  it('fails a first answer whose Retry-After outlasts what is left of the deadline, unmarked but unreachable', async () => {
     const svc = new NtfyService({
       ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
-      requestTimeoutMs: 15_000,
+      requestTimeoutMs: 30_000,
       maxRetries: 3,
     });
-    const { calls } = captureFetch(unavailable('40'));
-    const { outcome } = await runOnFakeClock(svc.fetch({ topic: 'alerts' }));
+    // Answered at 25 s with a 30 s wait: under the cap, over the 25 s of budget left.
+    const { calls } = captureFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          setTimeout(() => resolve(unavailable('30')()), 25_000);
+        }),
+    );
+    const { elapsed, outcome } = await runOnFakeClock(svc.fetch({ topic: 'alerts' }));
+    expect(elapsed).toBe(25_000);
     expect(calls).toHaveLength(1);
     const { error } = outcome as { error: Error & { data?: Record<string, unknown> } };
     expect(error.message).not.toMatch(/failed after/);
-    expect(isUpstreamUnreachable(error)).toBe(false);
+    expect(error.data?.retryAfter).toBe('30');
+    expect(isUpstreamUnreachable(error)).toBe(true);
   });
 });
 

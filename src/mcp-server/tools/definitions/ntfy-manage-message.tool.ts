@@ -6,8 +6,10 @@
  * user-confirmation gate: the first call returns an input request, and the
  * clear/delete only fires on the retried call whose approval redeems the
  * consent record that request stored for this exact topic, message, and
- * operation. The prompt, `format()`, and failure messages render every topic,
- * sequence ID, and event ID through `literal()`, so each reads as literal text.
+ * operation. The prompt and `format()` render every topic, sequence ID, and
+ * event ID through `literal()`, so each reads as literal text; failure messages
+ * quote them in double quotes as plain text, since the framework escapes
+ * Markdown in them.
  * @module mcp-server/tools/definitions/ntfy-manage-message.tool
  */
 
@@ -25,12 +27,13 @@ import {
 import {
   getCode,
   getMessage,
-  isAuthCode,
+  isAuthRejection,
   isNotFoundCode,
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
   retryAfterData,
+  unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyManageResponse } from '@/services/ntfy/types.js';
@@ -102,7 +105,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     {
       reason: 'forbidden_topic',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'Auth required for the target topic.',
+      when: 'ntfy refused access to the topic with its own 401 or 403 error: the topic needs credentials this server did not send, or the ones it sent lack access.',
       recovery:
         'Try an unprotected topic instead; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`) before retrying.',
     },
@@ -124,15 +127,15 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     {
       reason: 'upstream_unreachable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted, or no complete answer within the call deadline.',
+      when: 'A DNS, connection, or network failure or a 5xx answer that outlasted the retries, no complete answer within the call deadline, or a 5xx whose `Retry-After` is longer than the call can wait.',
       retryable: true,
       recovery:
-        'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
+        'When the error carries `retryAfter`, the ntfy server is answering and asked for that wait: reissue the clear or delete once it has passed. Otherwise verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
     },
     {
       reason: 'upstream_malformed',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The server answered the clear or delete with HTTP 200 but a reply that is not an ntfy event (an empty body, an HTML page, JSON without ntfy's message fields or the `sequence_id`). Not retried, since the event may already be out.",
+      when: "The server answered the clear or delete with a 2xx success but a reply that is not an ntfy event (an empty body, an HTML page, JSON without ntfy's message fields or the `sequence_id`) or that could not be read in full (the connection reset, or a timeout or the call deadline cut it off). Not retried, since the event may already be out.",
       retryable: false,
       thrownBy: 'service',
       recovery:
@@ -163,7 +166,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     if (consent === 'declined') {
       throw ctx.fail(
         'consent_declined',
-        `The ${input.operation} of ${literal(input.sequence_id)} on topic ${literal(topic)} was not confirmed.`,
+        `The ${input.operation} of "${input.sequence_id}" on topic "${topic}" was not confirmed.`,
       );
     }
 
@@ -179,13 +182,13 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       if (isUpstreamMalformed(err)) throw err;
       const code = getCode(err);
       const msg = getMessage(err);
-      if (isAuthCode(code)) {
-        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic ${literal(topic)}`);
+      if (isAuthRejection(err)) {
+        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic "${topic}"`);
       }
       if (isNotFoundCode(code)) {
         throw ctx.fail(
           'not_found',
-          msg || `No cached message ${literal(input.sequence_id)} on topic ${literal(topic)}.`,
+          msg || `No cached message "${input.sequence_id}" on topic "${topic}".`,
         );
       }
       if (isRateLimitedCode(code)) {
@@ -196,7 +199,12 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
         );
       }
       if (isUpstreamUnreachable(err)) {
-        throw ctx.fail('upstream_unreachable', msg || 'ntfy server is unreachable.');
+        throw ctx.fail(
+          'upstream_unreachable',
+          msg || 'ntfy server is unreachable.',
+          unreachableWaitData(err, 'reissue the clear or delete'),
+          { cause: err },
+        );
       }
       throw err;
     }

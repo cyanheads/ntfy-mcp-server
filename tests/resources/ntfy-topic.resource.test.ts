@@ -1,14 +1,17 @@
 /**
  * @fileoverview Tests for the `ntfy://{topic}` resource — fixed snapshot
- * window, open/keepalive filtering, forbidden-topic mapping, generic-error
- * rethrow, the newest-20 truncation cap, message normalization (ISO 8601
+ * window, open/keepalive filtering, forbidden-topic mapping (only on ntfy's own
+ * 401/403 envelope; a proxy's HTML 403 stays unlabelled), the topic quoted as
+ * plain text in the fallback message, generic-error rethrow, the newest-20
+ * truncation cap, message normalization (ISO 8601
  * timestamps, body truncation, sparse payloads), the snapshot envelope
  * shape (baseUrl, since, count, truncated, upstreamTruncated), and — through
  * the real service — a damaged poll body failing the read as
  * `upstream_malformed`, a 429 (status line or mid-replay error line) failing it
  * as `rate_limited`, a refused connection, an exhausted 5xx, or a call deadline
- * failing it as `upstream_unreachable`, a cancelled read and a fail-fast 503
- * left unlabelled, and each declared reason's recovery hint as a client reads
+ * failing it as `upstream_unreachable` (so does a 503 whose `Retry-After`
+ * outlasts the call, carrying the wait), a cancelled read left unlabelled, and
+ * each declared reason's recovery hint as a client reads
  * it through the server factory. Retry ladders and the deadline run on a fake clock.
  * @module tests/resources/ntfy-topic.resource
  */
@@ -110,7 +113,10 @@ describe('ntfyTopicResource handler', () => {
   it('maps Forbidden upstream to a Forbidden McpError, carrying the upstream text', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'fetch').mockRejectedValue(
-      forbidden('ntfy returned HTTP 403 Forbidden: reserved topic access denied'),
+      forbidden('ntfy returned HTTP 403 Forbidden: reserved topic access denied', {
+        status: 403,
+        body: '{"code":40301,"http":403,"error":"reserved topic access denied"}',
+      }),
     );
     const ctx = createMockContext({
       errors: ntfyTopicResource.errors,
@@ -119,6 +125,21 @@ describe('ntfyTopicResource handler', () => {
     await expect(ntfyTopicResource.handler({ topic: 'protected' }, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.Forbidden,
       message: expect.stringContaining('reserved topic access denied'),
+      data: { reason: 'forbidden_topic' },
+    });
+  });
+
+  it('names the topic in double quotes, as plain text, when ntfy gave no explanation', async () => {
+    const svc = freshService();
+    vi.spyOn(svc, 'fetch').mockRejectedValue(
+      forbidden('', { status: 403, body: '{"code":40301,"http":403,"error":"forbidden"}' }),
+    );
+    const ctx = createMockContext({
+      errors: ntfyTopicResource.errors,
+      uri: new URL('ntfy://_secret_'),
+    });
+    await expect(ntfyTopicResource.handler({ topic: '_secret_' }, ctx)).rejects.toMatchObject({
+      message: 'Forbidden for topic "_secret_"',
       data: { reason: 'forbidden_topic' },
     });
   });
@@ -462,7 +483,7 @@ describe('ntfyTopicResource handler', () => {
       expect(err.data?.reason).toBeUndefined();
     });
 
-    it('leaves a 503 whose Retry-After outlasts the retry budget to the framework, unretried', async () => {
+    it('fails a 503 whose Retry-After outlasts the call with `upstream_unreachable`, unretried, naming the wait', async () => {
       // Retries allowed, so only the over-budget Retry-After keeps this to one attempt.
       initNtfyService({
         servers: [{ baseUrl: 'https://ntfy.test' }],
@@ -479,8 +500,35 @@ describe('ntfyTopicResource handler', () => {
       const err = await failedRead();
       expect(upstream).toHaveBeenCalledTimes(1);
       expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
-      expect(err.data?.reason).toBeUndefined();
       expect(err.message).not.toMatch(/failed after/);
+      expect(err.data).toMatchObject({
+        reason: 'upstream_unreachable',
+        retryAfter: '3600',
+        recovery: {
+          hint: 'The ntfy server answered but asked to wait (Retry-After: 3600); read the topic again once that wait has passed.',
+        },
+      });
+      expect(err.data).not.toHaveProperty('retryAttempts');
+    });
+
+    it('carries the Retry-After of a 503 retried to exhaustion onto `upstream_unreachable`', async () => {
+      initNtfyService({
+        servers: [{ baseUrl: 'https://ntfy.test' }],
+        requestTimeoutMs: 1000,
+        maxRetries: 1,
+      } as never);
+      const upstream = stubUpstream(
+        () =>
+          new Response('{"code":50301,"http":503,"error":"service unavailable"}', {
+            status: 503,
+            headers: { 'content-type': 'application/json', 'retry-after': '1' },
+          }),
+      );
+      const err = await onFakeClock(() => failedRead(), 2_000);
+      expect(upstream).toHaveBeenCalledTimes(2);
+      expect(err.message).toContain('(failed after 2 attempts)');
+      expect(err.data).toMatchObject({ reason: 'upstream_unreachable', retryAfter: '1' });
+      expect((err.data?.recovery as { hint?: string })?.hint).toContain('Retry-After: 1)');
     });
 
     /**
@@ -570,6 +618,31 @@ describe('ntfyTopicResource handler', () => {
         expect(error?.data?.recovery?.hint).toContain(hint);
         // A resource read takes no `base_url`, so no hint may offer one.
         expect(error?.data?.recovery?.hint).not.toContain('base_url');
+      },
+    );
+
+    it.each([
+      ["ntfy's 401 envelope", ntfyError(401, 'unauthorized'), 'forbidden_topic'],
+      [
+        "a proxy's HTML 403",
+        () =>
+          new Response('<html><head><title>403 Forbidden</title></head></html>', {
+            status: 403,
+            headers: { 'content-type': 'text/html' },
+          }),
+        undefined,
+      ],
+    ])(
+      'labels %s as a client reads it through the server (#45)',
+      async (_label, respond, reason) => {
+        freshService();
+        vi.stubEnv('MCP_LOG_LEVEL', 'error');
+        stubUpstream(respond);
+        const error = await readThroughServer();
+        // `forbidden_topic` carries its declared `Forbidden`; the HTML 403 keeps the status-mapped one.
+        expect(error?.code).toBe(JsonRpcErrorCode.Forbidden);
+        expect(error?.data?.reason).toBe(reason);
+        if (reason === undefined) expect(error?.data?.recovery).toBeUndefined();
       },
     );
 

@@ -10,17 +10,19 @@
  * round that must ask again instead of publishing — replay, pre-answer,
  * fabricated or malformed id, a record minted for other content, target, tool,
  * or caller), and the full contract error mapping
- * (forbidden / rate-limit / payload-too-large from a 413 or an oversize title or
- * tags, each with its own hint / invalid-delay / invalid-attachment /
- * unverified-contact / upstream-unreachable / generic rethrow) with the upstream
- * explanation preserved on the error message, and a 200 reply that is not an
- * ntfy message failing as `upstream_malformed` without a resend.
+ * (forbidden only from ntfy's own 401/403 envelope / rate-limit /
+ * payload-too-large from a 413, an oversize title or tags, or a refused
+ * attachment, each with its own hint / invalid-delay / invalid-attachment /
+ * unverified-contact from ntfy's refusal phrases, with a credentials hint for an
+ * anonymous sender / upstream-unreachable / generic rethrow) with the upstream
+ * explanation preserved on the error message, values in thrown messages quoted
+ * as plain text, and a 200 reply that is not an ntfy message failing as
+ * `upstream_malformed` without a resend.
  * @module tests/tools/ntfy-publish-message.tool
  */
 
 import { type AuthContext, type InputRequiredResult, z } from '@cyanheads/mcp-ts-core';
 import {
-  forbidden,
   invalidParams,
   JsonRpcErrorCode,
   McpError,
@@ -35,6 +37,7 @@ import {
   type MockContextOptions,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
@@ -42,6 +45,7 @@ import { ntfyManageMessage } from '@/mcp-server/tools/definitions/ntfy-manage-me
 import { ntfyPublishMessage } from '@/mcp-server/tools/definitions/ntfy-publish-message.tool.js';
 import { initNtfyService, resetNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyPublishResponse } from '@/services/ntfy/types.js';
+import { readCommonMark } from '../helpers/commonmark.js';
 
 const ENV_KEYS = [
   'NTFY_BASE_URL',
@@ -235,24 +239,102 @@ describe('ntfyPublishMessage handler', () => {
     await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toThrow(/Topic is required/);
   });
 
-  it('maps a Forbidden upstream to reason `forbidden_topic`', async () => {
-    const svc = freshService();
-    vi.spyOn(svc, 'publish').mockRejectedValue(forbidden('Topic forbidden'));
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
-    const input = ntfyPublishMessage.input.parse({ topic: 'protected', message: 'x' });
-    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'forbidden_topic' },
-    });
-  });
+  /**
+   * `forbidden_topic` through the real service: ntfy (or whatever answers in its
+   * place) replies to every publish with `respond()`.
+   */
+  describe("forbidden_topic only on ntfy's own auth envelope (#45)", () => {
+    function answer(respond: () => Response) {
+      freshService();
+      return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+        return respond();
+      });
+    }
+    const envelope = (status: number, code: number, error: string) => () =>
+      new Response(
+        JSON.stringify({
+          code,
+          http: status,
+          error,
+          link: 'https://ntfy.sh/docs/publish/#authentication',
+        }),
+        { status, headers: { 'content-type': 'application/json' } },
+      );
+    const HINT = ntfyPublishMessage.errors?.find((e) => e.reason === 'forbidden_topic')
+      ?.recovery as string;
 
-  it('names the topic in a code span when ntfy gave no `forbidden_topic` explanation', async () => {
-    const svc = freshService();
-    vi.spyOn(svc, 'publish').mockRejectedValue(forbidden(''));
-    const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
-    const input = ntfyPublishMessage.input.parse({ topic: '_secret_', message: 'x' });
-    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
-      message: 'Forbidden for topic `_secret_`',
-      data: { reason: 'forbidden_topic' },
+    async function failed() {
+      const result = await runToolContract(ntfyPublishMessage, { topic: 'alerts', message: 'x' });
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as {
+        error: { code: number; message: string; data: Record<string, unknown> };
+      };
+      const text = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
+      return { error, text };
+    }
+
+    it.each([
+      [401, 40101, 'unauthorized'],
+      [403, 40301, 'forbidden'],
+    ])(
+      "maps ntfy's %i envelope (%i) to `forbidden_topic` on both surfaces",
+      async (status, code, text) => {
+        answer(envelope(status, code, text));
+        const { error, text: rendered } = await failed();
+        expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+        expect(error.data.reason).toBe('forbidden_topic');
+        expect(error.data.recovery).toEqual({ hint: HINT });
+        expect(error.message).toContain(`HTTP ${status}`);
+        expect(error.message).toContain(
+          `: ${text} (see https://ntfy.sh/docs/publish/#authentication)`,
+        );
+        expect(rendered).toContain(`Recovery: ${HINT}`);
+        expect(rendered).toContain('reason forbidden_topic');
+      },
+    );
+
+    it("fails a proxy's HTML 403 without `forbidden_topic`, keeping the status in the message", async () => {
+      answer(
+        () =>
+          new Response(
+            '<html>\n<head><title>403 Forbidden</title></head>\n<body>\n<center><h1>403 Forbidden</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>\n',
+            { status: 403, headers: { 'content-type': 'text/html' } },
+          ),
+      );
+      const { error, text } = await failed();
+      expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+      expect(error.data.reason).toBeUndefined();
+      expect(error.data.recovery).toBeUndefined();
+      expect(error.message).toContain('HTTP 403');
+      expect(text).toContain('HTTP 403');
+      expect(text).not.toContain('forbidden_topic');
+      expect(text).not.toContain('NTFY_AUTH_TOKEN');
+    });
+
+    it('names the topic in double quotes, as plain text, when ntfy gave no explanation', async () => {
+      const svc = freshService();
+      vi.spyOn(svc, 'publish').mockRejectedValue(
+        new McpError(JsonRpcErrorCode.Forbidden, '', {
+          status: 403,
+          body: '{"code":40301,"http":403,"error":"forbidden"}',
+        }),
+      );
+      const result = await runToolContract(ntfyPublishMessage, { topic: '_secret_', message: 'x' });
+      const { error } = result.structuredContent as {
+        error: { message: string; data: { reason?: string } };
+      };
+      expect(error).toMatchObject({
+        message: 'Forbidden for topic "_secret_"',
+        data: { reason: 'forbidden_topic' },
+      });
+      const text = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
+      expect(text).toContain('Error: Forbidden for topic "_secret_"');
     });
   });
 
@@ -393,7 +475,11 @@ describe('ntfyPublishMessage handler', () => {
       );
     }
 
-    /** The contract envelope of one failed publish: the JSON error and the `content[]` text. */
+    /**
+     * The contract envelope of one failed publish: the JSON error and the
+     * `content[]` text as a CommonMark parse reads it (the framework escapes
+     * Markdown punctuation in error text, so the raw bytes carry backslashes).
+     */
     async function failedPublish(rejection: McpError, input: Record<string, unknown>) {
       const svc = freshService();
       vi.spyOn(svc, 'publish').mockRejectedValue(rejection);
@@ -406,7 +492,9 @@ describe('ntfyPublishMessage handler', () => {
           data: { reason?: string; recovery?: { hint: string } };
         };
       };
-      const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      const text = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
       return { error, text };
     }
 
@@ -519,29 +607,181 @@ describe('ntfyPublishMessage handler', () => {
       expect(text).toContain(`Recovery: ${bodyHint}`);
     });
 
-    it('declares a `payload_too_large` entry that covers the body, the title, and the tags', () => {
+    it('declares a `payload_too_large` entry that covers the body, the title, the tags, and an attachment', () => {
       const entry = ntfyPublishMessage.errors?.find((e) => e.reason === 'payload_too_large');
       for (const field of ['title', 'tags']) {
         expect(entry?.when).toContain(`\`${field}\``);
         expect(entry?.recovery).toContain(`\`${field}\``);
       }
       expect(entry?.recovery).toContain('`attach`');
+      expect(entry?.when).toContain('bandwidth quota');
+      expect(entry?.recovery).toContain('`filename`');
+      expect(entry?.recovery).toContain('24 hours');
     });
   });
 
-  it('maps a 4xx with email/phone-verification hint to `unverified_contact`', async () => {
-    const svc = freshService();
-    vi.spyOn(svc, 'publish').mockRejectedValue(invalidParams('Phone number is not verified'));
-    const input = ntfyPublishMessage.input.parse({
-      topic: 'alerts',
-      message: 'x',
-      call: '+15555550100',
+  /**
+   * ntfy's refusals of an `email`, a `call`, or an attachment, through the real
+   * service against ntfy's real `{ code, http, error, link }` envelopes. The
+   * label is read from ntfy's answer, so most cases leave `email`/`call` off and
+   * run the contract in one round; the gated round is pinned at the end.
+   */
+  describe('e-mail, call, and attachment refusals (#40)', () => {
+    function refuse(status: number, code: number, error: string, link?: string) {
+      freshService();
+      return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+        return new Response(
+          JSON.stringify({ code, http: status, error, ...(link ? { link } : {}) }),
+          { status, headers: { 'content-type': 'application/json' } },
+        );
+      });
+    }
+
+    async function failed(input: Record<string, unknown> = {}) {
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'x',
+        ...input,
+      });
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as {
+        error: {
+          code: number;
+          message: string;
+          data: { reason?: string; recovery?: { hint: string } };
+        };
+      };
+      const text = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
+      return { error, text };
+    }
+
+    const PHONE_DOCS = 'https://ntfy.sh/docs/publish/#phone-calls';
+    const EMAIL_DOCS = 'https://ntfy.sh/docs/publish/#e-mail-notifications';
+    const DECLARED = ntfyPublishMessage.errors?.find((e) => e.reason === 'unverified_contact')
+      ?.recovery as string;
+
+    it.each([
+      [40032, 'invalid request: calling is disabled', 'https://ntfy.sh/docs/config/#phone-calls'],
+      [40033, 'invalid request: phone number invalid', PHONE_DOCS],
+      [
+        40001,
+        'e-mail notifications are not enabled',
+        'https://ntfy.sh/docs/config/#e-mail-notifications',
+      ],
+      [40050, 'invalid request: invalid e-mail address', EMAIL_DOCS],
+    ])(
+      "fails %i with no reason, in ntfy's own words and link, on both surfaces",
+      async (code, upstream, link) => {
+        refuse(400, code, upstream, link);
+        const { error, text } = await failed();
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.data.reason).toBeUndefined();
+        expect(error.data.recovery).toBeUndefined();
+        expect(error.message).toContain(`${upstream} (see ${link})`);
+        expect(text).toContain(`${upstream} (see ${link})`);
+        expect(text).not.toContain('Recovery:');
+      },
+    );
+
+    it.each([
+      [
+        40034,
+        'invalid request: phone number not verified, or no matching verified numbers found',
+        PHONE_DOCS,
+      ],
+      [40052, 'invalid request: email address not verified', EMAIL_DOCS],
+    ])(
+      'maps %i to `unverified_contact` with the declared recovery',
+      async (code, upstream, link) => {
+        refuse(400, code, upstream, link);
+        const { error, text } = await failed();
+        expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+        expect(error.data.reason).toBe('unverified_contact');
+        expect(error.data.recovery?.hint).toBe(DECLARED);
+        expect(error.message).toContain(upstream);
+        expect(text).toContain(`Recovery: ${DECLARED}`);
+      },
+    );
+
+    it.each([
+      [40035, 'invalid request: anonymous phone calls are not allowed', PHONE_DOCS],
+      [40053, 'invalid request: anonymous email sending is not allowed', EMAIL_DOCS],
+    ])(
+      'maps %i to `unverified_contact` with a hint naming ntfy credentials, on both surfaces',
+      async (code, upstream, link) => {
+        refuse(400, code, upstream, link);
+        const { error, text } = await failed();
+        expect(error.data.reason).toBe('unverified_contact');
+        const hint = error.data.recovery?.hint ?? '';
+        expect(hint).toContain('NTFY_AUTH_TOKEN');
+        expect(hint).toContain('NTFY_SERVERS');
+        expect(hint).not.toBe(DECLARED);
+        expect(hint).not.toContain('verify');
+        expect(error.message).toContain(upstream);
+        expect(text).toContain(`Recovery: ${hint}`);
+      },
+    );
+
+    it('maps 41301 to `payload_too_large` with the attachment hint, not the body hint', async () => {
+      refuse(
+        413,
+        41301,
+        'attachment too large, or bandwidth limit reached',
+        'https://ntfy.sh/docs/publish/#limitations',
+      );
+      const { error, text } = await failed({ filename: 'a.txt' });
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.data.reason).toBe('payload_too_large');
+      expect(error.message).toContain('attachment too large, or bandwidth limit reached');
+      const hint = error.data.recovery?.hint ?? '';
+      expect(hint).toContain('`filename`');
+      expect(hint).toContain('`attach`');
+      expect(hint).toContain('24 hours');
+      expect(hint).not.toContain('Shorten the message');
+      expect(text).toContain(`Recovery: ${hint}`);
     });
-    // `call` is a gated side effect — run the approved second round.
-    const ctx = await approvedCtx(input);
-    await expect(ntfyPublishMessage.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'unverified_contact' },
+
+    it.each([
+      [41302, 'Matrix request is larger than the max allowed length'],
+      [41303, 'JSON body too large'],
+    ])('keeps the message-body hint on the 413 %i', async (code, upstream) => {
+      refuse(413, code, upstream);
+      const { error, text } = await failed();
+      expect(error.data.reason).toBe('payload_too_large');
+      expect(error.data.recovery?.hint).toBe(
+        'Shorten the message (≤4096 bytes plain) or host the long content as an external URL via `attach`.',
+      );
+      expect(text).toContain('Recovery: Shorten the message');
     });
+
+    it.each([
+      [
+        40034,
+        'invalid request: phone number not verified, or no matching verified numbers found',
+        'unverified_contact',
+      ],
+      [40033, 'invalid request: phone number invalid', undefined],
+    ])(
+      'labels %i the same on the approved round of a gated `call`',
+      async (code, upstream, reason) => {
+        const upstreamFetch = refuse(400, code, upstream, PHONE_DOCS);
+        const input = ntfyPublishMessage.input.parse({
+          topic: 'alerts',
+          message: 'x',
+          call: '+15555550100',
+        });
+        const err = (await Promise.resolve(
+          ntfyPublishMessage.handler(input, await approvedCtx(input)),
+        ).catch((e: unknown) => e)) as McpError;
+        expect(upstreamFetch).toHaveBeenCalledTimes(1);
+        expect(err.message).toContain(upstream);
+        expect(err.data?.reason).toBe(reason);
+      },
+    );
   });
 
   it('renders every output field in format()', () => {
@@ -777,7 +1017,9 @@ describe('ntfyPublishMessage handler', () => {
         expect(error.data.retryable).toBe(false);
         expect(error.data.recovery?.hint).toBe(HINT);
         expect(error.message).toContain('publish was answered with HTTP 200');
-        const textOut = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        const textOut = readCommonMark(
+          result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+        );
         expect(textOut).toContain('publish was answered with HTTP 200');
         expect(textOut).toContain(`Recovery: ${HINT}`);
         expect(textOut).toContain('reason upstream_malformed');
@@ -816,6 +1058,122 @@ describe('ntfyPublishMessage handler', () => {
         data: { reason: 'upstream_malformed', retryable: false },
       });
     });
+
+    /** `200` headers and the first bytes of the reply, then the body stream errors. */
+    function stubCutOffReply(onRead?: () => void) {
+      initNtfyService({
+        servers: [{ baseUrl: 'https://ntfy.test' }],
+        requestTimeoutMs: 1000,
+        maxRetries: 3,
+      } as never);
+      return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+        const signal = init?.signal as AbortSignal;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"id":"m1","ti'));
+            signal.addEventListener('abort', () => controller.error(signal.reason), {
+              once: true,
+            });
+            if (onRead) onRead();
+            else {
+              queueMicrotask(() =>
+                controller.error(
+                  new TypeError('terminated', { cause: new Error('other side closed') }),
+                ),
+              );
+            }
+          },
+        });
+        return new Response(body, {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    }
+
+    it('fails a reply reset mid-body with `upstream_malformed` on both surfaces and publishes once (#43)', async () => {
+      const upstream = stubCutOffReply();
+      const result = await runToolContract(ntfyPublishMessage, { topic: 'alerts', message: 'x' });
+      expect(upstream).toHaveBeenCalledTimes(1);
+      const { error } = result.structuredContent as {
+        error: { code: number; message: string; data: Record<string, unknown> };
+      };
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.message).toBe(
+        'The publish was answered with HTTP 200, but reading the reply failed: terminated (other side closed).',
+      );
+      expect(error.data).toMatchObject({
+        reason: 'upstream_malformed',
+        retryable: false,
+        recovery: { hint: HINT },
+      });
+      const textOut = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
+      expect(textOut).toContain('but reading the reply failed: terminated (other side closed).');
+      expect(textOut).toContain(`Recovery: ${HINT}`);
+      expect(textOut).toContain('not retryable');
+    });
+
+    it('settles a caller cancel mid-reply as RequestCancelled, publishing once (#43)', async () => {
+      const caller = new AbortController();
+      const upstream = stubCutOffReply(() => queueMicrotask(() => caller.abort()));
+      const result = await runToolContract(
+        ntfyPublishMessage,
+        { topic: 'alerts', message: 'x' },
+        { context: { signal: caller.signal } },
+      );
+      expect(upstream).toHaveBeenCalledTimes(1);
+      const { error } = result.structuredContent as {
+        error: { code: number; message: string; data?: Record<string, unknown> };
+      };
+      expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(error.message).toBe('The ntfy request was cancelled by the caller.');
+      expect(error.data?.reason).toBeUndefined();
+      const textOut = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
+      expect(textOut).toContain('The ntfy request was cancelled by the caller.');
+      expect(textOut).not.toContain('upstream_malformed');
+    });
+  });
+
+  it('fails a 503 whose Retry-After outlasts the call as `upstream_unreachable`, sent once, naming the wait (#42)', async () => {
+    initNtfyService({
+      servers: [{ baseUrl: 'https://ntfy.test' }],
+      requestTimeoutMs: 1000,
+      maxRetries: 3,
+    } as never);
+    const upstream = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+      return new Response('{"code":50301,"http":503,"error":"service unavailable"}', {
+        status: 503,
+        headers: { 'content-type': 'application/json', 'retry-after': '120' },
+      });
+    });
+    const result = await runToolContract(ntfyPublishMessage, { topic: 'alerts', message: 'x' });
+    expect(upstream).toHaveBeenCalledTimes(1);
+    const { error } = result.structuredContent as {
+      error: { code: number; message: string; data: Record<string, unknown> };
+    };
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.message).not.toMatch(/failed after/);
+    expect(error.data).toMatchObject({
+      reason: 'upstream_unreachable',
+      retryAfter: '120',
+      recovery: {
+        hint: 'The ntfy server answered but asked to wait (Retry-After: 120); resend the publish once that wait has passed.',
+      },
+    });
+    expect(error.data).not.toHaveProperty('retryAttempts');
+    const textOut = readCommonMark(
+      result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+    );
+    expect(textOut).toContain('Retry-After: 120); resend the publish once that wait has passed.');
+    expect(textOut).toContain('reason upstream_unreachable');
   });
 
   it('rethrows unclassified errors (not auth/rate/invalid/unreachable) for the framework auto-classifier', async () => {
@@ -1107,14 +1465,22 @@ describe('ntfyPublishMessage consent gate', () => {
     expect(message).toContain('an email forward to \n```text\nops@example.com\n# forged\n```\n?');
   });
 
-  it('names the topic in a code span when the user declines', async () => {
+  it('names the topic in double quotes, as plain text, when the user declines', async () => {
     fakeUpstream();
-    await expect(
+    const err = (await Promise.resolve(
       ntfyPublishMessage.handler(
         inputWith(EMAIL),
         await approvedCtx(inputWith(EMAIL), { action: 'decline' }),
       ),
-    ).rejects.toMatchObject({ message: 'Publish to `alerts` was not confirmed.' });
+    ).catch((e: unknown) => e)) as McpError;
+    expect(err).toMatchObject({
+      message: 'Publish to "alerts" was not confirmed.',
+      data: { reason: 'consent_declined' },
+    });
+    // `content[]` is the message as the framework escapes it; a parse reads it back exactly.
+    expect(readCommonMark(`Error: ${escapeMarkdownInline(err.message)}`)).toBe(
+      'Error: Publish to "alerts" was not confirmed.',
+    );
   });
 
   it('lists every side effect when a publish carries more than one', async () => {

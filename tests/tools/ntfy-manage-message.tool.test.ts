@@ -1,8 +1,9 @@
 /**
  * @fileoverview Tests for `ntfy_manage_message` — clear and delete dispatch,
- * reason mapping (not_found / forbidden_topic / rate_limited /
- * upstream_unreachable / upstream_malformed without a resend / generic
- * rethrow), the advertised annotations and the
+ * reason mapping (not_found / forbidden_topic only on ntfy's own 401/403
+ * envelope / rate_limited / upstream_unreachable / upstream_malformed without a
+ * resend / generic rethrow), values in thrown messages quoted as plain text,
+ * the advertised annotations and the
  * no-dedupe guarantee they reflect, default-topic resolution,
  * missing-topic ValidationError,
  * base_url override plus its scheme validation, format() rendering for both
@@ -30,12 +31,18 @@ import {
   expectInputRequired,
   type MockContextOptions,
 } from '@cyanheads/mcp-ts-core/testing';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
 import { ntfyManageMessage } from '@/mcp-server/tools/definitions/ntfy-manage-message.tool.js';
 import { ntfyPublishMessage } from '@/mcp-server/tools/definitions/ntfy-publish-message.tool.js';
 import { initNtfyService, resetNtfyService } from '@/services/ntfy/ntfy-service.js';
+import { readCommonMark } from '../helpers/commonmark.js';
+
+/** The `content[]` error line the framework builds from `message`, as a CommonMark parse reads it. */
+const renderedError = (message: string) =>
+  readCommonMark(`Error: ${escapeMarkdownInline(message)}`);
 
 const ENV_KEYS = [
   'NTFY_BASE_URL',
@@ -188,17 +195,40 @@ describe('ntfyManageMessage handler', () => {
     );
   });
 
-  it('maps Forbidden to reason `forbidden_topic`', async () => {
-    const svc = freshService();
-    vi.spyOn(svc, 'manage').mockRejectedValue(forbidden('Topic forbidden'));
+  it.each([
+    [
+      "ntfy's 403 envelope",
+      403,
+      '{"code":40301,"http":403,"error":"forbidden","link":"https://ntfy.sh/docs/publish/#authentication"}',
+      'forbidden_topic',
+    ],
+    [
+      "ntfy's 401 envelope",
+      401,
+      '{"code":40101,"http":401,"error":"unauthorized","link":"https://ntfy.sh/docs/publish/#authentication"}',
+      'forbidden_topic',
+    ],
+    [
+      "a proxy's HTML 403",
+      403,
+      '<html><head><title>403 Forbidden</title></head></html>',
+      undefined,
+    ],
+  ])('labels %s through the real service (#45)', async (_label, status, body, reason) => {
+    const upstream = stubNtfy(() => new Response(body, { status }));
     const input = ntfyManageMessage.input.parse({
       topic: 'protected',
       sequence_id: 'seq_1',
       operation: 'clear',
     });
-    await expect(ntfyManageMessage.handler(input, await approvedCtx(input))).rejects.toMatchObject({
-      data: { reason: 'forbidden_topic' },
-    });
+    const err = (await Promise.resolve(
+      ntfyManageMessage.handler(input, await approvedCtx(input)),
+    ).catch((e: unknown) => e)) as McpError;
+    expect(upstream).toHaveBeenCalledTimes(1);
+    // `forbidden_topic` carries its declared `Forbidden`; the HTML 403 keeps the status-mapped one.
+    expect(err.code).toBe(JsonRpcErrorCode.Forbidden);
+    expect(err.message).toContain(`HTTP ${status}`);
+    expect(err.data?.reason).toBe(reason);
   });
 
   it('uses NTFY_DEFAULT_TOPIC when topic is omitted', async () => {
@@ -318,10 +348,14 @@ describe('ntfyManageMessage handler', () => {
   });
 
   it.each([
-    ['forbidden_topic', forbidden(''), 'Forbidden for topic `_secret_`'],
-    ['not_found', notFound(''), 'No cached message `_seq_` on topic `_secret_`.'],
+    [
+      'forbidden_topic',
+      forbidden('', { status: 403, body: '{"code":40301,"http":403,"error":"forbidden"}' }),
+      'Forbidden for topic "_secret_"',
+    ],
+    ['not_found', notFound(''), 'No cached message "_seq_" on topic "_secret_".'],
   ])(
-    'names the topic in a code span when ntfy gave no %s explanation',
+    'names the topic in double quotes, as plain text, when ntfy gave no %s explanation',
     async (reason, upstreamErr, message) => {
       const svc = freshService();
       vi.spyOn(svc, 'manage').mockRejectedValue(upstreamErr);
@@ -330,9 +364,11 @@ describe('ntfyManageMessage handler', () => {
         sequence_id: '_seq_',
         operation: 'delete',
       });
-      await expect(
+      const err = (await Promise.resolve(
         ntfyManageMessage.handler(input, await approvedCtx(input)),
-      ).rejects.toMatchObject({ message, data: { reason } });
+      ).catch((e: unknown) => e)) as McpError;
+      expect(err).toMatchObject({ message, data: { reason } });
+      expect(renderedError(err.message)).toBe(`Error: ${message}`);
     },
   );
 
@@ -541,6 +577,89 @@ describe('ntfyManageMessage handler', () => {
     });
   });
 
+  /** Through the real service with `NTFY_MAX_RETRIES` at 3; the request count is the events sent. */
+  function stubNtfy(respond: () => Response) {
+    initNtfyService({
+      servers: [{ baseUrl: 'https://ntfy.test' }],
+      requestTimeoutMs: 1000,
+      maxRetries: 3,
+    } as never);
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      if (new URL(String(url)).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+      return respond();
+    });
+  }
+
+  it.each(['clear', 'delete'] as const)(
+    'fails a %s whose reply resets mid-body as `upstream_malformed`, sending it once (#43)',
+    async (operation) => {
+      const upstream = stubNtfy(
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"id":"e1","ti'));
+                queueMicrotask(() =>
+                  controller.error(
+                    Object.assign(
+                      new TypeError('ECONNRESET: The socket connection was closed unexpectedly.'),
+                      {
+                        code: 'ECONNRESET',
+                      },
+                    ),
+                  ),
+                );
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+      );
+      const input = ntfyManageMessage.input.parse({
+        topic: 'alerts',
+        sequence_id: 'seq_x',
+        operation,
+      });
+      const err = (await Promise.resolve(
+        ntfyManageMessage.handler(input, await approvedCtx(input)),
+      ).catch((e: unknown) => e)) as McpError;
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(err.data).toMatchObject({ reason: 'upstream_malformed', retryable: false });
+      expect(err.message).toBe(
+        `The ${operation} was answered with HTTP 200, but reading the reply failed: ECONNRESET: The socket connection was closed unexpectedly.`,
+      );
+    },
+  );
+
+  it('fails a 503 whose Retry-After outlasts the call as `upstream_unreachable`, sent once, naming the wait (#42)', async () => {
+    const upstream = stubNtfy(
+      () =>
+        new Response('{"code":50301,"http":503,"error":"service unavailable"}', {
+          status: 503,
+          headers: { 'content-type': 'application/json', 'retry-after': '120' },
+        }),
+    );
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_x',
+      operation: 'clear',
+    });
+    const err = (await Promise.resolve(
+      ntfyManageMessage.handler(input, await approvedCtx(input)),
+    ).catch((e: unknown) => e)) as McpError;
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(err.message).not.toMatch(/failed after/);
+    expect(err.data).toMatchObject({
+      reason: 'upstream_unreachable',
+      retryAfter: '120',
+      recovery: {
+        hint: 'The ntfy server answered but asked to wait (Retry-After: 120); reissue the clear or delete once that wait has passed.',
+      },
+    });
+    expect(err.data).not.toHaveProperty('retryAttempts');
+  });
+
   it('rethrows unclassified errors so the framework auto-classifier handles them', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(invalidParams('weird upstream complaint'));
@@ -695,7 +814,7 @@ describe('ntfyManageMessage consent gate', () => {
     expect(message).toContain('message_clear');
   });
 
-  it('names the sequence and topic in code spans in the prompt and in a decline', async () => {
+  it('names the sequence and topic in code spans in the prompt, and in double quotes in a decline', async () => {
     const upstream = fakeUpstream();
     const gated = input({ topic: '_secret_', sequence_id: '__seq__' });
 
@@ -708,11 +827,16 @@ describe('ntfyManageMessage consent gate', () => {
       'Delete ntfy notification `__seq__` on topic `_secret_`? Subscribers receive a message_delete event.',
     );
 
-    await expect(
+    const err = (await Promise.resolve(
       ntfyManageMessage.handler(gated, await approvedCtx(gated, { action: 'decline' })),
-    ).rejects.toMatchObject({
-      message: 'The delete of `__seq__` on topic `_secret_` was not confirmed.',
+    ).catch((e: unknown) => e)) as McpError;
+    expect(err).toMatchObject({
+      message: 'The delete of "__seq__" on topic "_secret_" was not confirmed.',
+      data: { reason: 'consent_declined' },
     });
+    expect(renderedError(err.message)).toBe(
+      'Error: The delete of "__seq__" on topic "_secret_" was not confirmed.',
+    );
     expect(upstream).not.toHaveBeenCalled();
   });
 

@@ -8,7 +8,8 @@
  * redeems the consent record that request stored for this exact publish.
  * `format()` renders every value ntfy echoes as a code span or fence, so it
  * reads as literal text; a body ntfy accepted as `text/markdown` is flagged
- * `markdown: true` and fenced as `markdown`.
+ * `markdown: true` and fenced as `markdown`. Failure messages quote a value in
+ * double quotes as plain text, since the framework escapes Markdown in them.
  * @module mcp-server/tools/definitions/ntfy-publish-message.tool
  */
 
@@ -28,7 +29,8 @@ import {
   getCode,
   getDataStatus,
   getMessage,
-  isAuthCode,
+  isAnonymousSenderRejection,
+  isAuthRejection,
   isBaseUrlRejection,
   isInvalidParamsCode,
   isRateLimitedCode,
@@ -36,6 +38,7 @@ import {
   isUpstreamUnreachable,
   oversizedPublishField,
   retryAfterData,
+  unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
 import type {
@@ -261,7 +264,9 @@ const InputSchema = z.object({
 const OutputSchema = z.object({
   id: z
     .string()
-    .describe('Server-assigned message ID — pass back as `sequence_id` to update later.'),
+    .describe(
+      "Server-assigned ID of this message. When the call set no `sequence_id`, pass this `id` as `sequence_id` to update, clear, or delete the notification later. When it set one (an update, or a sequence id chosen on the first publish), that value comes back as `sequence_id` and stays the one to pass; this message's own `id` would start a separate notification.",
+    ),
   time: z
     .string()
     .describe(
@@ -297,7 +302,7 @@ const OutputSchema = z.object({
     .optional()
     .describe('True when ntfy accepted the body as Markdown; absent for plain text.'),
   priority: PrioritySchema.optional().describe(
-    'Echo of the input priority; absent when default (3).',
+    'Echo of the input priority; absent when none was set, which ntfy delivers at the default (3). An explicit 3 is echoed as 3.',
   ),
   tags: z
     .array(z.string())
@@ -382,7 +387,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     {
       reason: 'forbidden_topic',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'Auth required for the target topic.',
+      when: 'ntfy refused access to the topic with its own 401 or 403 error: the topic needs credentials this server did not send, or the ones it sent lack access.',
       recovery:
         'Try a public topic instead; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`) before retrying.',
       thrownBy: 'service',
@@ -399,9 +404,9 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     {
       reason: 'payload_too_large',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Upstream returned 413, or rejected a field as too large — the message body or attachment exceeds server limits, or the `title` or the combined `tags` are longer than ntfy accepts.',
+      when: "Upstream returned 413, or rejected a field as too large — the message body or attachment exceeds server limits (an attachment also fails once the client's attachment storage or daily bandwidth quota is used up), or the `title` or the combined `tags` are longer than ntfy accepts.",
       recovery:
-        'Shorten the field ntfy rejected: the message (≤4096 bytes plain, or host the long content as an external URL via `attach`), the `title`, or the `tags` (ntfy limits their combined length).',
+        'Shorten the field ntfy rejected: the message (≤4096 bytes plain, or host the long content as an external URL via `attach`), the `title`, or the `tags` (ntfy limits their combined length). When ntfy refused an attachment, drop `filename` or host the file and pass its URL as `attach`; a used-up bandwidth quota resets within 24 hours.',
       thrownBy: 'service',
     },
     {
@@ -431,16 +436,16 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     {
       reason: 'upstream_unreachable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted, or no complete answer within the call deadline.',
+      when: 'A DNS, connection, or network failure or a 5xx answer that outlasted the retries, no complete answer within the call deadline, or a 5xx whose `Retry-After` is longer than the call can wait.',
       retryable: true,
       recovery:
-        'Verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
+        'When the error carries `retryAfter`, the ntfy server is answering and asked for that wait: resend the publish once it has passed. Otherwise verify the configured `NTFY_BASE_URL` (or per-call `base_url`) resolves and is reachable; check network connectivity, then retry.',
       thrownBy: 'service',
     },
     {
       reason: 'upstream_malformed',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The server answered the publish with HTTP 200 but a reply that is not an ntfy message (an empty body, an HTML page, JSON without ntfy's message fields). Not retried, since the notification may already be out.",
+      when: "The server answered the publish with a 2xx success but a reply that is not an ntfy message (an empty body, an HTML page, JSON without ntfy's message fields) or that could not be read in full (the connection reset, or a timeout or the call deadline cut it off). Not retried, since the notification may already be out.",
       retryable: false,
       recovery:
         'The notification may already have been delivered — call `ntfy_fetch_messages` on the topic before resending, so a resend does not deliver it twice. Fetch with the same `base_url` this publish used, and with `scheduled: true` if it set `delay`; without them the fetch cannot see this message. If `base_url` (or the configured `NTFY_BASE_URL`) does not point at an ntfy server, correct it first.',
@@ -492,7 +497,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
         message: `Publish to ntfy topic ${literal(topic)} with ${sideEffects.join(' and ')}?`,
       });
       if (consent === 'declined') {
-        throw ctx.fail('consent_declined', `Publish to ${literal(topic)} was not confirmed.`);
+        throw ctx.fail('consent_declined', `Publish to "${topic}" was not confirmed.`);
       }
     }
 
@@ -583,16 +588,27 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
 });
 
 /**
- * The hint each `payload_too_large` failure carries: the fix for the one field
- * ntfy rejected, where the declared `recovery` names all three. A 413 and any
- * oversize 400 that names no field get the message-body hint.
+ * The hint each `payload_too_large` failure carries: the fix for the one thing
+ * ntfy rejected, where the declared `recovery` names them all. A 413 and an
+ * oversize 400 that name nothing else get the message-body hint.
  */
 const OVERSIZE_HINTS = {
   body: `Shorten the message (≤${MESSAGE_MAX_BYTES} bytes plain) or host the long content as an external URL via \`attach\`.`,
   title:
     'Shorten `title` and resend — ntfy rejected the title as too long, so shortening the message body will not help.',
   tags: 'Send fewer or shorter `tags` — ntfy limits their combined length, so shortening the message body will not help.',
+  attachment:
+    "ntfy stored the message as a file attachment (it does when `filename` is set without `attach`, or when the message is over the server's message limit) and refused the file: it exceeds the server's attachment size limit, or this client's attachment storage or daily bandwidth quota is used up. Drop `filename` to send the text as a plain message, or host the file elsewhere and pass its URL as `attach`; a used-up bandwidth quota resets within 24 hours.",
 } as const;
+
+/**
+ * The hint an `unverified_contact` failure carries when ntfy refused the
+ * `email` or `call` because the request had no credentials (40035, 40053),
+ * where the declared `recovery` covers an address or number that is not
+ * verified (40034, 40052).
+ */
+const ANONYMOUS_SENDER_HINT =
+  'ntfy forwards e-mail and places calls only for an authenticated sender: drop the `email`/`call` field and resend, or ask the operator to configure ntfy credentials for this server (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or an `NTFY_SERVERS` entry for a per-call `base_url`).';
 
 /**
  * Translate a thrown error from `NtfyService.publish` into a typed contract
@@ -615,8 +631,8 @@ function classifyPublishError(
   const code = getCode(err);
   const message = getMessage(err);
 
-  if (isAuthCode(code)) {
-    return ctx.fail('forbidden_topic', message || `Forbidden for topic ${literal(topic)}`);
+  if (isAuthRejection(err)) {
+    return ctx.fail('forbidden_topic', message || `Forbidden for topic "${topic}"`);
   }
   if (isRateLimitedCode(code)) {
     return ctx.fail(
@@ -626,10 +642,12 @@ function classifyPublishError(
     );
   }
   // 413 maps to `InvalidRequest`, which `isInvalidParamsCode` deliberately
-  // excludes — read the upstream status directly so an oversize body reaches
-  // `payload_too_large` instead of bubbling unclassified.
+  // excludes — read the upstream status directly so an oversize body or a
+  // refused attachment reaches `payload_too_large` instead of bubbling
+  // unclassified.
   if (getDataStatus(err) === 413) {
-    return ctx.fail('payload_too_large', message, { recovery: { hint: OVERSIZE_HINTS.body } });
+    const hint = OVERSIZE_HINTS[oversizedPublishField(err) ?? 'body'];
+    return ctx.fail('payload_too_large', message, { recovery: { hint } });
   }
   if (isInvalidParamsCode(code)) {
     const sub = classifyInvalidParams(err);
@@ -637,10 +655,18 @@ function classifyPublishError(
       const hint = OVERSIZE_HINTS[oversizedPublishField(err) ?? 'body'];
       return ctx.fail(sub, message, { recovery: { hint } });
     }
+    if (sub === 'unverified_contact' && isAnonymousSenderRejection(err)) {
+      return ctx.fail(sub, message, { recovery: { hint: ANONYMOUS_SENDER_HINT } });
+    }
     if (sub) return ctx.fail(sub, message);
   }
   if (isUpstreamUnreachable(err)) {
-    return ctx.fail('upstream_unreachable', message || 'ntfy server is unreachable.');
+    return ctx.fail(
+      'upstream_unreachable',
+      message || 'ntfy server is unreachable.',
+      unreachableWaitData(err, 'resend the publish'),
+      { cause: err },
+    );
   }
   return err;
 }

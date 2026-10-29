@@ -43,8 +43,9 @@ const CONSENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
  * a 2025-era client that declared no `elicitation.form` capability (a bare
  * `elicitation: {}` counts as declaring it) is refused inside
  * `ctx.requestInput` with `InvalidRequest` (-32600) and
- * `data.reason: 'client_capability_missing'` — so the call fails before the
- * upstream request goes out, on every transport.
+ * `data.reason: 'client_capability_missing'`; a 2026-era request lacking the
+ * capability gets the SDK's `-32021` with `data.requiredCapabilities` — so the
+ * call fails before the upstream request goes out, on every transport.
  */
 export type ConfirmationOutcome = 'confirmed' | 'declined';
 

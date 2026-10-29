@@ -3,10 +3,12 @@
  * Wraps `NtfyService.fetch()` with fixed defaults (since=1h, latest 20) so
  * clients can answer "what's happening on topic X" without parameterizing a
  * tool, normalizing messages through the shared `shapeMessage` so the payload
- * matches `ntfy_fetch_messages` field for field. Auth failures, a 429 that
- * outlasts the service's retries, an ntfy server that never answers within the
- * retries or the call deadline, and a poll body that is not ntfy's message
- * stream fail the read with the declared `forbidden_topic` / `rate_limited` /
+ * matches `ntfy_fetch_messages` field for field. ntfy's own auth refusals (a
+ * 401/403 carrying its error envelope), a 429 that outlasts the service's
+ * retries, an ntfy server that never answers within the
+ * retries or the call deadline (or answers 5xx with a `Retry-After` the read
+ * cannot wait out), and a poll body that is not ntfy's message stream fail the
+ * read with the declared `forbidden_topic` / `rate_limited` /
  * `upstream_unreachable` / `upstream_malformed` reasons. For filtering or
  * replay, callers should use `ntfy_fetch_messages`.
  * @module mcp-server/resources/definitions/ntfy-topic.resource
@@ -15,15 +17,15 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
-import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import {
   getCode,
   getMessage,
-  isAuthCode,
+  isAuthRejection,
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
   retryAfterData,
+  unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { MESSAGE_TRUNCATE_AT, shapeMessage } from '@/services/ntfy/message-shape.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
@@ -52,7 +54,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
     {
       reason: 'forbidden_topic',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'Auth required for the target topic.',
+      when: 'ntfy refused access to the topic with its own 401 or 403 error: the topic needs credentials this server did not send, or the ones it sent lack access.',
       recovery:
         'Try an unprotected topic; if this topic must stay protected, ask the operator to configure ntfy auth (`NTFY_AUTH_TOKEN`, or `NTFY_AUTH_USERNAME` + `NTFY_AUTH_PASSWORD`, or per-host entries in `NTFY_SERVERS`).',
     },
@@ -67,10 +69,10 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
     {
       reason: 'upstream_unreachable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DNS, connection, or network failure reaching the ntfy server after retries were exhausted, or no complete answer within the call deadline.',
+      when: 'A DNS, connection, or network failure or a 5xx answer that outlasted the retries, no complete answer within the call deadline, or a 5xx whose `Retry-After` is longer than the call can wait.',
       retryable: true,
       recovery:
-        'Read the topic again shortly; if it keeps failing, ask the operator to check that the configured `NTFY_BASE_URL` resolves and is reachable from this server.',
+        'When the error carries `retryAfter`, the ntfy server is answering and asked for that wait: read the topic again once it has passed. Otherwise read the topic again shortly; if it keeps failing, ask the operator to check that the configured `NTFY_BASE_URL` resolves and is reachable from this server.',
     },
     {
       reason: 'upstream_malformed',
@@ -104,10 +106,10 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
           retryAfterData(err),
         );
       }
-      if (isAuthCode(code)) {
+      if (isAuthRejection(err)) {
         throw ctx.fail(
           'forbidden_topic',
-          getMessage(err) || `Forbidden for topic ${literal(params.topic)}`,
+          getMessage(err) || `Forbidden for topic "${params.topic}"`,
           undefined,
           { cause: err },
         );
@@ -116,7 +118,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
         throw ctx.fail(
           'upstream_unreachable',
           getMessage(err) || 'ntfy server is unreachable.',
-          undefined,
+          unreachableWaitData(err, 'read the topic again'),
           { cause: err },
         );
       }

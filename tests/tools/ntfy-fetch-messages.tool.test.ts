@@ -4,7 +4,9 @@
  * single-message (`id`) path plus its empty-`id` fallback, the priority
  * schema's single-node validation,
  * sparse upstream payloads (per checklist), error mapping (forbidden /
- * invalid_since / rate_limited / upstream_unreachable / generic rethrow),
+ * invalid_since / rate_limited / upstream_unreachable / generic rethrow), ntfy
+ * 400s that are not about `since` kept unlabeled, the 64-character per-topic
+ * cap and the time its pattern takes on caller-sized text,
  * default-topic resolution, base_url override and its scheme validation,
  * enrichment (topic/since/count/truncated/filters/notice), format() rendering,
  * and — through the real service — `upstream_malformed`, a 429 on the status
@@ -40,6 +42,7 @@ import {
   resetNtfyService,
 } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage } from '@/services/ntfy/types.js';
+import { readCommonMark } from '../helpers/commonmark.js';
 
 const ENV_KEYS = [
   'NTFY_BASE_URL',
@@ -58,6 +61,10 @@ function freshService() {
     maxRetries: 0,
   } as never);
 }
+
+/** The empty-result notice's warning that ntfy may not return a just-published message yet. */
+const JUST_PUBLISHED =
+  'A message published in the last few seconds may not be returned yet, so retry shortly before concluding it is missing.';
 
 /** Stub one `NtfyService.fetch` result: the polled envelopes, and ntfy's replay-cap flag. */
 function stubFetch(svc: NtfyService, messages: NtfyMessage[], upstreamTruncated = false) {
@@ -324,50 +331,60 @@ describe('ntfyFetchMessages handler', () => {
     });
   });
 
-  it('maps Forbidden upstream to reason `forbidden_topic`', async () => {
+  it('names the topic in double quotes, as plain text, when ntfy gave no `forbidden_topic` explanation', async () => {
     const svc = freshService();
-    vi.spyOn(svc, 'fetch').mockRejectedValue(forbidden('Protected topic'));
-    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
-    const input = ntfyFetchMessages.input.parse({ topic: 'protected' });
-    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
+    vi.spyOn(svc, 'fetch').mockRejectedValue(
+      forbidden('', { status: 403, body: '{"code":40301,"http":403,"error":"forbidden"}' }),
+    );
+    const result = await runToolContract(ntfyFetchMessages, { topic: '_secret_' });
+    const { error } = result.structuredContent as {
+      error: { message: string; data: { reason?: string } };
+    };
+    expect(error).toMatchObject({
+      message: 'Forbidden for topic "_secret_"',
       data: { reason: 'forbidden_topic' },
     });
+    expect(
+      readCommonMark(result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n')),
+    ).toContain('Error: Forbidden for topic "_secret_"');
   });
 
-  it('names the topic in a code span when ntfy gave no `forbidden_topic` explanation', async () => {
+  it("maps ntfy's 40008 `invalid since parameter` to `invalid_since`", async () => {
     const svc = freshService();
-    vi.spyOn(svc, 'fetch').mockRejectedValue(forbidden(''));
+    vi.spyOn(svc, 'fetch').mockRejectedValue(
+      invalidParams(
+        'ntfy returned HTTP 400 Bad Request: invalid since parameter (see https://ntfy.sh/docs/subscribe/api/#fetch-cached-messages)',
+        {
+          status: 400,
+          body: '{"code":40008,"http":400,"error":"invalid since parameter","link":"https://ntfy.sh/docs/subscribe/api/#fetch-cached-messages"}',
+        },
+      ),
+    );
     const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
-    const input = ntfyFetchMessages.input.parse({ topic: '_secret_' });
+    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', since: '1d' });
     await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
-      message: 'Forbidden for topic `_secret_`',
-      data: { reason: 'forbidden_topic' },
-    });
-  });
-
-  it('maps a 4xx since-parse failure to `invalid_since`', async () => {
-    const svc = freshService();
-    vi.spyOn(svc, 'fetch').mockRejectedValue(invalidParams('Bad since value'));
-    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
-    const input = ntfyFetchMessages.input.parse({
-      topic: 'alerts',
-      since: 'tomorrow_maybe',
-    });
-    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('invalid since parameter'),
       data: { reason: 'invalid_since' },
     });
   });
 
-  it('names a backticked `since` in a sized span when ntfy gave no explanation', async () => {
-    const svc = freshService();
-    vi.spyOn(svc, 'fetch').mockRejectedValue(invalidParams(''));
-    const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
-    const input = ntfyFetchMessages.input.parse({ topic: 'alerts', since: '2h`x' });
-    await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
-      message: 'Could not parse `since` ``2h`x``.',
-      data: { reason: 'invalid_since' },
-    });
-  });
+  it.each([
+    ['no explanation', ''],
+    ['text that does not name `since`', 'Bad since value'],
+  ])(
+    'never labels a 400 with %s as `invalid_since`, and keeps its message',
+    async (_case, message) => {
+      const svc = freshService();
+      vi.spyOn(svc, 'fetch').mockRejectedValue(invalidParams(message));
+      const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+      const input = ntfyFetchMessages.input.parse({ topic: 'alerts', since: '2h`x' });
+      await expect(ntfyFetchMessages.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message,
+      });
+      await expect(ntfyFetchMessages.handler(input, ctx)).rejects.not.toHaveProperty('data.reason');
+    },
+  );
 
   it('keeps the upstream explanation alongside the `invalid_since` recovery hint', async () => {
     const svc = freshService();
@@ -752,6 +769,83 @@ describe('ntfyFetchMessages against a stubbed ntfy upstream', () => {
     expect(textOf(result)).not.toMatch(/failed after/);
   });
 
+  describe('a 5xx carrying Retry-After (#42)', () => {
+    /** ntfy answering every request 503, with `retry-after` when one is given. */
+    const unavailable = (retryAfter?: string) => () =>
+      new Response('{"code":50301,"http":503,"error":"service unavailable"}', {
+        status: 503,
+        headers: {
+          'content-type': 'application/json',
+          ...(retryAfter === undefined ? {} : { 'retry-after': retryAfter }),
+        },
+      });
+
+    beforeEach(() => {
+      resetNtfyService();
+      initNtfyService({
+        servers: [{ baseUrl: 'https://ntfy.test' }],
+        requestTimeoutMs: 1000,
+        maxRetries: 3,
+      } as never);
+    });
+
+    const DECLARED = ntfyFetchMessages.errors?.find((e) => e.reason === 'upstream_unreachable')
+      ?.recovery as string;
+
+    it('fails a Retry-After the call cannot wait out as `upstream_unreachable`, unretried, naming the wait', async () => {
+      const upstream = stubUpstream(unavailable('120'));
+      const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts' });
+      expect(upstream).toHaveBeenCalledTimes(1);
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.message).toMatch(/^ntfy returned HTTP 503\b.*: service unavailable$/);
+      expect(error.data).toMatchObject({
+        reason: 'upstream_unreachable',
+        retryable: true,
+        retryAfter: '120',
+        recovery: {
+          hint: 'The ntfy server answered but asked to wait (Retry-After: 120); poll again once that wait has passed.',
+        },
+      });
+      expect(error.data).not.toHaveProperty('retryAttempts');
+      const text = readCommonMark(textOf(result));
+      expect(text).toContain('Retry-After: 120); poll again once that wait has passed.');
+      expect(text).toContain('reason upstream_unreachable');
+      expect(text).not.toMatch(/failed after/);
+    });
+
+    it('carries the Retry-After of a ladder the deadline cut short onto `upstream_unreachable`', async () => {
+      const upstream = stubUpstream(unavailable('26'));
+      const result = await onFakeClock(
+        () => runToolContract(ntfyFetchMessages, { topic: 'alerts' }),
+        30_000,
+      );
+      expect(upstream).toHaveBeenCalledTimes(2);
+      const error = errorOf(result);
+      expect(error.message).toContain('(failed after 2 attempts)');
+      expect(error.data).toMatchObject({ reason: 'upstream_unreachable', retryAfter: '26' });
+      expect(error.data.recovery).toMatchObject({
+        hint: expect.stringContaining('Retry-After: 26'),
+      });
+    });
+
+    it('keeps the declared recovery on a 503 with no Retry-After, retried to exhaustion', async () => {
+      const upstream = stubUpstream(unavailable());
+      const result = await onFakeClock(
+        () => runToolContract(ntfyFetchMessages, { topic: 'alerts' }),
+        10_000,
+      );
+      expect(upstream).toHaveBeenCalledTimes(4);
+      const error = errorOf(result);
+      expect(error.message).toContain('(failed after 4 attempts)');
+      expect(error.data.reason).toBe('upstream_unreachable');
+      expect(error.data).not.toHaveProperty('retryAfter');
+      expect(error.data.recovery).toEqual({ hint: DECLARED });
+      expect(DECLARED).toContain('`retryAfter`');
+      expect(DECLARED).toContain('`NTFY_BASE_URL`');
+    });
+  });
+
   it("discloses ntfy's replay cap in the enrichment and a notice on both surfaces", async () => {
     stubUpstream(
       poll(['a', 'b', 'c', 'd', 'e'].map((id, i) => line(id, i + 1)).join('\n'), {
@@ -815,6 +909,202 @@ describe('ntfyFetchMessages against a stubbed ntfy upstream', () => {
     const structured = result.structuredContent as Record<string, unknown>;
     expect(structured).toMatchObject({ count: 0, truncated: false });
     expect(structured.notice).toContain('No messages on topic `alerts`');
+  });
+
+  it('warns on both surfaces that a just-published message may not be returned yet, and keeps the topic hint', async () => {
+    stubUpstream(poll(''));
+    const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts' });
+    const notice = (result.structuredContent as { notice?: string }).notice;
+    expect(notice).toContain('verify the topic name');
+    expect(notice).toContain(JUST_PUBLISHED);
+    const rendered = readCommonMark(textOf(result));
+    expect(rendered).toContain('verify the topic name');
+    expect(rendered).toContain(JUST_PUBLISHED);
+  });
+
+  it('leaves the just-published warning out of a non-empty result', async () => {
+    stubUpstream(poll([line('a', 1), line('b', 2)].join('\n')));
+    const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts', limit: 1 });
+    const notice = (result.structuredContent as { notice?: string }).notice;
+    expect(notice).toContain('newest 1');
+    expect(notice).not.toContain(JUST_PUBLISHED);
+  });
+
+  describe('400 rejections of the poll (#41)', () => {
+    /** ntfy's JSON error envelope, texts and links as in its `server/errors.go`. */
+    const rejection = (code: number, error: string, link?: string) => () =>
+      new Response(JSON.stringify({ code, http: 400, error, ...(link ? { link } : {}) }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      });
+
+    it('labels 40008 `invalid since parameter` as `invalid_since` with the `since` recovery', async () => {
+      stubUpstream(
+        rejection(
+          40008,
+          'invalid since parameter',
+          'https://ntfy.sh/docs/subscribe/api/#fetch-cached-messages',
+        ),
+      );
+      const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts', since: '1d' });
+      const error = errorOf(result);
+      expect(error.data.reason).toBe('invalid_since');
+      expect(error.message).toContain('invalid since parameter');
+      expect(error.data.recovery).toMatchObject({
+        hint: expect.stringContaining('Unix timestamp'),
+      });
+      const rendered = readCommonMark(textOf(result));
+      expect(rendered).toContain('invalid_since');
+      expect(rendered).toContain('Unix timestamp');
+    });
+
+    it.each([
+      [40010, 'invalid request: topic name is not allowed', undefined],
+      [
+        40061,
+        'invalid request: too many topics',
+        'https://ntfy.sh/docs/subscribe/api/#subscribe-to-multiple-topics',
+      ],
+    ])(
+      'keeps %i in ntfy’s own words, with no `invalid_since` label or `since` recovery',
+      async (_code, text, link) => {
+        const upstream = stubUpstream(rejection(_code, text, link));
+        const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts,metrics' });
+        expect(upstream).toHaveBeenCalledTimes(1);
+        expect(result.isError).toBe(true);
+        const error = errorOf(result);
+        expect(error.message).toContain(text);
+        expect(error.data).not.toHaveProperty('reason');
+        expect(JSON.stringify(error.data)).not.toContain('Unix timestamp');
+        const rendered = readCommonMark(textOf(result));
+        expect(rendered).toContain(text);
+        expect(rendered).not.toContain('invalid_since');
+        expect(rendered).not.toContain('Unix timestamp');
+      },
+    );
+  });
+
+  describe("forbidden_topic only on ntfy's own auth envelope (#45)", () => {
+    const AUTH_DOCS = 'https://ntfy.sh/docs/publish/#authentication';
+    const envelope = (status: number, code: number, error: string) =>
+      JSON.stringify({ code, http: status, error, link: AUTH_DOCS });
+    const HINT = ntfyFetchMessages.errors?.find((e) => e.reason === 'forbidden_topic')
+      ?.recovery as string;
+
+    it.each([
+      [401, 40101, 'unauthorized'],
+      [403, 40301, 'forbidden'],
+    ])(
+      "maps ntfy's %i envelope (%i) to `forbidden_topic` on both surfaces",
+      async (status, code, text) => {
+        stubUpstream(
+          () =>
+            new Response(envelope(status, code, text), {
+              status,
+              headers: { 'content-type': 'application/json' },
+            }),
+        );
+        const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts' });
+        const error = errorOf(result);
+        expect(error.data.reason).toBe('forbidden_topic');
+        expect(error.data.recovery).toEqual({ hint: HINT });
+        expect(error.message).toContain(`HTTP ${status}`);
+        expect(error.message).toContain(`${text} (see ${AUTH_DOCS})`);
+        const rendered = readCommonMark(textOf(result));
+        expect(rendered).toContain(`Recovery: ${HINT}`);
+        expect(rendered).toContain('reason forbidden_topic');
+      },
+    );
+
+    it('maps an auth error line ntfy writes into a 200 replay to `forbidden_topic`', async () => {
+      stubUpstream(poll(`${line('a', 1)}\n${envelope(403, 40301, 'forbidden')}`));
+      const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts' });
+      expect(errorOf(result)).toMatchObject({
+        code: JsonRpcErrorCode.Forbidden,
+        data: { reason: 'forbidden_topic' },
+      });
+    });
+
+    it("fails a proxy's HTML 403 without `forbidden_topic`, keeping the status in the message", async () => {
+      const upstream = stubUpstream(
+        () =>
+          new Response(
+            '<html>\n<head><title>403 Forbidden</title></head>\n<body>\n<center><h1>403 Forbidden</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>\n',
+            { status: 403, headers: { 'content-type': 'text/html' } },
+          ),
+      );
+      const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts' });
+      expect(upstream).toHaveBeenCalledTimes(1);
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+      expect(error.data).not.toHaveProperty('reason');
+      expect(error.data).not.toHaveProperty('recovery');
+      expect(error.message).toContain('HTTP 403');
+      const rendered = readCommonMark(textOf(result));
+      expect(rendered).toContain('HTTP 403');
+      expect(rendered).not.toContain('forbidden_topic');
+      expect(rendered).not.toContain('NTFY_AUTH_TOKEN');
+    });
+  });
+
+  describe('per-topic length cap (#41)', () => {
+    const t64 = `${'a'.repeat(63)}Z`;
+    const t65 = 'b'.repeat(65);
+
+    it.each([
+      ['alone', t64],
+      ['first in a list', `${t64},alerts`],
+      ['last in a list', `alerts,${t64}`],
+      ['twice', `${t64},${t64}`],
+    ])('polls a 64-character topic %s', async (_where, topic) => {
+      const upstream = stubUpstream(poll(''));
+      const result = await runToolContract(ntfyFetchMessages, { topic });
+      expect(result.isError).toBeFalsy();
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect((result.structuredContent as { topic: string }).topic).toBe(topic);
+    });
+
+    it.each([
+      ['alone', t65],
+      ['first in a list', `${t65},alerts`],
+      ['last in a list', `alerts,${t65}`],
+      ['beside a 64-character one', `${t64},${t65}`],
+    ])(
+      'refuses a 65-character topic %s, naming the 64-character limit, before any request',
+      async (_where, topic) => {
+        const upstream = stubUpstream(poll(''));
+        const result = await runToolContract(ntfyFetchMessages, { topic });
+        expect(result.isError).toBe(true);
+        const error = errorOf(result);
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.message).toContain('1 to 64 characters');
+        expect(readCommonMark(textOf(result))).toContain('1 to 64 characters');
+        expect(upstream).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['', ' ', 'alerts,', ',alerts', 'alerts,,backups'])(
+      'still refuses %j before any request',
+      async (topic) => {
+        const upstream = stubUpstream(poll(''));
+        const result = await runToolContract(ntfyFetchMessages, { topic });
+        expect(result.isError).toBe(true);
+        expect(errorOf(result).code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(upstream).not.toHaveBeenCalled();
+      },
+    );
+
+    it('advertises the cap in the `topic` pattern of `tools/list`, with no cap on the topic count', () => {
+      const schema = z.toJSONSchema(ntfyFetchMessages.input, { io: 'input' }) as unknown as {
+        properties: { topic: { pattern: string; maxLength?: number } };
+      };
+      const pattern = new RegExp(schema.properties.topic.pattern);
+      expect(pattern.test(t64)).toBe(true);
+      expect(pattern.test(Array.from({ length: 200 }, () => t64).join(','))).toBe(true);
+      expect(pattern.test(t65)).toBe(false);
+      expect(pattern.test(`alerts,${t65}`)).toBe(false);
+      expect(schema.properties.topic.maxLength).toBeUndefined();
+    });
   });
 
   /**
@@ -964,15 +1254,18 @@ describe('ntfyFetchMessages against a stubbed ntfy upstream', () => {
       expect(textOf(result)).toContain('**Filters:** title=``a`b``, tags=[``t`1``]');
     });
 
-    it('wraps a backticked `cursor` in a sized span in the `cursor_not_found` message', async () => {
+    it('quotes a backticked `cursor` as plain text in the `cursor_not_found` message, on both surfaces', async () => {
       stubUpstream(ndjson(envelope('m1', { message: 'one' })));
       const result = await runToolContract(ntfyFetchMessages, {
         topic: 'alerts',
         since: 'all',
-        cursor: 'gone`id',
+        cursor: 'gone`*id*',
       });
+      const message =
+        'Cursor "gone`*id*" names none of the 1 messages in the window for topic "alerts" (since "all").';
       expect(errorOf(result).data.reason).toBe('cursor_not_found');
-      expect(errorOf(result).message).toContain('Cursor ``gone`id`` names none of the 1 messages');
+      expect(errorOf(result).message).toBe(message);
+      expect(readCommonMark(textOf(result))).toContain(`Error: ${message}`);
     });
   });
 });
@@ -1395,7 +1688,7 @@ describe('ntfyFetchMessages filters and paging against a fake ntfy window', () =
           error: { message: string; data: { reason: string } };
         };
         expect(error.data.reason).toBe('cursor_not_found');
-        expect(error.message).toContain(`(since \`${start}\``);
+        expect(error.message).toContain(`(since "${start}", where the walk began)`);
       });
 
       it.each([
@@ -1467,8 +1760,10 @@ describe('ntfyFetchMessages filters and paging against a fake ntfy window', () =
           totalCount: 150,
           nextCursor: `m041@${start}`,
         });
-        expect(text).toContain(`**since:** ${start}`);
-        expect(text).toContain(`**nextCursor:** m041@${start}`);
+        // Enrichment string values render as code literals, so a copied cursor carries no escapes.
+        const rendered = readCommonMark(text);
+        expect(rendered).toContain(`⟨strong⟩since:⟨/strong⟩ ⟨code_inline:${start}⟩`);
+        expect(rendered).toContain(`⟨strong⟩nextCursor:⟨/strong⟩ ⟨code_inline:m041@${start}⟩`);
         expect(structured.notice).toContain(`\`cursor\` set to \`m041@${start}\``);
         expect(structured.notice).toContain('same `topic`, `since`, and filters');
         expect(text).toContain(`\`cursor\` set to \`m041@${start}\``);
@@ -1578,7 +1873,9 @@ describe('ntfyFetchMessages filters and paging against a fake ntfy window', () =
         expect(text).toContain(`**totalCount:** ${n}`);
         if (next) {
           expect(structured.nextCursor).toBe(next);
-          expect(text).toContain(`**nextCursor:** ${next}`);
+          expect(readCommonMark(text)).toContain(
+            `⟨strong⟩nextCursor:⟨/strong⟩ ⟨code_inline:${next}⟩`,
+          );
         } else {
           expect(structured).not.toHaveProperty('nextCursor');
           expect(text).not.toContain('nextCursor:');
@@ -1701,5 +1998,57 @@ describe('isDuration on caller-sized `since` text', () => {
     const largeMs = cpuMs(make(large), 1);
     expect(largeMs).toBeLessThan(CPU_LIMIT_MS);
     expect(largeMs / smallPerCallMs).toBeLessThan(256);
+  });
+});
+
+describe('the `topic` pattern on caller-sized text (#41)', () => {
+  const topic = ntfyFetchMessages.input.shape.topic;
+  /** Per-call CPU budget at every size; a run past it already fails, so the remaining runs are skipped. */
+  const CPU_LIMIT_MS = 50;
+
+  /** Thread CPU milliseconds per schema parse of `input` over `reps` parses: the least of up to three runs. */
+  function cpuMsPerCall(input: string, reps: number): number {
+    let least = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < 3; run++) {
+      const start = process.threadCpuUsage();
+      for (let i = 0; i < reps; i++) topic.safeParse(input);
+      const { user, system } = process.threadCpuUsage(start);
+      least = Math.min(least, (user + system) / 1000 / reps);
+      if (least > CPU_LIMIT_MS) break;
+    }
+    return least;
+  }
+
+  /**
+   * Each shape doubles from `small` to 64× `small`, checking the per-call budget
+   * at each size before the next, so a quadratic regression fails at its first
+   * oversized step instead of running the 64× input. A linear matcher grows about
+   * 64× across the span and a quadratic one about 4096×. Shapes the pattern
+   * scans end to end stay under ~80k characters, where Bun's regex engine leaves
+   * its JIT for a slower interpreter; the digit run carries the 5k → 320k span.
+   */
+  it.each([
+    ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`, 5_000],
+    ['line breaks throughout', (n: number) => '  \r\n'.repeat(n / 4), 5_000],
+    ['one long digit run', (n: number) => '9'.repeat(n), 5_000],
+    [
+      '64-character topics closed by a bad character',
+      (n: number) => `${`${'a'.repeat(64)},`.repeat(Math.floor(n / 65))}!`,
+      1_250,
+    ],
+    [
+      'one-character topics closed by a bad character',
+      (n: number) => `${'a,'.repeat(n / 2)}!`,
+      1_250,
+    ],
+  ])('rejects %s in time linear in its length', (_shape, make, small) => {
+    expect(topic.safeParse(make(small)).success).toBe(false);
+    const smallMs = cpuMsPerCall(make(small), 64);
+    let largeMs = smallMs;
+    for (let n = small * 2; n <= small * 64; n *= 2) {
+      largeMs = cpuMsPerCall(make(n), Math.max(1, (64 * small) / n));
+      expect(largeMs).toBeLessThan(CPU_LIMIT_MS);
+    }
+    expect(largeMs / smallMs).toBeLessThan(256);
   });
 });
