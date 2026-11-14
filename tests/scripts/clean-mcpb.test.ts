@@ -1,9 +1,10 @@
 /**
  * @fileoverview Tests for the MCPB agent-doc selector shared by
  * `scripts/clean-mcpb.ts` (the strip step) and `scripts/lint-packaging.ts`
- * (the post-bundle check): runtime `skills/` modules nested inside a package
- * survive, package-root agent trees and `SKILL.md` files are selected, and the
- * two copies of `AGENT_DOC_ENTRY` select the same entries.
+ * (the post-bundle check): runtime `skills/` modules and docs nested inside a
+ * package survive; package-root agent trees, package-root `AGENTS.md` /
+ * `CLAUDE.md`, and `SKILL.md` files are selected; and the two copies of
+ * `AGENT_DOC_ENTRY` select the same entries.
  * @module tests/scripts/clean-mcpb
  */
 
@@ -29,6 +30,8 @@ const RUNTIME_ENTRIES = [
   'node_modules/feature/dist/skills/worker.js',
   'node_modules/skills/index.js',
   'node_modules/@scope/skills/index.js',
+  'node_modules/example/docs/AGENTS.md',
+  'node_modules/@scope/child/lib/CLAUDE.md',
   'skills/ntfy-guide/SKILL.md',
   'dist/index.js',
 ];
@@ -41,6 +44,9 @@ const AGENT_DOC_ENTRIES = [
   'node_modules/@scope/parent/node_modules/child/.claude/settings.json',
   'node_modules/example/.agents/skills/guide/SKILL.md',
   'node_modules/example/docs/SKILL.md',
+  'node_modules/example/AGENTS.md',
+  'node_modules/@cyanheads/mcp-ts-core/CLAUDE.md',
+  'node_modules/parent/node_modules/@scope/child/AGENTS.md',
 ];
 
 describe('MCPB agent-doc selector', () => {
