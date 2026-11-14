@@ -641,6 +641,32 @@ or by simply providing traccar with a valid username/password combination.
         <entry key='sms.http.password'>mypass</entry>
 ```
 
+## Flowtriq DDoS detection
+[Flowtriq](https://flowtriq.com) is a real-time DDoS detection and mitigation platform. Its Linux agent, ftagent,
+supports webhook alerts that can POST directly to an ntfy topic, so you get push notifications on your phone
+whenever an attack is detected.
+
+Configure the webhook URL in your ftagent configuration to point to your ntfy topic:
+
+```yaml
+# /etc/ftagent/ftagent.yml
+alerts:
+  webhooks:
+    - url: https://ntfy.sh/flowtriq-attacks
+      method: POST
+```
+
+You can also use curl to test the integration manually with a sample attack alert:
+
+```bash
+curl \
+  -H "Title: DDoS Attack Detected" \
+  -H "Priority: urgent" \
+  -H "Tags: rotating_light" \
+  -d "Attack detected on 203.0.113.5: 14.2 Gbps UDP flood from 3,482 sources" \
+  ntfy.sh/flowtriq-attacks
+```
+
 ## Terminal Notifications for Long-Running Commands
 
 This example provides a simple way to send notifications using [ntfy.sh](https://ntfy.sh) when a terminal command completes. It includes success or failure indicators based on the command's exit status.

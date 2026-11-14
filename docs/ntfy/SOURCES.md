@@ -7,9 +7,9 @@ These files are a verbatim copy of the [`binwiederhier/ntfy`](https://github.com
 | Field | Value |
 |:------|:------|
 | Repo | [`binwiederhier/ntfy`](https://github.com/binwiederhier/ntfy) |
-| Commit | [`802c0a4c`](https://github.com/binwiederhier/ntfy/commit/802c0a4c303d76db911d5f83c17320651efdf84d) |
-| Date | 2026-04-27 |
-| Mirrored | 2026-05-08 |
+| Commit | [`9c29e255`](https://github.com/binwiederhier/ntfy/commit/9c29e255795e6783e0de08759a7f9c2e3c5a6b02) |
+| Date | 2026-11-13 |
+| Mirrored | 2026-11-13 |
 
 ## Files
 

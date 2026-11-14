@@ -1,7 +1,7 @@
 # Publishing
 Publishing messages can be done via HTTP PUT/POST or via the [ntfy CLI](subscribe/cli.md#publish-messages) ([install instructions](install.md)).
 Topics are created on the fly by subscribing or publishing to them. Because there is no sign-up, **the topic is essentially a password**, so pick 
-something that's not easily guessable.
+something that's not easily guessable (see [picking a topic](#picking-a-topic) for a handy topic name generator).
 
 Here's an example showing how to publish a simple message using a POST request:
 
@@ -307,6 +307,44 @@ an [external image attachment](#attach-file-from-a-url) and [email publishing](#
   ![priority notification](static/img/android-screenshot-notification-multiline.jpg){ width=500 }
   <figcaption>Notification using a click action, a user action, with an external image attachment and forwarded via email</figcaption>
 </figure>
+
+## Picking a topic
+Since there is no sign-up, **the topic is essentially a password**, so pick something that's not easily guessable. Topic names may
+only contain letters, numbers, underscores and dashes (`[-_A-Za-z0-9]`), and may be up to 64 characters long.
+
+Not sure what to pick? Type a name below and the generator will add a random, hard-to-guess suffix for you. Everything happens locally in your browser:
+
+<div id="tg-widget" class="tg-generator">
+<div class="tg-header">
+<span class="tg-title">Topic name generator</span>
+<button type="button" id="tg-reroll" class="tg-reset" title="Generate a new random suffix">Regenerate suffix</button>
+</div>
+<div class="tg-body">
+<div class="tg-left">
+<div class="tg-field">
+<label for="tg-input">Type a topic name</label>
+<input type="text" id="tg-input" placeholder="e.g. backups, alerts, phil-home" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+</div>
+<div class="tg-note">Spaces and characters other than letters, numbers, <code>-</code> and <code>_</code> are removed automatically as you type. Names are capped at 64 characters.</div>
+</div>
+<div class="tg-right">
+<div class="tg-output-row">
+<span class="tg-output-label">Your topic:</span>
+<div class="tg-output-line">
+<pre class="tg-output" id="tg-output-name"></pre>
+<button type="button" class="tg-btn-copy" data-copy="tg-output-name" title="Copy to clipboard"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>
+</div>
+</div>
+<div class="tg-output-row">
+<span class="tg-output-label">Your topic URL:</span>
+<div class="tg-output-line">
+<pre class="tg-output" id="tg-output-url">https://ntfy.sh/</pre>
+<button type="button" class="tg-btn-copy" data-copy="tg-output-url" title="Copy to clipboard"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>
+</div>
+</div>
+</div>
+</div>
+</div>
 
 ## Message title
 _Supported on:_ :material-android: :material-apple: :material-firefox:
@@ -628,7 +666,7 @@ them with a comma, e.g. `tag1,tag2,tag3`.
 _Supported on:_ :material-android: :material-firefox:
 
 You can format messages using [Markdown](https://www.markdownguide.org/basic-syntax/) 🤩. That means you can use 
-**bold text**, *italicized text*, links, images, and more. Supported Markdown features (web app only for now):
+**bold text**, *italicized text*, links, images, and more. Supported Markdown features:
 
 - [Emphasis](https://www.markdownguide.org/basic-syntax/#emphasis) such as **bold** (`**bold**`), *italics* (`*italics*`)
 - [Links](https://www.markdownguide.org/basic-syntax/#links) (`[some tool](https://ntfy.sh)`)
@@ -932,7 +970,7 @@ Here's an example of how it will look on Android:
 </figure>
 
 ## Attachments
-_Supported on:_ :material-android: :material-firefox:
+_Supported on:_ :material-android: :material-apple: :material-firefox:
 
 You can **send images and other files to your phone** as attachments to a notification. The attachments are then downloaded
 onto your phone (depending on size and setting automatically), and can be used from the Downloads folder.
@@ -2553,9 +2591,22 @@ You can delay the delivery of messages and let ntfy send them at a later date. T
 reminders or even to execute commands at a later date (if your subscriber acts on messages).
 
 Usage is pretty straight forward. You can set the delivery time using the `X-Delay` header (or any of its aliases: `Delay`, 
-`X-At`, `At`, `X-In` or `In`), either by specifying a Unix timestamp (e.g. `1639194738`), a duration (e.g. `30m`, 
-`3h`, `2 days`), or a natural language time string (e.g. `10am`, `8:30pm`, `tomorrow, 3pm`, `Tuesday, 7am`, 
-[and more](https://github.com/olebedev/when)). 
+`X-At`, `At`, `X-In` or `In`), either by specifying a Unix timestamp (e.g. `1639194738`), an RFC3339/ISO-8601 absolute
+ timestamp (e.g. `2026-09-02T10:00:00Z`), a duration (e.g. `30m`, `3h`, `2 days`), or a natural language time string 
+(e.g. `10am`, `8:30pm`, `tomorrow, 3pm`, `Tuesday, 7am`, [and more](https://github.com/olebedev/when)). 
+
+To interpret a natural language time in a specific timezone, set the `X-Timezone` header
+(alias: `Timezone`), the `timezone` query parameter, or the `timezone` JSON field to an
+IANA timezone name such as `Asia/Tokyo` or `America/New_York`:
+
+```
+curl -H "At: tomorrow, 10am" -H "Timezone: Asia/Tokyo" -d "Good morning" ntfy.sh/hello
+```
+
+Without a timezone, the server's local timezone is used as before. The web app sends your
+browser's timezone automatically when scheduling a message. Relative durations such as
+`1h` and Unix timestamps still refer to the same instant regardless of timezone. Invalid
+timezone names return HTTP 400 when a delay is supplied; without a delay, the timezone is ignored.
 
 As of today, the minimum delay you can set is **10 seconds** and the maximum delay is **3 days**. This can be configured
 with the `message-delay-limit` option.
@@ -2569,6 +2620,7 @@ to be delivered in 3 days, it'll remain in the cache for 3 days and 12 hours. Al
     ```
     curl -H "At: tomorrow, 10am" -d "Good morning" ntfy.sh/hello
     curl -H "In: 30min" -d "It's 30 minutes later now" ntfy.sh/reminder
+    curl -H "Delay: 2026-09-02T10:00:00Z" -d "RFC3339 timestamps are awesome" ntfy.sh/itsarfc3339system
     curl -H "Delay: 1639194738" -d "Unix timestamps are awesome" ntfy.sh/itsaunixsystem
     ```
 
@@ -2647,6 +2699,7 @@ Here are a few examples (assuming today's date is **12/10/2021, 9am, Eastern Tim
     <tr><td><code>1 day</code></td><td>12/<b>11</b>/2021, 9am</td><td>24 hours from now</td></tr>
     <tr><td><code>10am</code></td><td>12/10/2021, <b>10am</b></td><td>Today at 10am (same day, because it's only 9am)</td></tr>
     <tr><td><code>8am</code></td><td>12/<b>11</b>/2021, <b>8am</b></td><td>Tomorrow at 8am (because it's 9am already)</td></tr>
+    <tr><td><code>2026-12-10T11:00:00-05:00</code></td><td>12/10/2026, <b>11am</b> (EST)</td><td>Absolute RFC3339 timestamp with timezone offset</td></tr>
     <tr><td><code>1639152000</code></td><td>12/10/2021, 11am (EST)</td><td> Today at 11am (EST)</td></tr>
     </tbody></table>
 </td>
@@ -2777,16 +2830,20 @@ Here's an example of a dead man's switch that sends an alert if the script stops
 ### Canceling scheduled notifications
 
 You can cancel a scheduled message before it is delivered by sending a DELETE request to the 
-`/<topic>/<sequence_id>` endpoint, just like [deleting notifications](#deleting-notifications). This will remove the 
-scheduled message from the server so it will never be delivered, and emit a `message_delete` event to any subscribers.
+`/<topic>/<sequence_id>` endpoint, just like [deleting notifications](#deleting-notifications). Alternatively, you can send a `GET`
+request to `/<topic>/<sequence_id>/delete`. This will remove the scheduled message from the server so it will never be delivered,
+and emit a `message_delete` event to any subscribers.
 
 === "Command line (curl)"
     ```bash
     # Schedule a reminder for 2 hours from now
     curl -H "In: 2h" -d "Take a break!" ntfy.sh/mytopic/break-reminder
 
-    # Changed your mind? Cancel the scheduled message
+    # Changed your mind? Cancel the scheduled message via DELETE
     curl -X DELETE ntfy.sh/mytopic/break-reminder
+
+    # Or cancel it via GET
+    curl ntfy.sh/mytopic/break-reminder/delete
     ```
 
 === "ntfy CLI"
@@ -3182,6 +3239,14 @@ You can use the following features in your templates:
 A good way to experiment with Go templates is the **[Go Template Playground](https://repeatit.io)**. It is _highly recommended_ to test
 your templates there first ([example for Grafana alert](https://repeatit.io/#/share/eyJ0ZW1wbGF0ZSI6InRpdGxlPUdyYWZhbmErYWxlcnQ6K3t7LnRpdGxlfX0mbWVzc2FnZT17ey5tZXNzYWdlfX0iLCJpbnB1dCI6IntcbiAgXCJyZWNlaXZlclwiOiBcIm50ZnlcXFxcLmV4YW1wbGVcXFxcLmNvbS9hbGVydHNcIixcbiAgXCJzdGF0dXNcIjogXCJyZXNvbHZlZFwiLFxuICBcImFsZXJ0c1wiOiBbXG4gICAge1xuICAgICAgXCJzdGF0dXNcIjogXCJyZXNvbHZlZFwiLFxuICAgICAgXCJsYWJlbHNcIjoge1xuICAgICAgICBcImFsZXJ0bmFtZVwiOiBcIkxvYWQgYXZnIDE1bSB0b28gaGlnaFwiLFxuICAgICAgICBcImdyYWZhbmFfZm9sZGVyXCI6IFwiTm9kZSBhbGVydHNcIixcbiAgICAgICAgXCJpbnN0YW5jZVwiOiBcIjEwLjEwOC4wLjI6OTEwMFwiLFxuICAgICAgICBcImpvYlwiOiBcIm5vZGUtZXhwb3J0ZXJcIlxuICAgICAgfSxcbiAgICAgIFwiYW5ub3RhdGlvbnNcIjoge1xuICAgICAgICBcInN1bW1hcnlcIjogXCIxNW0gbG9hZCBhdmVyYWdlIHRvbyBoaWdoXCJcbiAgICAgIH0sXG4gICAgICBcInN0YXJ0c0F0XCI6IFwiMjAyNC0wMy0xNVQwMjoyODowMFpcIixcbiAgICAgIFwiZW5kc0F0XCI6IFwiMjAyNC0wMy0xNVQwMjo0MjowMFpcIixcbiAgICAgIFwiZ2VuZXJhdG9yVVJMXCI6IFwibG9jYWxob3N0OjMwMDAvYWxlcnRpbmcvZ3JhZmFuYS9OVzlvRHctNHovdmlld1wiLFxuICAgICAgXCJmaW5nZXJwcmludFwiOiBcImJlY2JmYjk0YmQ4MWVmNDhcIixcbiAgICAgIFwic2lsZW5jZVVSTFwiOiBcImxvY2FsaG9zdDozMDAwL2FsZXJ0aW5nL3NpbGVuY2UvbmV3P2FsZXJ0bWFuYWdlcj1ncmFmYW5hJm1hdGNoZXI9YWxlcnRuYW1lJTNETG9hZCthdmcrMTVtK3RvbytoaWdoJm1hdGNoZXI9Z3JhZmFuYV9mb2xkZXIlM0ROb2RlK2FsZXJ0cyZtYXRjaGVyPWluc3RhbmNlJTNEMTAuMTA4LjAuMiUzQTkxMDAmbWF0Y2hlcj1qb2IlM0Rub2RlLWV4cG9ydGVyXCIsXG4gICAgICBcImRhc2hib2FyZFVSTFwiOiBcIlwiLFxuICAgICAgXCJwYW5lbFVSTFwiOiBcIlwiLFxuICAgICAgXCJ2YWx1ZXNcIjoge1xuICAgICAgICBcIkJcIjogMTguOTgyMTEzMTQ0NzU4NzYsXG4gICAgICAgIFwiQ1wiOiAwXG4gICAgICB9LFxuICAgICAgXCJ2YWx1ZVN0cmluZ1wiOiBcIlsgdmFyPSdCJyBsYWJlbHM9e19fbmFtZV9fPW5vZGVfbG9hZDE1LCBpbnN0YW5jZT0xMC4xMDguMC4yOjkxMDAsIGpvYj1ub2RlLWV4cG9ydGVyfSB2YWx1ZT0xOC45ODIxMTMxNDQ3NTg3NiBdLCBbIHZhcj0nQycgbGFiZWxzPXtfX25hbWVfXz1ub2RlX2xvYWQxNSwgaW5zdGFuY2U9MTAuMTA4LjAuMjo5MTAwLCBqb2I9bm9kZS1leHBvcnRlcn0gdmFsdWU9MCBdXCJcbiAgICB9XG4gIF0sXG4gIFwiZ3JvdXBMYWJlbHNcIjoge1xuICAgIFwiYWxlcnRuYW1lXCI6IFwiTG9hZCBhdmcgMTVtIHRvbyBoaWdoXCIsXG4gICAgXCJncmFmYW5hX2ZvbGRlclwiOiBcIk5vZGUgYWxlcnRzXCJcbiAgfSxcbiAgXCJjb21tb25MYWJlbHNcIjoge1xuICAgIFwiYWxlcnRuYW1lXCI6IFwiTG9hZCBhdmcgMTVtIHRvbyBoaWdoXCIsXG4gICAgXCJncmFmYW5hX2ZvbGRlclwiOiBcIk5vZGUgYWxlcnRzXCIsXG4gICAgXCJpbnN0YW5jZVwiOiBcIjEwLjEwOC4wLjI6OTEwMFwiLFxuICAgIFwiam9iXCI6IFwibm9kZS1leHBvcnRlclwiXG4gIH0sXG4gIFwiY29tbW9uQW5ub3RhdGlvbnNcIjoge1xuICAgIFwic3VtbWFyeVwiOiBcIjE1bSBsb2FkIGF2ZXJhZ2UgdG9vIGhpZ2hcIlxuICB9LFxuICBcImV4dGVybmFsVVJMXCI6IFwibG9jYWxob3N0OjMwMDAvXCIsXG4gIFwidmVyc2lvblwiOiBcIjFcIixcbiAgXCJncm91cEtleVwiOiBcInt9OnthbGVydG5hbWU9XFxcIkxvYWQgYXZnIDE1bSB0b28gaGlnaFxcXCIsIGdyYWZhbmFfZm9sZGVyPVxcXCJOb2RlIGFsZXJ0c1xcXCJ9XCIsXG4gIFwidHJ1bmNhdGVkQWxlcnRzXCI6IDAsXG4gIFwib3JnSWRcIjogMSxcbiAgXCJ0aXRsZVwiOiBcIltSRVNPTFZFRF0gTG9hZCBhdmcgMTVtIHRvbyBoaWdoIE5vZGUgYWxlcnRzICgxMC4xMDguMC4yOjkxMDAgbm9kZS1leHBvcnRlcilcIixcbiAgXCJzdGF0ZVwiOiBcIm9rXCIsXG4gIFwibWVzc2FnZVwiOiBcIioqUmVzb2x2ZWQqKlxcblxcblZhbHVlOiBCPTE4Ljk4MjExMzE0NDc1ODc2LCBDPTBcXG5MYWJlbHM6XFxuIC0gYWxlcnRuYW1lID0gTG9hZCBhdmcgMTVtIHRvbyBoaWdoXFxuIC0gZ3JhZmFuYV9mb2xkZXIgPSBOb2RlIGFsZXJ0c1xcbiAtIGluc3RhbmNlID0gMTAuMTA4LjAuMjo5MTAwXFxuIC0gam9iID0gbm9kZS1leHBvcnRlclxcbkFubm90YXRpb25zOlxcbiAtIHN1bW1hcnkgPSAxNW0gbG9hZCBhdmVyYWdlIHRvbyBoaWdoXFxuU291cmNlOiBsb2NhbGhvc3Q6MzAwMC9hbGVydGluZy9ncmFmYW5hL05XOW9Edy00ei92aWV3XFxuU2lsZW5jZTogbG9jYWxob3N0OjMwMDAvYWxlcnRpbmcvc2lsZW5jZS9uZXc/YWxlcnRtYW5hZ2VyPWdyYWZhbmEmbWF0Y2hlcj1hbGVydG5hbWUlM0RMb2FkK2F2ZysxNW0rdG9vK2hpZ2gmbWF0Y2hlcj1ncmFmYW5hX2ZvbGRlciUzRE5vZGUrYWxlcnRzJm1hdGNoZXI9aW5zdGFuY2UlM0QxMC4xMDguMC4yJTNBOTEwMCZtYXRjaGVyPWpvYiUzRG5vZGUtZXhwb3J0ZXJcXG5cIlxufVxuIiwiY29uZmlnIjp7InRlbXBsYXRlIjoidGV4dCIsImZ1bGxTY3JlZW5IVE1MIjpmYWxzZSwiZnVuY3Rpb25zIjpbInNwcmlnIl0sIm9wdGlvbnMiOlsibGl2ZSJdLCJpbnB1dFR5cGUiOiJ5YW1sIn19)).
 
+!!! info
+    A few Go template features are disabled for user-supplied templates: `{{define}}`, `{{template}}`,
+    `{{block}}`, and `{{call}}` are not allowed. Templates also run with a short execution time limit --
+    a template that loops too long is stopped and rejected with an HTTP 400 error. Templates are
+    limited to 32 KB in size, `printf` widths and precisions must be below 1000 (`%999d` is
+    allowed, `%1000d` is not), including the `%*d` form that takes the width from an argument, and
+    `indent`/`nindent` are limited to 100 spaces.
+
 ### Template functions
 ntfy supports a subset of the **[Sprig template functions](publish/template-functions.md)** (originally copied from [Sprig](https://github.com/Masterminds/sprig),
 thank you to the Sprig developers 🙏). This is useful for advanced message templating and for transforming the data provided through the JSON payload.
@@ -3213,8 +3278,13 @@ You can forward messages to e-mail by specifying an address in the header. This 
 you'd like to persist longer, or to blast-notify yourself on all possible channels. 
 
 Usage is easy: Simply pass the `X-Email` header (or any of its aliases: `X-E-mail`, `Email`, `E-mail`, `Mail`, or `e`).
-Only one e-mail address is supported. If the server has [`smtp-sender-verify`](config.md#e-mail-notifications) enabled (ntfy.sh has this enabled),
-you can also pass `yes`, `true`, or `1` to send to your first verified email address.
+Only one e-mail address is supported.
+
+If you are logged in and have a verified email address on your account, you can pass `yes`, `true`, or `1` instead of an
+address to send to your **primary email address** (the one marked primary in the web app's
+[Account section](https://ntfy.sh/account)); if you haven't designated a primary, it falls back to your first verified
+address. This works regardless of the [`smtp-sender-verify`](config.md#e-mail-notifications) setting -- that setting only
+controls whether *literal* addresses must already be verified on your account.
 
 ntfy allows anonymous email sending (if enabled), so the rate limiting is pretty strict (see [limitations](#limitations)). In the
 default configuration, you get **16 e-mails per visitor** (IP address) and then after that one per hour. On top of
@@ -3664,7 +3734,8 @@ all the supported fields:
 | `icon`        | -        | *string*                         | `https://example.com/icon.png`            | URL to use as notification [icon](#icons)                                                 |
 | `filename`    | -        | *string*                         | `file.jpg`                                | File name of the attachment                                                               |
 | `delay`       | -        | *string*                         | `30min`, `9am`                            | Timestamp or duration for delayed delivery                                                |
-| `email`       | -        | *e-mail address or 'yes'*        | `phil@example.com` or `yes`               | E-mail address for e-mail notifications, or `yes` to use first verified address           |
+| `timezone`    | -        | *string*                         | `Asia/Tokyo`                             | Timezone for natural language delayed delivery times                                      |
+| `email`       | -        | *e-mail address or 'yes'*        | `phil@example.com` or `yes`               | E-mail address for e-mail notifications, or `yes` to use your primary verified address    |
 | `call`        | -        | *phone number or 'yes'*          | `+1222334444` or `yes`                    | Phone number to use for [voice call](#phone-calls)                                        |
 | `sequence_id` | -        | *string*                         | `my-sequence-123`                         | Sequence ID for [updating/deleting notifications](#updating-deleting-notifications)   |
 
@@ -4100,26 +4171,41 @@ field the response. A sequence of updates may look like this (first example from
 ### Clearing notifications
 Clearing a notification means **marking it as read and dismissing it from the notification drawer**. 
 
-To do this, send a PUT request to the `/<topic>/<sequence_id>/clear` endpoint (or `/<topic>/<sequence_id>/read` as an alias). 
+To do this, send a `PUT` request to the `/<topic>/<sequence_id>/clear` endpoint (or `/<topic>/<sequence_id>/read` as an alias).
 This will then emit a `message_clear` event that is used by the clients (web app and Android app) to update the read status
 and dismiss the notification.
 
+Alternatively, if your client has limited HTTP support, you can send a `GET` request to the same endpoints:
+`GET /<topic>/<sequence_id>/clear` or `GET /<topic>/<sequence_id>/read`.
+
 === "Command line (curl)"
     ```bash
+    # Via PUT method
     curl -X PUT ntfy.sh/mytopic/my-download-123/clear
+
+    # Via GET method
+    curl ntfy.sh/mytopic/my-download-123/clear
     ```
 
 === "HTTP"
     ``` http
     PUT /mytopic/my-download-123/clear HTTP/1.1
     Host: ntfy.sh
+
+    # Or using GET
+    GET /mytopic/my-download-123/clear HTTP/1.1
+    Host: ntfy.sh
     ```
 
 === "JavaScript"
     ``` javascript
+    // Via PUT method
     await fetch('https://ntfy.sh/mytopic/my-download-123/clear', {
       method: 'PUT'
     });
+
+    // Via GET method
+    await fetch('https://ntfy.sh/mytopic/my-download-123/clear');
     ```
 
 === "Go"
@@ -4154,25 +4240,40 @@ An example response from the server with the `message_clear` event may look like
 ### Deleting notifications
 Deleting a notification means **removing it from the notification drawer and from the client's database**.
 
-To do this, send a DELETE request to the `/<topic>/<sequence_id>` endpoint. This will emit a `message_delete` event
+To do this, send a `DELETE` request to the `/<topic>/<sequence_id>` endpoint. This will emit a `message_delete` event
 that is used by the clients (web app and Android app) to remove the notification entirely.
+
+Alternatively, if your client has limited HTTP support (e.g. webhooks or IoT devices), you can also delete a message by sending
+a `GET` request to `/<topic>/<sequence_id>/delete`.
 
 === "Command line (curl)"
     ```bash
+    # Via DELETE method
     curl -X DELETE ntfy.sh/mytopic/my-download-123
+
+    # Via GET method
+    curl ntfy.sh/mytopic/my-download-123/delete
     ```
 
 === "HTTP"
     ``` http
     DELETE /mytopic/my-download-123 HTTP/1.1
     Host: ntfy.sh
+
+    # Or using GET
+    GET /mytopic/my-download-123/delete HTTP/1.1
+    Host: ntfy.sh
     ```
 
 === "JavaScript"
     ``` javascript
+    // Via DELETE method
     await fetch('https://ntfy.sh/mytopic/my-download-123', {
       method: 'DELETE'
     });
+
+    // Via GET method
+    await fetch('https://ntfy.sh/mytopic/my-download-123/delete');
     ```
 
 === "Go"
@@ -4611,6 +4712,13 @@ authParam  = base64_raw(authHeader) // -> QmFzaWMgZEdWemRIVnpaWEk2Wm1GclpYQmhjM0
 // If your language does not have a function to encode raw base64, simply use normal base64
 // and REMOVE TRAILING "=" characters. 
 ```
+You can use following one liner to create `auth` parameter from ntfy token using powershell:
+``` powershell
+(Read-Host -Prompt 'Enter Ntfy token' | ForEach-Object { ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(":$_"))))) }).TrimEnd('=')
+
+# If you have base64 module installed
+(Read-Host -Prompt "Enter Ntfy token" | ForEach-Object { ":$_" } | ConvertTo-Base64 | ForEach-Object { "Basic $_" } | ConvertTo-Base64 ).TrimEnd('=')
+```
 
 The following command will generate the appropriate value for you on *nix systems:
 
@@ -4846,11 +4954,16 @@ but just in case, let's list them all:
 | **Subscription limit**     | By default, the server allows each visitor to keep 30 connections to the server open.                                                                                                                                   |
 | **Attachment size limit**  | By default, the server allows attachments up to 15 MB in size, up to 100 MB in total per visitor and up to 5 GB across all visitors. On ntfy.sh, the attachment size limit is 2 MB, and the per-visitor total is 20 MB. |
 | **Attachment expiry**      | By default, the server deletes attachments after 3 hours and thereby frees up space from the total visitor attachment limit.                                                                                            |
-| **Attachment bandwidth**   | By default, the server allows 500 MB of GET/PUT/POST traffic for attachments per visitor in a 24 hour period. Traffic exceeding that is rejected. On ntfy.sh, the daily bandwidth limit is 200 MB.                      |
+| **Title and tag size**    | The message title is limited to 1 KB, and all tags combined to 512 bytes. Requests exceeding either are rejected with HTTP 400. |
+| **Daily bandwidth**        | By default, the server allows 500 MB of traffic per visitor in a 24 hour period, covering attachment GET/PUT/POST traffic and messages replayed from the cache by [poll requests](subscribe/api.md#replay-limits). Traffic exceeding that is rejected. On ntfy.sh, the daily bandwidth limit is 200 MB.  |
 | **Total number of topics** | By default, the server is configured to allow 15,000 topics. The ntfy.sh server has higher limits though.                                                                                                               |
 
 These limits can be changed on a per-user basis using [tiers](config.md#tiers). If [payments](config.md#payments) are enabled, a user tier can be changed by purchasing
 a higher tier. ntfy.sh offers multiple paid tiers, which allows for much hier limits than the ones listed above. 
+
+!!! tip
+    If you repeatedly exceed the limits on ntfy.sh, or otherwise abuse the service, your IP address may be temporarily
+    banned. You can check if you have been banned at [am-i-banned.ntfy.sh](https://am-i-banned.ntfy.sh/).
 
 ## List of all parameters
 The following is a list of all parameters that can be passed when publishing a message. Parameter names are **case-insensitive**
@@ -4871,6 +4984,7 @@ table in their canonical form.
 | `X-Priority`    | `Priority`, `prio`, `p`                    | [Message priority](#message-priority)                                                         |
 | `X-Tags`        | `Tags`, `Tag`, `ta`                        | [Tags and emojis](#tags-emojis)                                                               |
 | `X-Delay`       | `Delay`, `X-At`, `At`, `X-In`, `In`        | Timestamp or duration for [delayed delivery](#scheduled-delivery)                             |
+| `X-Timezone`    | `Timezone`                               | IANA timezone for [delayed delivery](#scheduled-delivery)                                     |
 | `X-Actions`     | `Actions`, `Action`                        | JSON array or short format of [user actions](#action-buttons)                                 |
 | `X-Click`       | `Click`                                    | URL to open when [notification is clicked](#click-action)                                     |
 | `X-Attach`      | `Attach`, `a`                              | URL to send as an [attachment](#attachments), as an alternative to PUT/POST-ing an attachment |
