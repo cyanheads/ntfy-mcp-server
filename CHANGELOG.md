@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.4.1](changelog/2.4.x/2.4.1.md) — 2026-11-14 · 🛡️ Security
+
+Log records and the log notifications sent to clients no longer carry topic names. ntfy_publish_message gains timezone for natural-language delay, ntfy_fetch_messages marks reminders still queued, and an answer from a host that is not ntfy fails as not_ntfy_endpoint. Built on mcp-ts-core 0.13.22.
+
 ## [2.4.0](changelog/2.4.x/2.4.0.md) — 2026-10-29
 
 Publishes the ntfy-guide skill as skill://ntfy-guide/SKILL.md. A 5xx with a Retry-After the call cannot wait out fails fast as upstream_unreachable, and a failed read of a 2xx reply is upstream_malformed and never resends a publish, clear, or delete. Error labels follow ntfy's own codes; fetch caps each topic at 64 characters.
