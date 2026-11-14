@@ -2,9 +2,9 @@
 /**
  * @fileoverview ntfy-mcp-server entry point. Registers the four ntfy tools
  * (`ntfy_search_emoji_tags` disabled when `NTFY_ENABLE_EMOJI_TAGS=false`) and
- * the topic-snapshot resource, keeps topic names out of every log record, and
- * initializes the `EmojiTagService` and `NtfyService` inside `setup()` so the
- * framework's startup banner reports a clean state.
+ * the topic-snapshot resource, redacts the `topic` and `uri` fields in every
+ * log sink, and initializes the `EmojiTagService` and `NtfyService` inside
+ * `setup()` so the framework's startup banner reports a clean state.
  * @module index
  */
 

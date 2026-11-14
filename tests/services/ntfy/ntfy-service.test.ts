@@ -555,7 +555,7 @@ describe('NtfyService upstream error messages', () => {
     });
   });
 
-  it('names the answering host in the status line for a non-JSON body', async () => {
+  it('names the host the request was sent to in the status line for a non-JSON body', async () => {
     const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
     captureFetch(
       () =>
