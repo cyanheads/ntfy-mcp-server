@@ -4,7 +4,7 @@ description: Gates and identifier rules for the ntfy_* tools — choosing the to
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
@@ -33,9 +33,9 @@ A notification keeps one sequence id for its whole life:
 
 ## Gates
 
-1. **Never invent a topic.** If the user named none, publish without `topic` so the configured default applies. If that fails because no default is configured, ask the user which topic their app subscribes to. ntfy accepts any topic name and reports the publish as sent whether or not anyone is subscribed, so a guessed or mistyped topic fails silently. The topic works as a password: keep it out of commits, issues, logs, and anything else you write that others can read.
+1. **Never invent a topic.** If the user named none, publish without `topic` so the configured default applies. If that fails because no default is configured, ask the user which topic their app subscribes to. ntfy accepts any topic name and reports the publish as sent whether or not anyone is subscribed, so a guessed or mistyped topic fails silently. `docs`, `static`, and `file` are never topics: ntfy serves its own pages there, so fetching one fails with `not_ntfy_endpoint` and publishing to one is refused (`topic name is not allowed`). Pick another name. The topic works as a password: keep it out of commits, issues, logs, and anything else you write that others can read.
 2. **Confirm the sequence id before a clear or delete.** ntfy.sh accepts any `sequence_id`, including one never published, and reports success. A wrong id dismisses nothing and raises no error. Take the id from a publish result in this conversation or from a fetch row, per Identifiers.
-3. **An update replaces the notification; it does not merge into it.** Resend every field the notification should keep (title, tags, priority, click URL, buttons). The update carries only what that call sets.
+3. **An update replaces the notification; it does not merge into it.** Resend every field the notification should keep (title, tags, priority, click URL, icon, buttons). The update carries only what that call sets.
 4. **The publish result is the receipt.** A successful publish means the server accepted the message. A fetch made right after it can come back empty for a few seconds before the message shows up. That is not a lost message or a wrong topic, and resending delivers a duplicate. Fetch to confirm only when a publish failed in a way that says it may have gone out, and wait a few seconds first.
 5. **Prompted actions need a client that can prompt.** A clear, a delete, or a publish that sends email, places a call, or carries a broadcast or `http` button asks the user to confirm through the client. A failure saying the client did not declare the elicitation capability (`client_capability_missing`, or JSON-RPC error `-32021` with `requiredCapabilities`) means this client cannot show that prompt. Tell the user the action is unavailable here and don't retry it. A plain notification, a `view` or `copy` button, and a `click` URL never prompt.
 6. **Every update counts against the quota.** Each update, clear, and delete is a message against the server's daily per-visitor limit, which is low on public ntfy.sh. Update a progress notification at milestones, not on every step.
@@ -46,13 +46,13 @@ A notification keeps one sequence id for its whole life:
 
 **Progress notification.** Publish the first state with a chosen sequence id. At each milestone, publish again with the same sequence id and the full field set (Gate 3). Finish with a final update or a clear.
 
-**Reminders.** Publish with `delay` and a chosen sequence id.
+**Reminders.** Publish with `delay` and a chosen sequence id. For a duration (`30m`) or an RFC 3339 time with its offset (`2026-11-15T10:00:00-08:00`), `delay` alone is enough. For a natural-language time (`tomorrow, 10am`), also pass the user's `timezone` as an IANA name (`America/Los_Angeles`); without it ntfy reads the time in its own server's zone, which is UTC on ntfy.sh. If you don't know the user's zone, ask for it rather than guessing; a duration needs none. An RFC 3339 time always carries its offset: a date-time without one is not read as RFC 3339.
 
 - Move it: publish again with the same sequence id and the new `delay` while the first is still pending. The pending one is replaced rather than joined by a second reminder. Give a reschedule a few seconds after the publish it replaces; two sent back to back can both stay queued.
 - Cancel it: delete that sequence id before it fires. It is removed and never delivered.
-- Check what is queued: pending reminders appear in a fetch only with `scheduled: true`.
+- Check what is queued: pending reminders appear in a fetch only when the call sets `scheduled: true`. Each one still queued then carries `scheduled: true` on its row (shown as `Delivers: <time> (scheduled)`), and its `time` is when it will deliver. A reminder that came due seconds ago can still be queued without the flag.
 
-**What arrived on a topic.** Fetch with a `since` that covers the period. For "since this morning", use that moment as a Unix timestamp in seconds. Durations stop at hours (`24h`, not `1d`). One call returns at most `limit` rows (20 by default, 100 at most); while a result has `truncated: true`, call again with `cursor` set to its `nextCursor`, keeping `topic` and `since` the same. Then reduce all the rows:
+**What arrived on a topic.** Fetch with a `since` that covers the period. For "since this morning", use that moment as a Unix timestamp in seconds, never milliseconds; a bare `10` means 1970, not ten minutes. Durations stop at hours (`24h`, not `1d`). One call returns at most `limit` rows (20 by default, 100 at most); while a result has a `nextCursor`, call again with `cursor` set to it, keeping `topic`, `since`, and filters the same. The last page has no `nextCursor` even when it still says `truncated: true`, so stop there. The first call returns the newest rows and the cursor walk then covers the whole window from the oldest, so those rows come back at the end of the walk: count messages with `totalCount`, not by adding up pages. Then reduce all the rows:
 
 1. Set aside `message_clear` and `message_delete` rows. Each one means the notification named by its `sequence_id` was dismissed or removed. A clear or delete with no message row in the window points at a notification sent before the window, or a reminder cancelled before it fired.
 2. Group the remaining rows by sequence id and report each notification's latest row once, not every intermediate update.
@@ -60,4 +60,4 @@ A notification keeps one sequence id for its whole life:
 
 If the period reaches past the cache window, say so rather than reporting the topic as quiet.
 
-**Clearing one you didn't just send.** Fetch with `since: all`, paging with `cursor` as above until `truncated` is false, to read the whole cache; find the notification by title or body, take its sequence id per Identifiers, then clear or delete it. If it has left the cache and its sequence id isn't already in this conversation, it cannot be targeted. Tell the user.
+**Clearing one you didn't just send.** Fetch with `since: all`, paging with `cursor` as above until a response has no `nextCursor`, to read the whole cache; find the notification by title or body, take its sequence id per Identifiers, then clear or delete it. If it has left the cache and its sequence id isn't already in this conversation, it cannot be targeted. Tell the user.

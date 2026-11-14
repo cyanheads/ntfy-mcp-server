@@ -8,8 +8,8 @@
  * consent record that request stored for this exact topic, message, and
  * operation. The prompt and `format()` render every topic, sequence ID, and
  * event ID through `literal()`, so each reads as literal text; failure messages
- * quote them in double quotes as plain text, since the framework escapes
- * Markdown in them.
+ * quote a `sequence_id` in double quotes as plain text, since the framework
+ * escapes Markdown in them, and never name the topic.
  * @module mcp-server/tools/definitions/ntfy-manage-message.tool
  */
 
@@ -141,6 +141,15 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       recovery:
         'The clear or delete may already have taken effect — call `ntfy_fetch_messages` on the topic, with the same `base_url` this call used, and look for a `message_clear` / `message_delete` event carrying this `sequence_id` before reissuing it. If `base_url` (or the configured `NTFY_BASE_URL`) does not point at an ntfy server, correct it first.',
     },
+    {
+      reason: 'not_ntfy_endpoint',
+      code: JsonRpcErrorCode.NotFound,
+      when: "The clear or delete did not reach an ntfy topic route: a non-2xx answer other than a 404 without ntfy's JSON error envelope, on a status no other reason covers (such as a 405 or 501, or a 401 or 403 without the envelope). Every 404 is `not_found`, with the envelope or without it. The code stays the one the HTTP status maps to",
+      retryable: false,
+      thrownBy: 'service',
+      recovery:
+        'Check that `base_url` (or the configured `NTFY_BASE_URL`) is the root URL of an ntfy server, not a page under it, and that no proxy in front of it refused the request, then reissue the clear or delete.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -166,7 +175,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
     if (consent === 'declined') {
       throw ctx.fail(
         'consent_declined',
-        `The ${input.operation} of "${input.sequence_id}" on topic "${topic}" was not confirmed.`,
+        `The ${input.operation} of message "${input.sequence_id}" was not confirmed, so nothing was sent to ntfy.`,
       );
     }
 
@@ -183,12 +192,12 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       const code = getCode(err);
       const msg = getMessage(err);
       if (isAuthRejection(err)) {
-        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic "${topic}"`);
+        throw ctx.fail('forbidden_topic', msg || 'ntfy refused access to the topic.');
       }
       if (isNotFoundCode(code)) {
         throw ctx.fail(
           'not_found',
-          msg || `No cached message "${input.sequence_id}" on topic "${topic}".`,
+          msg || `No cached message "${input.sequence_id}" on the topic.`,
         );
       }
       if (isRateLimitedCode(code)) {

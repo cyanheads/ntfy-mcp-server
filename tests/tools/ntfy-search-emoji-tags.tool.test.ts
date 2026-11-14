@@ -1,16 +1,24 @@
 /**
  * @fileoverview Tests for `ntfy_search_emoji_tags` — service wiring, default
- * limit, offset paging past the limit cap, enrichment (query echo, total,
- * truncation, next-page and empty-result notices, the query rendered
- * literally), format-rendering of matches, and the `NTFY_ENABLE_EMOJI_TAGS`
+ * limit, offset paging past the limit cap, enrichment (normalized query echo,
+ * total, truncation, next-page and empty-result notices, the query rendered
+ * literally), `:code:` / spaced / emoji queries on both surfaces, the
+ * `limit` clamp's wiring (clamped / not clamped, advertised in both
+ * `NTFY_CLAMP_LIMITS` modes), format-rendering of matches, and the `NTFY_ENABLE_EMOJI_TAGS`
  * gate that wraps the definition in `disabledTool()`.
  * @module tests/tools/ntfy-search-emoji-tags.tool
  */
 
-import { type AnyToolDefinition, disabledTool } from '@cyanheads/mcp-ts-core';
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { type AnyToolDefinition, disabledTool, z } from '@cyanheads/mcp-ts-core';
+import {
+  createMockContext,
+  getEnrichment,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { resetServerConfig } from '@/config/server-config.js';
 import { ntfySearchEmojiTags } from '@/mcp-server/tools/definitions/ntfy-search-emoji-tags.tool.js';
 import {
   initEmojiTagService,
@@ -85,7 +93,69 @@ describe('ntfySearchEmojiTags handler', () => {
     expect(enrichment.truncated).toBe(true);
     expect(enrichment.notice).toContain('200-row page size');
     expect(enrichment.notice).toContain('offset: 200');
-    expect(ntfySearchEmojiTags.input.safeParse({ limit: 1001 }).success).toBe(false);
+  });
+
+  describe('`limit` above the 200-row cap', () => {
+    const FLAG = 'NTFY_CLAMP_LIMITS';
+    /** The `limit` property as `tools/list` advertises it. */
+    const advertisedLimit = () =>
+      (
+        z.toJSONSchema(ntfySearchEmojiTags.input, { io: 'input' }) as unknown as {
+          properties: { limit: Record<string, unknown> };
+        }
+      ).properties.limit;
+
+    beforeEach(() => {
+      delete process.env[FLAG];
+      resetServerConfig();
+    });
+    afterEach(() => {
+      delete process.env[FLAG];
+      resetServerConfig();
+    });
+
+    it('is clamped to 200 with a notice naming both values and a log line naming this tool', async () => {
+      const ctx = createMockContext();
+      const result = await ntfySearchEmojiTags.handler(
+        ntfySearchEmojiTags.input.parse({ limit: 5000 }),
+        ctx,
+      );
+
+      expect(result.matches).toHaveLength(200);
+      expect(getEnrichment(ctx).notice).toContain(
+        '`limit` 5000 is above the 200-row page size, so this page holds 200',
+      );
+      expect((ctx.log as MockContextLogger).calls).toContainEqual({
+        level: 'info',
+        msg: 'Clamped limit',
+        data: { tool: 'ntfy_search_emoji_tags', requested: 5000, applied: 200 },
+      });
+    });
+
+    it('is not clamped at 200, so nothing is logged and the notice names no cap', async () => {
+      const ctx = createMockContext();
+      await ntfySearchEmojiTags.handler(ntfySearchEmojiTags.input.parse({ limit: 200 }), ctx);
+
+      expect(getEnrichment(ctx).notice).not.toContain('page size');
+      expect((ctx.log as MockContextLogger).calls).toEqual([]);
+    });
+
+    it('is advertised with no maximum while clamping, and as maximum 200 and rejected when NTFY_CLAMP_LIMITS=false', () => {
+      expect(advertisedLimit()).not.toHaveProperty('maximum');
+      expect(advertisedLimit()).toMatchObject({ type: 'integer', minimum: 1, default: 25 });
+      expect(advertisedLimit().description).toBe(
+        'Maximum number of matches to return. Default 25. One call returns at most 200; a larger value is served as 200, and the notice says so whenever more remain. Page past it with `offset`.',
+      );
+
+      process.env[FLAG] = 'false';
+      resetServerConfig();
+      expect(advertisedLimit()).toMatchObject({ maximum: 200 });
+      expect(advertisedLimit().description).toBe(
+        'Maximum number of matches to return. Default 25. At most 200 per call. Page past it with `offset`.',
+      );
+      expect(ntfySearchEmojiTags.input.safeParse({ limit: 201 }).success).toBe(false);
+      expect(ntfySearchEmojiTags.input.safeParse({ limit: 200 }).success).toBe(true);
+    });
   });
 
   it('defaults offset to 0, so an unpaged call starts at the first row', async () => {
@@ -166,20 +236,67 @@ describe('ntfySearchEmojiTags handler', () => {
     );
   });
 
+  it('resolves a `:code:` and spaced query and echoes the normalized query on both surfaces', async () => {
+    const result = await runToolContract(ntfySearchEmojiTags, { query: ' :Heavy Check: ' });
+
+    expect(result.structuredContent).toMatchObject({
+      matches: [{ tag: 'heavy_check_mark', emoji: '✔️' }],
+      effectiveQuery: 'heavy_check',
+      totalCount: 1,
+      truncated: false,
+    });
+    const text = contentText(result);
+    expect(text).toContain('| `heavy_check_mark` | ✔️ |');
+    expect(text).toContain('`heavy_check`');
+    expect(text).not.toContain('Heavy Check');
+  });
+
+  it('resolves an emoji with a skin tone to its short code', async () => {
+    const result = await runToolContract(ntfySearchEmojiTags, { query: '👍🏽' });
+
+    expect(result.structuredContent).toMatchObject({
+      matches: [{ tag: '+1', emoji: '👍' }],
+      effectiveQuery: '👍🏽',
+      totalCount: 1,
+    });
+    expect(contentText(result)).toContain('| `+1` | 👍 |');
+  });
+
+  it('lists the reference with no effectiveQuery for a query that normalizes to nothing', async () => {
+    const result = await runToolContract(ntfySearchEmojiTags, { query: ' :: ' });
+
+    expect(result.structuredContent).toMatchObject({ totalCount: 1812, truncated: true });
+    expect(result.structuredContent).not.toHaveProperty('effectiveQuery');
+    expect((result.structuredContent as { matches: unknown[] }).matches).toHaveLength(25);
+    expect(contentText(result)).not.toContain('`::`');
+  });
+
+  it('names both accepted query forms when a text-and-emoji query matches nothing', async () => {
+    const result = await runToolContract(ntfySearchEmojiTags, { query: 'warning ⚠️' });
+
+    expect(result.structuredContent).toMatchObject({ matches: [], totalCount: 0 });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('`warning_⚠️`');
+    expect(notice).toContain('part of a tag name');
+    expect(notice).toContain('a single emoji');
+    expect(contentText(result)).toContain('a single emoji');
+  });
+
   it('keeps a query holding backticks and emphasis inside one code span of the empty-result notice', async () => {
     const result = await runToolContract(ntfySearchEmojiTags, { query: 'x`*y*' });
     const notice =
-      'No emoji tags matched query ``x`*y*``. Try a shorter substring or omit the query to list the reference from the start.';
+      'No emoji tags matched query ``x`*y*``. Send part of a tag name (`warning`, `heavy check`) or a single emoji (`⚠️`), not both; try a shorter substring, or omit the query to list the reference from the start.';
 
     expect(result.structuredContent).toMatchObject({ matches: [], totalCount: 0, notice });
     expect(contentText(result)).toContain(notice);
   });
 
-  it('moves a query with a line break into its own `text` fence in the notice', async () => {
+  it('names the query in the notice as it was matched, so a line break reads as `_` on one line', async () => {
     const result = await runToolContract(ntfySearchEmojiTags, { query: 'zz\n# forged' });
-    expect((result.structuredContent as { notice: string }).notice).toContain(
-      'query \n```text\nzz\n# forged\n```\n. Try',
-    );
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('No emoji tags matched query `zz_#_forged`. Send');
+    expect(notice).not.toContain('\n');
+    expect(result.structuredContent).toMatchObject({ effectiveQuery: 'zz_#_forged' });
   });
 });
 

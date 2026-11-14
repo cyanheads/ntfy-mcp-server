@@ -24,7 +24,13 @@ import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import type { NtfyServerEntry, ServerConfig } from '@/config/server-config.js';
 import { assertAbsoluteHttpUrl, assertPublicHost, REJECTION_MARKER } from './base-url-guard.js';
-import { getDataBody, upstreamErrorDetail } from './error-classifier.js';
+import {
+  getDataBody,
+  hasNtfyEnvelope,
+  isNotNtfyEndpoint,
+  isNtfyInternalError,
+  upstreamErrorDetail,
+} from './error-classifier.js';
 import type {
   ManageOperation,
   NtfyCallOptions,
@@ -139,22 +145,105 @@ function buildAuthHeader(entry: NtfyServerEntry): string | undefined {
   return;
 }
 
+/** The status line's subject when ntfy's own envelope proves ntfy answered. */
+const NTFY_SUBJECT = 'ntfy';
+
+/**
+ * What a topic name reads as in a captured body: no character a topic name
+ * holds (`[a-zA-Z0-9_-]`), so no name survives the mask or re-forms around it.
+ */
+const TOPIC_MASK = '***';
+
+/** The request an upstream error's `data` names for the caller, who supplied it. */
+type UpstreamErrorData = {
+  operation: string;
+  /** One topic, or the comma-separated list a poll sends. */
+  topic: string;
+  sequenceId?: string;
+};
+
 /**
  * Build the error for a non-OK ntfy response, with the upstream explanation
  * folded into the message. `httpErrorFromResponse` renders only the status line
  * ("ntfy returned HTTP 400 Bad Request.") and captures the body under
- * `data.body` — but `content[]` error text is built from the message plus the
- * recovery hint, so the captured body never reaches it, and it is dropped
- * outright once a tool re-throws through `ctx.fail(reason, message, …)`.
- * Folding it in here — the one place every tool and the resource shares — puts
- * ntfy's "invalid delay parameter: unable to parse delay" on both surfaces for
- * classified and unclassified failures alike.
+ * `data.body` (and its alias `data.responseBody`), which stays on the server:
+ * the classifiers read it and the failure log records it, but no client
+ * envelope carries it (no `exposeBody`), and it is dropped outright once a tool
+ * re-throws through `ctx.fail(reason, message, …)`. Folding ntfy's
+ * `error (see link)` into the message here — the one place every tool and the
+ * resource shares — puts "invalid delay parameter: unable to parse delay" on
+ * both surfaces for classified and unclassified failures alike, and leaves a
+ * proxy's HTML page off both.
+ *
+ * An answer without ntfy's envelope came from something else. Its status line
+ * names `host` — the request URL's host, never its userinfo or its path, which
+ * holds the topic — rather than ntfy; no `error` string its body carries is
+ * folded in, since that text is not ntfy's explanation; and every topic name in
+ * its captured body is masked before the failure log can write it, since such a
+ * page can repeat the request path or body. ntfy's own envelope carries its
+ * fixed error text, not the topic, and those words are what the classifiers
+ * match, so it stays as captured. An answer whose request never reached an ntfy
+ * topic route (`isNotNtfyEndpoint`) is labelled `not_ntfy_endpoint` and marked
+ * `retryable: false`, since the same request gets the same answer; its
+ * status-derived code stays as it is.
  */
-async function ntfyHttpError(response: Response, data: Record<string, unknown>): Promise<McpError> {
-  const err = await httpErrorFromResponse(response, { service: 'ntfy', data });
-  const detail = upstreamErrorDetail(getDataBody(err));
-  if (!detail) return err;
-  return new McpError(err.code, `${err.message.replace(/\.$/, '')}: ${detail}`, err.data);
+async function ntfyHttpError(
+  response: Response,
+  host: string,
+  data: UpstreamErrorData,
+): Promise<McpError> {
+  const err = await httpErrorFromResponse(response, { service: NTFY_SUBJECT, data });
+  const fromNtfy = hasNtfyEnvelope(err);
+  const statusLine = fromNtfy ? err.message : `${host}${err.message.slice(NTFY_SUBJECT.length)}`;
+  const detail = fromNtfy ? upstreamErrorDetail(getDataBody(err)) : undefined;
+  const message = detail ? `${statusLine.replace(/\.$/, '')}: ${detail}` : statusLine;
+  const label = isNotNtfyEndpoint(err)
+    ? { reason: 'not_ntfy_endpoint', retryable: false }
+    : undefined;
+  const masked = fromNtfy ? undefined : maskTopics(getDataBody(err), data.topic);
+  if (message === err.message && !label && !masked) return err;
+  // The spread keeps the marker that holds `body` and `responseBody` off the wire.
+  return new McpError(err.code, message, { ...err.data, ...label, ...masked });
+}
+
+/**
+ * `body`, under both keys `httpErrorFromResponse` captures it as, with each
+ * name in `topic` replaced by {@link TOPIC_MASK} — one name at a time, so a
+ * poll's list is masked in the percent-encoded form its path carries
+ * (`a%2Cb`) as well as the plain one. `undefined` when the body names none.
+ */
+function maskTopics(
+  body: string,
+  topic: string,
+): { body: string; responseBody: string } | undefined {
+  const masked = topic.split(',').reduce((text, name) => text.replaceAll(name, TOPIC_MASK), body);
+  return masked === body ? undefined : { body: masked, responseBody: masked };
+}
+
+/**
+ * A publish ntfy stores as a file: `filename` names it and no `attach` points
+ * at one hosted elsewhere, so ntfy writes the message body to its attachment
+ * store under that name. The publish tool sends neither field blank.
+ */
+function storesBodyAsFile(body: NtfyPublishRequest): boolean {
+  return body.filename !== undefined && body.attach === undefined;
+}
+
+/**
+ * ntfy's own 500 `50001` to a publish it stores as a file. ntfy v2.20.0 and
+ * later fail that write for every JSON publish — the attachment store is handed
+ * the `message` text but told the whole JSON request's length — so every
+ * attempt gets the same answer and none stores anything. Marked
+ * `retryable: false`, which `withRetry` fails on the first attempt instead of
+ * re-sending a publish that cannot succeed, and labelled with the publish
+ * contract's `invalid_attachment`.
+ */
+function fileStoreFailure(err: McpError): McpError {
+  return new McpError(err.code, err.message, {
+    ...err.data,
+    reason: 'invalid_attachment',
+    retryable: false,
+  });
 }
 
 /**
@@ -249,7 +338,8 @@ export class NtfyService {
    * `POST /` with a JSON body. Returns the upstream message envelope echoing
    * the published values plus the server-assigned `id`/`time`/`expires`. A
    * `200` whose body is not that envelope, or cannot be read in full, fails
-   * without a resend — see `parseReply`.
+   * without a resend — see `parseReply` — and so does ntfy's 500 to a publish
+   * it stores as a file — see `fileStoreFailure`.
    */
   async publish(
     body: NtfyPublishRequest,
@@ -257,6 +347,7 @@ export class NtfyService {
   ): Promise<NtfyPublishResponse> {
     const { base, authHeader, redirect } = await this.resolveBase(opts.baseUrl, opts.signal);
     const url = `${base}/`;
+    const { host } = new URL(url);
 
     // `cache` / `firebase` are wire-level headers, not JSON body fields.
     const { cache, firebase, ...jsonBody } = body;
@@ -280,7 +371,13 @@ export class NtfyService {
           signal,
           async (response) => {
             if (!response.ok) {
-              throw await ntfyHttpError(response, { operation: 'publish', topic: body.topic });
+              const err = await ntfyHttpError(response, host, {
+                operation: 'publish',
+                topic: body.topic,
+              });
+              throw storesBodyAsFile(body) && isNtfyInternalError(err)
+                ? fileStoreFailure(err)
+                : err;
             }
             return await parseReply<NtfyPublishResponse>(response, 'publish');
           },
@@ -307,6 +404,7 @@ export class NtfyService {
       operation === 'clear'
         ? `${base}/${encodeURIComponent(topic)}/${encodeURIComponent(sequenceId)}/clear`
         : `${base}/${encodeURIComponent(topic)}/${encodeURIComponent(sequenceId)}`;
+    const { host } = new URL(path);
 
     return await this.run(
       (signal) =>
@@ -321,7 +419,7 @@ export class NtfyService {
           signal,
           async (response) => {
             if (!response.ok) {
-              throw await ntfyHttpError(response, { operation, topic, sequenceId });
+              throw await ntfyHttpError(response, host, { operation, topic, sequenceId });
             }
             return await parseReply<NtfyManageResponse>(response, operation, ['sequence_id']);
           },
@@ -333,7 +431,8 @@ export class NtfyService {
 
   /**
    * `GET /<topic>/json?poll=1&...`. Parses the NDJSON line-delimited stream
-   * into an array, alongside ntfy's `X-Messages-Truncated` replay-cap flag;
+   * into an array, alongside ntfy's `X-Messages-Truncated` replay-cap flag and
+   * its clock from the `Date` header;
    * `open` and `keepalive` frames are filtered out by the caller (they're
    * connection-level, not notification data). A body that is not that stream
    * fails inside the retried round trip — see `parsePollBody`.
@@ -350,7 +449,8 @@ export class NtfyService {
     if (params.message) search.set('message', params.message);
 
     const url = `${base}/${encodeURIComponent(params.topic)}/json?${search.toString()}`;
-    const errorData = { operation: 'fetch', topic: params.topic };
+    const { host } = new URL(url);
+    const errorData: UpstreamErrorData = { operation: 'fetch', topic: params.topic };
 
     return await this.run(
       (signal) =>
@@ -364,15 +464,17 @@ export class NtfyService {
           this.cfg.requestTimeoutMs,
           signal,
           async (response) => {
-            if (!response.ok) throw await ntfyHttpError(response, errorData);
+            if (!response.ok) throw await ntfyHttpError(response, host, errorData);
             const messages = await parsePollBody(
               await response.text(),
               response.headers.get('content-type'),
+              host,
               errorData,
             );
             return {
               messages,
               upstreamTruncated: response.headers.get('x-messages-truncated') === '1',
+              ntfyClockSeconds: httpDateSeconds(response.headers.get('date')),
             };
           },
         ),
@@ -589,6 +691,13 @@ function readFailureCause(err: unknown): string {
   return `${message.replace(/\.$/, '')}${nested}`;
 }
 
+/** An HTTP `Date` header value as Unix seconds; `undefined` when absent or unparseable. */
+function httpDateSeconds(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : ms / 1000;
+}
+
 function malformedPollBody(line: number, problem: string, contentType: string | null): McpError {
   const type = contentType ? ` (content-type ${contentType})` : '';
   return serviceUnavailable(
@@ -607,12 +716,14 @@ function malformedPollBody(line: number, problem: string, contentType: string | 
  *
  * ntfy writes its JSON error body onto a replay that has already started with
  * `200` when a limit trips mid-stream; that line surfaces as the upstream HTTP
- * error it describes, through the same mapping a non-OK response takes.
+ * error it describes, through the same mapping a non-OK response from `host`
+ * takes.
  */
 async function parsePollBody(
   text: string,
   contentType: string | null,
-  errorData: Record<string, unknown>,
+  host: string,
+  errorData: UpstreamErrorData,
 ): Promise<NtfyMessage[]> {
   const out: NtfyMessage[] = [];
   for (const [index, raw] of text.split(/\r?\n/).entries()) {
@@ -625,7 +736,7 @@ async function parsePollBody(
       throw malformedPollBody(index + 1, 'is not valid JSON', contentType);
     }
     if (isErrorEnvelope(parsed)) {
-      throw await ntfyHttpError(new Response(line, { status: parsed.http }), errorData);
+      throw await ntfyHttpError(new Response(line, { status: parsed.http }), host, errorData);
     }
     if (!isMessageEnvelope(parsed)) {
       throw malformedPollBody(

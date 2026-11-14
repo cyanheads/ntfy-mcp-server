@@ -15,6 +15,9 @@
  *
  * `NTFY_ENABLE_EMOJI_TAGS` is parsed on its own by `isEmojiTagsEnabled()`,
  * since it is read at module load rather than inside `createApp()`.
+ * `NTFY_CLAMP_LIMITS` (`clampLimits`) is read through `getServerConfig()` on
+ * every `tools/list` and every `limit` parse (`limit-clamp.ts`), so `setup()`'s
+ * own call is what fails startup on an invalid value.
  * @module config/server-config
  */
 
@@ -102,6 +105,12 @@ const ServerConfigSchema = z.object({
     .describe(
       'When true, a per-call base_url override that is not a registered server must resolve to a public address, and its redirects are not followed.',
     ),
+  clampLimits: z
+    .stringbool()
+    .default(true)
+    .describe(
+      "When true, a tool's `limit` above its per-call cap is served as the cap with a notice; when false, the schema advertises and enforces a maximum at the cap instead.",
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -150,6 +159,7 @@ interface RawEnv {
   NTFY_AUTH_USERNAME?: string | undefined;
   NTFY_BASE_URL?: string | undefined;
   NTFY_BLOCK_PRIVATE_HOSTS?: string | undefined;
+  NTFY_CLAMP_LIMITS?: string | undefined;
   NTFY_DEFAULT_TOPIC?: string | undefined;
   NTFY_MAX_RETRIES?: string | undefined;
   NTFY_REQUEST_TIMEOUT_MS?: string | undefined;
@@ -174,6 +184,7 @@ function loadFromEnv(rawEnv: Record<string, string | undefined>): ServerConfig {
     requestTimeoutMs: env.NTFY_REQUEST_TIMEOUT_MS,
     maxRetries: env.NTFY_MAX_RETRIES,
     blockPrivateHosts: env.NTFY_BLOCK_PRIVATE_HOSTS,
+    clampLimits: env.NTFY_CLAMP_LIMITS,
   });
 
   if (!result.success) {
@@ -252,6 +263,8 @@ function envVarForSingleServerPath(path: string): string | undefined {
       return 'NTFY_MAX_RETRIES';
     case 'blockPrivateHosts':
       return 'NTFY_BLOCK_PRIVATE_HOSTS';
+    case 'clampLimits':
+      return 'NTFY_CLAMP_LIMITS';
     default:
       return;
   }

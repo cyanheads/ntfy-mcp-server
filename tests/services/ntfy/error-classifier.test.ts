@@ -1,15 +1,18 @@
 /**
  * @fileoverview Tests for the pure-data error classifiers — code/message/status
- * extraction, upstream JSON error-body parsing, the auth rejection read from
- * ntfy's own error envelope, the rate/invalid/not-found predicates, the
- * malformed-poll-body marker, the "retry-exhausted" heuristic (call-deadline
- * expiry included), the phrase-based 4xx sub-reason split (`invalid_delay` vs
- * `invalid_attachment` vs `payload_too_large` vs `unverified_contact`), the
- * anonymous-sender refusal, and which publish field an oversize rejection names.
+ * extraction, upstream JSON error-body parsing, the envelope check, the auth
+ * rejection read from ntfy's own error envelope, the `not_ntfy_endpoint` split
+ * (no envelope on a final status, or ntfy's 40401), the rate/invalid/not-found
+ * predicates, the malformed-poll-body marker, the "retry-exhausted" heuristic
+ * (call-deadline expiry included), the phrase-based 4xx sub-reason split (`invalid_delay` vs
+ * `invalid_attachment` vs `payload_too_large` vs `unverified_contact`) and the
+ * `invalid_timezone` read from ntfy's envelope code, the anonymous-sender
+ * refusal, and which publish field an oversize rejection names.
  * @module tests/services/ntfy/error-classifier
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { httpStatusToErrorCode } from '@cyanheads/mcp-ts-core/utils';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -18,10 +21,14 @@ import {
   getDataBody,
   getDataStatus,
   getMessage,
+  hasNtfyEnvelope,
   isAnonymousSenderRejection,
   isAuthRejection,
+  isFileStoreFailure,
   isInvalidParamsCode,
   isNotFoundCode,
+  isNotNtfyEndpoint,
+  isNtfyInternalError,
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
@@ -34,6 +41,8 @@ const RPC_CODE_BY_STATUS: Record<number, JsonRpcErrorCode> = {
   401: JsonRpcErrorCode.Unauthorized,
   403: JsonRpcErrorCode.Forbidden,
   413: JsonRpcErrorCode.InvalidRequest,
+  500: JsonRpcErrorCode.ServiceUnavailable,
+  502: JsonRpcErrorCode.ServiceUnavailable,
 };
 
 /**
@@ -201,6 +210,117 @@ describe('isAuthRejection', () => {
   });
 });
 
+/**
+ * An answer as `httpErrorFromResponse` captures it: the status-derived code,
+ * `data.status`, and the body under `data.body`. The bodies are real answers:
+ * ntfy's own envelopes, ntfy.sh's `static` file server, example.com, nginx, and
+ * Python's `http.server`.
+ */
+function answer(status: number, body: string) {
+  return new McpError(httpStatusToErrorCode(status) ?? JsonRpcErrorCode.InternalError, 'x', {
+    status,
+    body,
+  });
+}
+
+const ROUTE_MISS = '{"code":40401,"http":404,"error":"page not found"}';
+const EXAMPLE_PAGE =
+  '<!doctype html><html lang=en><head><title>Example Domain</title></head><body><p>This domain is for use in documentation examples.</p></body></html>';
+const NGINX_403 =
+  '<html>\n<head><title>403 Forbidden</title></head>\n<body>\n<center><h1>403 Forbidden</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>\n';
+const PYTHON_501 =
+  "<!DOCTYPE HTML>\n<html><head><title>Error response</title></head><body><h1>Error response</h1><p>Error code: 501</p><p>Message: Unsupported method ('POST').</p></body></html>\n";
+
+describe('hasNtfyEnvelope', () => {
+  it.each([
+    [403, '{"code":40301,"http":403,"error":"forbidden"}'],
+    [404, ROUTE_MISS],
+    [429, '{"code":42901,"http":429,"error":"limit reached: too many requests"}'],
+    [500, '{"code":50001,"http":500,"error":"internal server error"}'],
+  ])("recognizes ntfy's own %i envelope", (status, body) => {
+    expect(hasNtfyEnvelope(answer(status, body))).toBe(true);
+  });
+
+  it.each([
+    ['an HTML page', 403, NGINX_403],
+    ['plain text', 404, '404 page not found\n'],
+    ['an empty body', 405, ''],
+    ['JSON with no code', 404, '{"error":"not found"}'],
+    ['a string code', 403, '{"code":"40301","http":403}'],
+    ['an envelope cut off by the capture limit', 403, '{"code":40301,"ht'],
+    ['a code whose status family differs from the response', 404, '{"code":40301,"http":403}'],
+  ])('finds none in %s', (_label, status, body) => {
+    expect(hasNtfyEnvelope(answer(status, body))).toBe(false);
+  });
+
+  it('is null-safe', () => {
+    expect(hasNtfyEnvelope(undefined)).toBe(false);
+    expect(hasNtfyEnvelope(new Error('page not found'))).toBe(false);
+  });
+});
+
+/**
+ * #55: an answer that did not come from an ntfy topic route. ntfy answers every
+ * failure on its own routes with its envelope, so one without it came from
+ * something else; ntfy's own 40401 is a route miss. Statuses another reason
+ * claims (429, the retried 408/425/5xx) and every other ntfy envelope stay out.
+ */
+describe('isNotNtfyEndpoint', () => {
+  it.each([
+    ['a plain-text 404 (ntfy.sh `static`)', 404, '404 page not found\n'],
+    ['an HTML 404 (a host that is not ntfy)', 404, EXAMPLE_PAGE],
+    ['an HTML 405', 405, EXAMPLE_PAGE],
+    ['an HTML 501', 501, PYTHON_501],
+    ['a plain-text 401', 401, 'Unauthorized'],
+    ["a proxy's HTML 403", 403, NGINX_403],
+    ["a proxy's HTML 400", 400, '<html><head><title>400 Bad Request</title></head></html>'],
+    ['an empty 410', 410, ''],
+    ['a redirect that was not followed', 304, ''],
+    ['JSON with no envelope code', 404, '{"error":"not found"}'],
+    [
+      'an auth envelope on a 404, a status ntfy never pairs it with',
+      404,
+      '{"code":40301,"http":403,"error":"forbidden"}',
+    ],
+    ["ntfy's own 40401 route miss", 404, ROUTE_MISS],
+  ])('claims %s', (_label, status, body) => {
+    expect(isNotNtfyEndpoint(answer(status, body))).toBe(true);
+  });
+
+  it.each([
+    ["ntfy's 403 auth envelope", 403, '{"code":40301,"http":403,"error":"forbidden"}'],
+    ["ntfy's 401 auth envelope", 401, '{"code":40101,"http":401,"error":"unauthorized"}'],
+    ["ntfy's 40008", 400, '{"code":40008,"http":400,"error":"invalid since parameter"}'],
+    [
+      "ntfy's 40010",
+      400,
+      '{"code":40010,"http":400,"error":"invalid request: topic name is not allowed"}',
+    ],
+    ["ntfy's 40061", 400, '{"code":40061,"http":400,"error":"invalid request: too many topics"}'],
+    ["ntfy's 413", 413, '{"code":41303,"http":413,"error":"JSON body too large"}'],
+    ["ntfy's 429", 429, '{"code":42901,"http":429,"error":"limit reached: too many requests"}'],
+    ['a 429 without an envelope', 429, 'slow down'],
+    ['a 408 without an envelope', 408, ''],
+    ['a 425 without an envelope', 425, ''],
+    ["ntfy's 500", 500, '{"code":50001,"http":500,"error":"internal server error"}'],
+    ['a 500 without an envelope', 500, 'boom'],
+    ["a proxy's 502", 502, '<html><body><h1>502 Bad Gateway</h1></body></html>'],
+    ['an empty 503', 503, ''],
+    ['an empty 504', 504, ''],
+    ['40401 on a 503, a status ntfy never pairs it with', 503, ROUTE_MISS],
+  ])('leaves %s to its own outcome', (_label, status, body) => {
+    expect(isNotNtfyEndpoint(answer(status, body))).toBe(false);
+  });
+
+  it('leaves an error that carries no upstream status alone', () => {
+    expect(isNotNtfyEndpoint(new McpError(JsonRpcErrorCode.NotFound, 'page not found'))).toBe(
+      false,
+    );
+    expect(isNotNtfyEndpoint(new Error('fetch failed'))).toBe(false);
+    expect(isNotNtfyEndpoint(undefined)).toBe(false);
+  });
+});
+
 describe('error-classifier predicates', () => {
   it('isRateLimitedCode matches RateLimited', () => {
     expect(isRateLimitedCode(JsonRpcErrorCode.RateLimited)).toBe(true);
@@ -244,6 +364,67 @@ describe('isUpstreamMalformed', () => {
     ).toBe(false);
     expect(isUpstreamMalformed(undefined)).toBe(false);
     expect(isUpstreamMalformed(new Error('upstream_malformed'))).toBe(false);
+  });
+});
+
+/**
+ * ntfy's own 500 `50001` envelope, which `NtfyService.publish` reads as a failed
+ * file write when the publish stores its body as a file (#46).
+ */
+describe('isNtfyInternalError', () => {
+  it("matches ntfy's own 500 envelope (50001)", () => {
+    expect(isNtfyInternalError(ntfyRejection(500, 50001, 'internal server error'))).toBe(true);
+  });
+
+  it('rejects a 500 with no ntfy envelope: an empty, plain-text, HTML, or cut-off body', () => {
+    for (const body of [
+      '',
+      'boom',
+      '<html><body><h1>500 Internal Server Error</h1></body></html>',
+      '{"code":50001,"ht',
+      '{"code":"50001","http":500}',
+    ]) {
+      const err = new McpError(JsonRpcErrorCode.ServiceUnavailable, 'x', { status: 500, body });
+      expect(isNtfyInternalError(err)).toBe(false);
+    }
+    expect(
+      isNtfyInternalError(new McpError(JsonRpcErrorCode.ServiceUnavailable, 'internal error')),
+    ).toBe(false);
+  });
+
+  it('rejects another ntfy code, or 50001 on a status ntfy never pairs it with', () => {
+    expect(isNtfyInternalError(ntfyRejection(500, 50002, 'internal server error'))).toBe(false);
+    expect(isNtfyInternalError(ntfyRejection(502, 50001, 'internal server error'))).toBe(false);
+    expect(isNtfyInternalError(ntfyRejection(400, 40013, 'invalid request'))).toBe(false);
+  });
+
+  it('is null-safe', () => {
+    expect(isNtfyInternalError(undefined)).toBe(false);
+    expect(isNtfyInternalError(new Error('internal server error'))).toBe(false);
+  });
+});
+
+describe('isFileStoreFailure', () => {
+  it('matches the failure the publish path labels `invalid_attachment`', () => {
+    const err = new McpError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      'ntfy returned HTTP 500 Internal Server Error: internal server error',
+      { status: 500, reason: 'invalid_attachment', retryable: false },
+    );
+    expect(isFileStoreFailure(err)).toBe(true);
+    // Not retried, so it never carries the suffix the unreachable heuristic reads.
+    expect(isUpstreamUnreachable(err)).toBe(false);
+  });
+
+  it("does not match ntfy's unlabelled 500, another reason, or non-errors", () => {
+    expect(isFileStoreFailure(ntfyRejection(500, 50001, 'internal server error'))).toBe(false);
+    expect(
+      isFileStoreFailure(
+        new McpError(JsonRpcErrorCode.ServiceUnavailable, 'x', { reason: 'upstream_malformed' }),
+      ),
+    ).toBe(false);
+    expect(isFileStoreFailure(undefined)).toBe(false);
+    expect(isFileStoreFailure(new Error('invalid_attachment'))).toBe(false);
   });
 });
 
@@ -529,7 +710,6 @@ describe('classifyInvalidParams', () => {
     [40003, 'delayed e-mail notifications are not supported', undefined],
     [40015, 'invalid request: attachment expiry before delayed delivery date', DELAY_DOCS],
     [40037, 'invalid request: delayed call notifications are not supported', undefined],
-    [40059, 'invalid request: invalid timezone', DELAY_DOCS],
   ])(
     'never returns `invalid_delay` for %i, which names a delay or links the delay docs',
     (code, error, link) => {
@@ -537,6 +717,36 @@ describe('classifyInvalidParams', () => {
       expect(classifyInvalidParams(ntfy400(code, error, link))).toBeUndefined();
     },
   );
+
+  it("returns `invalid_timezone` for ntfy's 40059, not `invalid_delay`", () => {
+    expect(
+      classifyInvalidParams(ntfy400(40059, 'invalid request: invalid timezone', DELAY_DOCS)),
+    ).toBe('invalid_timezone');
+  });
+
+  it("reads `invalid_timezone` from ntfy's envelope code, never from the words alone", () => {
+    // ntfy's wording with no envelope behind it: a proxy page, a truncated body.
+    const wordsOnly = new McpError(
+      JsonRpcErrorCode.InvalidParams,
+      'ntfy returned HTTP 400 Bad Request: invalid request: invalid timezone',
+      { status: 400, body: '<html><body>invalid request: invalid timezone</body></html>' },
+    );
+    expect(classifyInvalidParams(wordsOnly)).toBeUndefined();
+    // 40059 on a status ntfy never pairs it with is no answer ntfy sent.
+    const wrongStatus = new McpError(
+      JsonRpcErrorCode.InvalidParams,
+      'ntfy returned HTTP 422: invalid request: invalid timezone',
+      {
+        status: 422,
+        body: JSON.stringify({
+          code: 40059,
+          http: 400,
+          error: 'invalid request: invalid timezone',
+        }),
+      },
+    );
+    expect(classifyInvalidParams(wrongStatus)).toBeUndefined();
+  });
 
   it.each([
     [40057, 'invalid request: title is too large'],

@@ -4,7 +4,7 @@
  * mutual exclusion of token vs basic auth, trailing-slash stripping, the
  * precedence of NTFY_SERVERS over the shorthand vars when both are set, the
  * deprecated NTFY_API_KEY alias, defaultTopic / numeric-coercion validation,
- * the NTFY_BLOCK_PRIVATE_HOSTS boolean flag, blank / whitespace / whole-value
+ * the NTFY_BLOCK_PRIVATE_HOSTS and NTFY_CLAMP_LIMITS boolean flags, blank / whitespace / whole-value
  * `${…}` placeholder values reading as unset, and the memoization behavior of
  * `getServerConfig` / `resetServerConfig`. Also covers `isEmojiTagsEnabled`
  * (NTFY_ENABLE_EMOJI_TAGS), parsed apart from the rest of the config.
@@ -27,6 +27,7 @@ const KEYS = [
   'NTFY_REQUEST_TIMEOUT_MS',
   'NTFY_MAX_RETRIES',
   'NTFY_BLOCK_PRIVATE_HOSTS',
+  'NTFY_CLAMP_LIMITS',
   'NTFY_ENABLE_EMOJI_TAGS',
 ] as const;
 
@@ -233,12 +234,39 @@ describe('getServerConfig', () => {
     });
   });
 
+  describe('NTFY_CLAMP_LIMITS', () => {
+    it('defaults to on, clamping an over-cap `limit` rather than rejecting it', () => {
+      expect(getServerConfig().clampLimits).toBe(true);
+    });
+
+    it.each(['true', '1', 'yes', 'on'])('reads %j as on', (value) => {
+      process.env.NTFY_CLAMP_LIMITS = value;
+      expect(getServerConfig().clampLimits).toBe(true);
+    });
+
+    it.each(['false', '0', 'no', 'off', 'FALSE'])('reads %j as off', (value) => {
+      process.env.NTFY_CLAMP_LIMITS = value;
+      expect(getServerConfig().clampLimits).toBe(false);
+    });
+
+    it('fails with a ConfigurationError naming the variable for an unrecognized value', () => {
+      process.env.NTFY_CLAMP_LIMITS = 'maybe';
+      expect(() => getServerConfig()).toThrow(
+        expect.objectContaining({
+          code: JsonRpcErrorCode.ConfigurationError,
+          message: expect.stringMatching(/NTFY_CLAMP_LIMITS \(clampLimits\)/),
+        }),
+      );
+    });
+  });
+
   describe('blank and unsubstituted placeholder values', () => {
     const DEFAULTS = {
       servers: [{ baseUrl: 'https://ntfy.sh' }],
       requestTimeoutMs: 15_000,
       maxRetries: 3,
       blockPrivateHosts: false,
+      clampLimits: true,
     };
 
     /** A whole-value `${name}` reference an install host forwarded unsubstituted. */

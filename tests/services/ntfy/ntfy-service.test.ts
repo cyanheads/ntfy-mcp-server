@@ -6,10 +6,13 @@
  * line), the publish and clear/delete reply validation that fails a `200` that
  * is not an ntfy message — or fails partway through being read — as
  * `upstream_malformed` without resending it, the
- * `X-Messages-Truncated` replay-cap flag, upstream error propagation including the
+ * `X-Messages-Truncated` replay-cap flag, ntfy's clock read from the poll's
+ * `Date` header, upstream error propagation including the
  * JSON error body folded into the message and the request URL kept off
- * `error.data`, the module-level init/get/reset
- * accessors, and `base_url` override validation — the always-on absolute
+ * `error.data`, an answer without ntfy's envelope naming only the request host
+ * and labelled `not_ntfy_endpoint` (so is ntfy's own 40401), its body's `error`
+ * text kept off the message and every topic name masked in its captured body, the module-level
+ * init/get/reset accessors, and `base_url` override validation — the always-on absolute
  * http(s) check plus the opt-in private-host guard, its registered-base bypass,
  * and its redirect refusal.
  * @module tests/services/ntfy/ntfy-service
@@ -40,12 +43,17 @@ const { lookup } = await import('node:dns/promises');
 
 const PUBLISH_BODY = { topic: 'alerts', message: 'hi' } as const;
 
+/** The page example.com answers a poll path and a `POST /` with — no ntfy envelope. */
+const EXAMPLE_PAGE =
+  '<!doctype html><html lang=en><head><title>Example Domain</title></head><body><p>This domain is for use in documentation examples.</p></body></html>';
+
 function makeConfig(servers: ServerConfig['servers'], blockPrivateHosts = false): ServerConfig {
   return {
     servers,
     requestTimeoutMs: 1000,
     maxRetries: 0,
     blockPrivateHosts,
+    clampLimits: true,
   };
 }
 
@@ -547,7 +555,7 @@ describe('NtfyService upstream error messages', () => {
     });
   });
 
-  it('leaves the status-line message untouched for a non-JSON body', async () => {
+  it('names the answering host in the status line for a non-JSON body', async () => {
     const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
     captureFetch(
       () =>
@@ -558,7 +566,240 @@ describe('NtfyService upstream error messages', () => {
         }),
     );
     const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
-    expect(err.message).toBe('ntfy returned HTTP 403 Forbidden.');
+    expect(err.message).toBe('ntfy.test returned HTTP 403 Forbidden.');
+  });
+
+  /**
+   * #55: ntfy answers every failure on its own routes with its JSON envelope, so
+   * an answer without one came from something else — a `base_url` that is no
+   * ntfy root, a proxy, ntfy.sh's docs or static file server.
+   */
+  describe('an answer without ntfy’s envelope (#55)', () => {
+    /** Userinfo, a port, and a path on the base; the topic rides the path or body. */
+    const OVERRIDE = 'https://agent:s3cret@proxy.test:8443/ntfy';
+    const TOPIC = 'tok_q81zv';
+    const page =
+      (status: number, statusText: string, body = EXAMPLE_PAGE) =>
+      () =>
+        new Response(body, { status, statusText, headers: { 'content-type': 'text/html' } });
+
+    it.each([
+      [
+        'publish',
+        (svc: NtfyService) => svc.publish({ topic: TOPIC, message: 'x' }, { baseUrl: OVERRIDE }),
+      ],
+      ['manage', (svc: NtfyService) => svc.manage(TOPIC, 'seq_1', 'clear', { baseUrl: OVERRIDE })],
+      [
+        'fetch',
+        (svc: NtfyService) => svc.fetch({ topic: TOPIC, since: '1h' }, { baseUrl: OVERRIDE }),
+      ],
+    ] as const)(
+      'fails a %s as `not_ntfy_endpoint`, naming only the request host, with the status-derived code',
+      async (_label, call) => {
+        const svc = new NtfyService({
+          ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+          maxRetries: 2,
+        });
+        const { calls } = captureFetch(page(404, 'Not Found'));
+        const err = (await call(svc).catch((e: unknown) => e)) as Error & {
+          code?: unknown;
+          data?: Record<string, unknown>;
+        };
+        expect(calls).toHaveLength(1);
+        expect(getErrorCode(err)).toBe(JsonRpcErrorCode.NotFound);
+        expect(err.message).toBe('proxy.test:8443 returned HTTP 404 Not Found.');
+        expect(err.data).toMatchObject({
+          reason: 'not_ntfy_endpoint',
+          retryable: false,
+          status: 404,
+        });
+        for (const leak of ['agent', 's3cret', '/ntfy', TOPIC, 'poll']) {
+          expect(err.message).not.toContain(leak);
+        }
+      },
+    );
+
+    it.each([
+      [405, 'Method Not Allowed', EXAMPLE_PAGE, JsonRpcErrorCode.InvalidRequest],
+      [501, 'Not Implemented', 'Unsupported method', JsonRpcErrorCode.ServiceUnavailable],
+      [401, 'Unauthorized', 'Unauthorized', JsonRpcErrorCode.Unauthorized],
+      [403, 'Forbidden', '<html><title>403 Forbidden</title></html>', JsonRpcErrorCode.Forbidden],
+    ])('keeps the code a %i maps to, sent once', async (status, statusText, body, code) => {
+      const svc = new NtfyService({
+        ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+        maxRetries: 2,
+      });
+      const { calls } = captureFetch(page(status, statusText, body));
+      const err = (await svc.publish(PUBLISH_BODY).catch((e: unknown) => e)) as Error & {
+        data?: Record<string, unknown>;
+      };
+      expect(calls).toHaveLength(1);
+      expect(getErrorCode(err)).toBe(code);
+      expect(err.message).toBe(`ntfy.test returned HTTP ${status} ${statusText}.`);
+      expect(err.data).toMatchObject({ reason: 'not_ntfy_endpoint', retryable: false, status });
+    });
+
+    it.each([
+      [429, 'Too Many Requests', JsonRpcErrorCode.RateLimited],
+      [503, 'Service Unavailable', JsonRpcErrorCode.ServiceUnavailable],
+    ])(
+      'names the host on a %i but leaves it to the reason that claims that status',
+      async (status, statusText, code) => {
+        const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+        captureFetch(page(status, statusText, ''));
+        const err = (await svc
+          .fetch({ topic: 'alerts', since: '1h' })
+          .catch((e: unknown) => e)) as Error & { data?: Record<string, unknown> };
+        expect(getErrorCode(err)).toBe(code);
+        expect(err.message).toMatch(
+          new RegExp(`^ntfy\\.test returned HTTP ${status} ${statusText}\\.`),
+        );
+        expect(err.data?.reason).toBeUndefined();
+      },
+    );
+
+    it("keeps ntfy's words and the `ntfy returned` subject on its own 40401 route miss, stamping the reason", async () => {
+      const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+      captureFetch(
+        () =>
+          new Response('{"code":40401,"http":404,"error":"page not found"}', {
+            status: 404,
+            statusText: 'Not Found',
+            headers: { 'content-type': 'application/json' },
+          }),
+      );
+      const err = (await svc
+        .fetch({ topic: 'alerts', since: '1h' })
+        .catch((e: unknown) => e)) as Error & { data?: Record<string, unknown> };
+      expect(getErrorCode(err)).toBe(JsonRpcErrorCode.NotFound);
+      expect(err.message).toBe('ntfy returned HTTP 404 Not Found: page not found');
+      expect(err.data).toMatchObject({ reason: 'not_ntfy_endpoint', retryable: false });
+    });
+
+    it("leaves ntfy's other envelopes unstamped, with the `ntfy returned` subject", async () => {
+      const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+      captureFetch(
+        () =>
+          new Response('{"code":40301,"http":403,"error":"forbidden"}', {
+            status: 403,
+            statusText: 'Forbidden',
+            headers: { 'content-type': 'application/json' },
+          }),
+      );
+      const err = (await svc.publish(PUBLISH_BODY).catch((e: unknown) => e)) as Error & {
+        data?: Record<string, unknown>;
+      };
+      expect(err.message).toBe('ntfy returned HTTP 403 Forbidden: forbidden');
+      expect(err.data).not.toHaveProperty('reason');
+      expect(err.data).not.toHaveProperty('retryable');
+    });
+
+    it("folds no `error` string from a JSON body without ntfy's envelope into the message", async () => {
+      const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+      captureFetch(
+        () =>
+          new Response(`{"error":"no route for /${TOPIC}/json"}`, {
+            status: 404,
+            statusText: 'Not Found',
+            headers: { 'content-type': 'application/json' },
+          }),
+      );
+      const err = (await svc
+        .fetch({ topic: TOPIC, since: '1h' }, { baseUrl: OVERRIDE })
+        .catch((e: unknown) => e)) as Error & { data?: Record<string, unknown> };
+      expect(err.message).toBe('proxy.test:8443 returned HTTP 404 Not Found.');
+      expect(err.data).toMatchObject({ reason: 'not_ntfy_endpoint', status: 404 });
+    });
+  });
+
+  /**
+   * #54: the captured body is server-side, but the failure record logs it, and
+   * a page from something that is not ntfy can repeat the request — its path
+   * holds the topic. ntfy's own envelope never names the topic, so it stays as
+   * captured: the classifiers read its words.
+   */
+  describe('a captured body without ntfy’s envelope keeps no topic name (#54)', () => {
+    const OVERRIDE = 'https://proxy.test/ntfy';
+    /** An Express-style miss repeating the request line, and the body a publish sent. */
+    const echo =
+      (status: number, statusText: string, headers: Record<string, string> = {}) =>
+      (call: CapturedCall) =>
+        new Response(
+          `<pre>Cannot ${call.method} ${new URL(call.url).pathname}${call.body ? ` with ${call.body}` : ''}</pre>`,
+          { status, statusText, headers: { 'content-type': 'text/html', ...headers } },
+        );
+
+    it.each([
+      [
+        'publish',
+        'tok_p54',
+        (svc: NtfyService) =>
+          svc.publish({ topic: 'tok_p54', message: 'x' }, { baseUrl: OVERRIDE }),
+        '<pre>Cannot POST /ntfy/ with {"topic":"***","message":"x"}</pre>',
+      ],
+      [
+        'manage',
+        'tok_m54',
+        (svc: NtfyService) => svc.manage('tok_m54', 'seq_1', 'clear', { baseUrl: OVERRIDE }),
+        '<pre>Cannot PUT /ntfy/***/seq_1/clear</pre>',
+      ],
+      [
+        'fetch of two topics',
+        'tok_f54,tok_g54',
+        (svc: NtfyService) =>
+          svc.fetch({ topic: 'tok_f54,tok_g54', since: '1h' }, { baseUrl: OVERRIDE }),
+        '<pre>Cannot GET /ntfy/***%2C***/json</pre>',
+      ],
+    ] as const)(
+      'masks every topic name a %s page repeats, and changes nothing else about the error',
+      async (_label, topic, call, masked) => {
+        const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+        captureFetch(echo(404, 'Not Found'));
+        const err = (await call(svc).catch((e: unknown) => e)) as Error & {
+          code?: unknown;
+          data?: Record<string, unknown>;
+        };
+        expect(err.data?.body).toBe(masked);
+        expect(err.data?.responseBody).toBe(masked);
+        expect(getErrorCode(err)).toBe(JsonRpcErrorCode.NotFound);
+        expect(err.message).toBe('proxy.test returned HTTP 404 Not Found.');
+        expect(err.data).toMatchObject({
+          reason: 'not_ntfy_endpoint',
+          retryable: false,
+          status: 404,
+          topic,
+        });
+      },
+    );
+
+    it('masks a topic name in a 5xx page the handlers rethrow as the cause of `upstream_unreachable`', async () => {
+      const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+      captureFetch(echo(503, 'Service Unavailable', { 'retry-after': '120' }));
+      const err = (await svc
+        .fetch({ topic: 'tok_r54', since: '1h' }, { baseUrl: OVERRIDE })
+        .catch((e: unknown) => e)) as Error & { data?: Record<string, unknown> };
+      expect(isUpstreamUnreachable(err)).toBe(true);
+      expect(err.data?.body).toBe('<pre>Cannot GET /ntfy/***/json</pre>');
+      expect(err.data?.topic).toBe('tok_r54');
+    });
+
+    it("leaves ntfy's own envelope as captured, even where its words hold the topic name", async () => {
+      const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+      const envelope = '{"code":40301,"http":403,"error":"forbidden"}';
+      captureFetch(
+        () =>
+          new Response(envelope, {
+            status: 403,
+            statusText: 'Forbidden',
+            headers: { 'content-type': 'application/json' },
+          }),
+      );
+      const err = (await svc
+        .publish({ topic: 'forbidden', message: 'x' })
+        .catch((e: unknown) => e)) as Error & { data?: Record<string, unknown> };
+      expect(err.data?.body).toBe(envelope);
+      expect(err.message).toBe('ntfy returned HTTP 403 Forbidden: forbidden');
+    });
   });
 
   it('keeps the upstream request URL off the client-facing error data', async () => {
@@ -756,6 +997,43 @@ describe('NtfyService.fetch request shape', () => {
   });
 });
 
+describe("NtfyService.fetch reports ntfy's clock (#51)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function pollWithDate(date: string | undefined): () => Response {
+    return () =>
+      new Response(JSON.stringify({ id: 'a', time: 1, event: 'message', topic: 'alerts' }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/x-ndjson',
+          ...(date === undefined ? {} : { date }),
+        },
+      });
+  }
+
+  it("reads the poll response's `Date` header as Unix seconds", async () => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    // As ntfy.sh sent it on a `scheduled=1` poll.
+    captureFetch(pollWithDate('Sat, 14 Nov 2026 06:08:39 GMT'));
+    const result = await svc.fetch({ topic: 'alerts', since: 'all', scheduled: true });
+    expect(result.ntfyClockSeconds).toBe(1_794_636_519);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['unparseable', 'not a date'],
+    ['empty', ''],
+  ])('reports no clock when the header is %s', async (_case, date) => {
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    captureFetch(pollWithDate(date));
+    const result = await svc.fetch({ topic: 'alerts', since: 'all' });
+    expect(result.ntfyClockSeconds).toBeUndefined();
+    expect(result.messages).toHaveLength(1);
+  });
+});
+
 describe('NtfyService.fetch poll-body validation', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -856,6 +1134,27 @@ describe('NtfyService.fetch poll-body validation', () => {
     expect(getErrorCode(err)).toBe(JsonRpcErrorCode.Forbidden);
     expect(err.message).toContain('forbidden (see https://ntfy.sh/docs/config/#access-control)');
   });
+
+  it.each([
+    [
+      "ntfy's 40401 route miss",
+      '{"code":40401,"http":404,"error":"page not found"}',
+      'ntfy returned HTTP 404: page not found',
+    ],
+    [
+      'a line whose code ntfy never pairs with its status',
+      '{"code":40301,"http":404,"error":"forbidden"}',
+      'ntfy.test returned HTTP 404.',
+    ],
+  ])(
+    'labels an error line that is %s as `not_ntfy_endpoint`, with the subject its envelope earns (#55)',
+    async (_label, line, text) => {
+      const { err } = await pollError(bodyResponder([message('a', 1), line].join('\n')));
+      expect(getErrorCode(err)).toBe(JsonRpcErrorCode.NotFound);
+      expect(err.message).toBe(text);
+      expect(err.data).toMatchObject({ reason: 'not_ntfy_endpoint', retryable: false });
+    },
+  );
 
   it('returns the body a retry delivers after a malformed attempt', async () => {
     const svc = new NtfyService({
@@ -1438,6 +1737,78 @@ describe('NtfyService a 200 reply that fails mid-read', () => {
     const { error } = outcome as { error: Failure };
     expect(error.message).toMatch(/\(failed after 4 attempts\)$/);
     expect(error.data?.reason).toBeUndefined();
+    expect(isUpstreamUnreachable(error)).toBe(true);
+  });
+});
+
+/**
+ * ntfy stores the body of a publish carrying `filename` and no `attach` as a
+ * file, and from v2.20.0 fails that write for every JSON publish with its own
+ * 500 `50001` (#46). That answer is final: sent once, labelled
+ * `invalid_attachment`. Every other 500 keeps the retry ladder.
+ */
+describe('NtfyService a publish ntfy stores as a file (#46)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const retrying = () =>
+    new NtfyService({ ...makeConfig([{ baseUrl: 'https://ntfy.test' }]), maxRetries: 3 });
+
+  /** ntfy.sh's answer to a JSON publish carrying `filename` without `attach`. */
+  const INTERNAL_ERROR = '{"code":50001,"http":500,"error":"internal server error"}';
+  const answer = (status: number, body: string, contentType: string) => () =>
+    new Response(body, { status, headers: { 'content-type': contentType } });
+  const fileWriteFailure = answer(500, INTERNAL_ERROR, 'application/json');
+
+  type Failure = Error & { data?: Record<string, unknown> };
+
+  it("fails ntfy's 500 `50001` to a `filename` publish without `attach` as `invalid_attachment`, sent once", async () => {
+    const { calls } = captureFetch(fileWriteFailure);
+    const { outcome } = await runOnFakeClock(
+      retrying().publish({ topic: 'alerts', message: 'probe', filename: 'probe.txt' }),
+    );
+    expect(calls).toHaveLength(1);
+    const { error } = outcome as { error: Failure };
+    expect(getErrorCode(error)).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.data).toMatchObject({
+      status: 500,
+      reason: 'invalid_attachment',
+      retryable: false,
+    });
+    expect(error.message).toContain('HTTP 500');
+    expect(error.message).toContain(': internal server error');
+    expect(error.message).not.toMatch(/failed after/);
+    expect(isUpstreamUnreachable(error)).toBe(false);
+  });
+
+  it.each([
+    ['a 500 with no ntfy envelope', { filename: 'probe.txt' }, answer(500, 'boom', 'text/plain')],
+    ["ntfy's 500 `50001` to a publish with no `filename`", {}, fileWriteFailure],
+    [
+      "ntfy's 500 `50001` to a `filename` publish that carries `attach`",
+      { filename: 'probe.txt', attach: 'https://example.com/probe.txt' },
+      fileWriteFailure,
+    ],
+    [
+      'a `50001` envelope on a 502',
+      { filename: 'probe.txt' },
+      answer(502, INTERNAL_ERROR, 'application/json'),
+    ],
+  ] as const)('keeps retrying %s, ending unreachable', async (_label, extra, responder) => {
+    const { calls } = captureFetch(responder);
+    const { outcome } = await runOnFakeClock(
+      retrying().publish({ topic: 'alerts', message: 'probe', ...extra }),
+    );
+    expect(calls).toHaveLength(4);
+    const { error } = outcome as { error: Failure };
+    expect(error.message).toMatch(/\(failed after 4 attempts\)$/);
+    expect(error.data?.reason).toBeUndefined();
+    expect(error.data?.retryable).toBeUndefined();
     expect(isUpstreamUnreachable(error)).toBe(true);
   });
 });

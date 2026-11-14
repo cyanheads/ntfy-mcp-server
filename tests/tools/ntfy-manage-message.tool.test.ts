@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tests for `ntfy_manage_message` — clear and delete dispatch,
- * reason mapping (not_found / forbidden_topic only on ntfy's own 401/403
- * envelope / rate_limited / upstream_unreachable / upstream_malformed without a
+ * reason mapping (not_found for every 404 / forbidden_topic only on ntfy's own
+ * 401/403 envelope / not_ntfy_endpoint for any other answer without one /
+ * rate_limited / upstream_unreachable / upstream_malformed without a
  * resend / generic rethrow), values in thrown messages quoted as plain text,
  * the advertised annotations and the
  * no-dedupe guarantee they reflect, default-topic resolution,
@@ -212,7 +213,8 @@ describe('ntfyManageMessage handler', () => {
       "a proxy's HTML 403",
       403,
       '<html><head><title>403 Forbidden</title></head></html>',
-      undefined,
+      // Something other than ntfy answered (#55): its own reason, never the auth one.
+      'not_ntfy_endpoint',
     ],
   ])('labels %s through the real service (#45)', async (_label, status, body, reason) => {
     const upstream = stubNtfy(() => new Response(body, { status }));
@@ -351,11 +353,11 @@ describe('ntfyManageMessage handler', () => {
     [
       'forbidden_topic',
       forbidden('', { status: 403, body: '{"code":40301,"http":403,"error":"forbidden"}' }),
-      'Forbidden for topic "_secret_"',
+      'ntfy refused access to the topic.',
     ],
-    ['not_found', notFound(''), 'No cached message "_seq_" on topic "_secret_".'],
+    ['not_found', notFound(''), 'No cached message "_seq_" on the topic.'],
   ])(
-    'names the topic in double quotes, as plain text, when ntfy gave no %s explanation',
+    'falls back to a message without the topic when ntfy gave no %s explanation',
     async (reason, upstreamErr, message) => {
       const svc = freshService();
       vi.spyOn(svc, 'manage').mockRejectedValue(upstreamErr);
@@ -660,6 +662,66 @@ describe('ntfyManageMessage handler', () => {
     expect(err.data).not.toHaveProperty('retryAttempts');
   });
 
+  /**
+   * #55 through the real service: a non-404 answer without ntfy's envelope
+   * carries `not_ntfy_endpoint`, while every 404 — with ntfy's 40401 envelope or
+   * without any — stays `not_found`, the reason this tool has always given it.
+   */
+  it.each([
+    [
+      "example.com's HTML 405",
+      405,
+      'Method Not Allowed',
+      '<!doctype html><html lang="en"><head><title>Example Domain</title></head></html>',
+      JsonRpcErrorCode.InvalidRequest,
+      'not_ntfy_endpoint',
+      'ntfy.test returned HTTP 405 Method Not Allowed.',
+    ],
+    [
+      'an HTML 404',
+      404,
+      'Not Found',
+      '<html><head><title>404 Not Found</title></head></html>',
+      JsonRpcErrorCode.NotFound,
+      'not_found',
+      'ntfy.test returned HTTP 404 Not Found.',
+    ],
+    [
+      "ntfy's own 40401",
+      404,
+      'Not Found',
+      '{"code":40401,"http":404,"error":"page not found"}',
+      JsonRpcErrorCode.NotFound,
+      'not_found',
+      'ntfy returned HTTP 404 Not Found: page not found',
+    ],
+  ])(
+    'fails %s with its own reason, sent once (#55)',
+    async (_label, status, statusText, body, code, reason, message) => {
+      const upstream = stubNtfy(() => new Response(body, { status, statusText }));
+      const input = ntfyManageMessage.input.parse({
+        topic: 'alerts',
+        sequence_id: 'seq_1',
+        operation: 'delete',
+      });
+      const err = (await Promise.resolve(
+        ntfyManageMessage.handler(input, await approvedCtx(input)),
+      ).catch((e: unknown) => e)) as McpError;
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect(err.code).toBe(code);
+      expect(err.message).toBe(message);
+      expect(err.data?.reason).toBe(reason);
+    },
+  );
+
+  it('declares `not_ntfy_endpoint` with a hint at `base_url`, `NTFY_BASE_URL`, and a proxy (#55)', () => {
+    const entry = ntfyManageMessage.errors?.find((e) => e.reason === 'not_ntfy_endpoint');
+    expect(entry).toMatchObject({ code: JsonRpcErrorCode.NotFound, retryable: false });
+    for (const term of ['`base_url`', '`NTFY_BASE_URL`', 'proxy', 'clear or delete']) {
+      expect(entry?.recovery).toContain(term);
+    }
+  });
+
   it('rethrows unclassified errors so the framework auto-classifier handles them', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockRejectedValue(invalidParams('weird upstream complaint'));
@@ -814,7 +876,7 @@ describe('ntfyManageMessage consent gate', () => {
     expect(message).toContain('message_clear');
   });
 
-  it('names the sequence and topic in code spans in the prompt, and in double quotes in a decline', async () => {
+  it('names the sequence and topic in code spans in the prompt, and only the sequence, in double quotes, in a decline', async () => {
     const upstream = fakeUpstream();
     const gated = input({ topic: '_secret_', sequence_id: '__seq__' });
 
@@ -831,11 +893,11 @@ describe('ntfyManageMessage consent gate', () => {
       ntfyManageMessage.handler(gated, await approvedCtx(gated, { action: 'decline' })),
     ).catch((e: unknown) => e)) as McpError;
     expect(err).toMatchObject({
-      message: 'The delete of "__seq__" on topic "_secret_" was not confirmed.',
+      message: 'The delete of message "__seq__" was not confirmed, so nothing was sent to ntfy.',
       data: { reason: 'consent_declined' },
     });
     expect(renderedError(err.message)).toBe(
-      'Error: The delete of "__seq__" on topic "_secret_" was not confirmed.',
+      'Error: The delete of message "__seq__" was not confirmed, so nothing was sent to ntfy.',
     );
     expect(upstream).not.toHaveBeenCalled();
   });

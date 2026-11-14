@@ -2,8 +2,8 @@
 
 **Server:** ntfy-mcp-server
 **Version:** 2.4.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0 (via the framework)
 **Zod:** ^4.6.7
 
@@ -45,7 +45,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 - **Secrets in env vars only** — never hardcoded. `NTFY_AUTH_TOKEN` is mutually exclusive with `NTFY_AUTH_USERNAME` / `NTFY_AUTH_PASSWORD`; the basic-auth pair must be set together. Validation enforces this at config load.
-- **Treat topic names as secrets.** Anyone who knows a topic name can publish or subscribe — surface that in tool descriptions and never log full topic names at info level when the topic is private.
+- **Treat topic names as secrets.** Anyone who knows a topic name can publish or subscribe — surface that in tool descriptions and keep topic names out of every log record, at every level. Never put one in a thrown message (the framework logs every message) or a `ctx.log` field. Carry it in error `data` only under the key `topic`: `setup()` registers `topic` and `uri` with `sanitization.setSensitiveFields`, so every log sink writes them as `[REDACTED]` while the caller still receives `data.topic`.
 - **Cut noise.** Add only what earns its place: no speculative generality, no guards for states the framework already prevents (Zod-validated params, classified errors), no abstraction until a third caller proves it, no option nothing sets.
 
 ---
@@ -58,6 +58,8 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { clampLimit, limitSchema } from '@/mcp-server/tools/utils/limit-clamp.js';
+import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
 import { getEmojiTagService } from '@/services/emoji-tags/emoji-tag-service.js';
 
 export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
@@ -65,8 +67,16 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
     "Look up ntfy emoji tag short codes. Use the returned `tag` strings in `ntfy_publish_message`'s `tags` field…",
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
-    query: z.string().optional().describe('Substring to match (case-insensitive).'),
-    limit: z.number().int().positive().max(200).default(25).describe('Max matches.'),
+    query: z.string().optional().describe(
+      'Part of a tag name, matched case-insensitively; surrounding colons are dropped and spaces or hyphens match `_`. Or one emoji, which finds its own tag. Omit to list the reference from the start.',
+    ),
+    // No schema maximum by default: a larger value is served as the cap (NTFY_CLAMP_LIMITS).
+    limit: limitSchema({
+      cap: 200,
+      defaultLimit: 25,
+      describe: (capRule) => `Maximum number of matches to return. Default 25. ${capRule} Page past it with \`offset\`.`,
+    }),
+    offset: z.number().int().min(0).default(0).describe('Number of matches to skip before returning `limit` rows.'),
   }),
   output: z.object({
     matches: z.array(z.object({
@@ -74,21 +84,24 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
       emoji: z.string().describe('Rendered Unicode emoji.'),
     })).describe('Tag → emoji rows.'),
   }),
-  // Agent-facing meta (parsed query, true total, truncation, empty-result
+  // Agent-facing meta (normalized query, true total, truncation, empty-result
   // notice) rides `enrichment` — both client surfaces, no `format()` entry.
   enrichment: {
-    effectiveQuery: z.string().optional().describe('Query as the server parsed it.'),
-    totalCount: z.number().describe('Total matches before truncation.'),
-    truncated: z.boolean().describe('True when more matched than `limit`.'),
-    notice: z.string().optional().describe('Guidance when nothing matched.'),
+    effectiveQuery: z.string().optional().describe('The query as matched against tag names — trimmed, surrounding colons dropped, lowercased, spaces and hyphens read as `_`.'),
+    totalCount: z.number().describe('Total matches before `limit`/`offset` were applied.'),
+    truncated: z.boolean().describe('True when matches remain past this page.'),
+    notice: z.string().optional().describe('Guidance when nothing matched or matches remain unseen.'),
   },
 
   handler(input, ctx) {
-    const { matches, total, truncated } = getEmojiTagService().search(input.query, input.limit);
-    if (input.query) ctx.enrich.echo(input.query);
+    const { applied: limit } = clampLimit(input.limit, { cap: 200, tool: 'ntfy_search_emoji_tags' }, ctx);
+    const { effectiveQuery, matches, total, truncated } = getEmojiTagService().search(input.query, limit, input.offset);
+    if (effectiveQuery !== undefined) ctx.enrich.echo(effectiveQuery);
     ctx.enrich.total(total);
     ctx.enrich({ truncated });
-    if (matches.length === 0) ctx.enrich.notice('No tags matched — try a shorter substring.');
+    if (matches.length === 0 && effectiveQuery !== undefined) {
+      ctx.enrich.notice(`No emoji tags matched query ${literal(effectiveQuery)}. Send part of a tag name (\`warning\`, \`heavy check\`) or a single emoji (\`⚠️\`), not both; try a shorter substring, or omit the query to list the reference from the start.`);
+    }
     return { matches };
   },
 
@@ -96,7 +109,7 @@ export const ntfySearchEmojiTags = tool('ntfy_search_emoji_tags', {
     type: 'text',
     text: result.matches.length === 0
       ? 'No emoji tags matched.'
-      : result.matches.map(m => `| \`${m.tag}\` | ${m.emoji} |`).join('\n'),
+      : `| Tag | Emoji |\n|:----|:------|\n${result.matches.map(m => `| ${literal(m.tag)} | ${m.emoji} |`).join('\n')}`,
   }],
 });
 ```
@@ -135,10 +148,11 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       const response = await getNtfyService().publish({ topic, ...input }, { signal: ctx.signal });
       return { id: response.id, /* … */ };
     } catch (err) {
-      // Keyed on ntfy's own error envelope, never the status: a proxy's HTML 403 stays unlabeled.
+      // Keyed on ntfy's own error envelope, never the status: a proxy's HTML 403 is `not_ntfy_endpoint`, labelled by the service.
       // Values in a thrown message are quoted plain text — the framework escapes Markdown there.
+      // A thrown message never names the topic: the framework logs every message.
       if (isAuthRejection(err)) {
-        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic "${topic}"`);
+        throw ctx.fail('forbidden_topic', getMessage(err) || 'ntfy refused access to the topic.');
       }
       throw err; // Let framework auto-classify the rest
     }
@@ -184,7 +198,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
       const code = getCode(err);
       if (isRateLimitedCode(code)) throw ctx.fail('rate_limited', getMessage(err));
       if (isAuthRejection(err)) {
-        throw ctx.fail('forbidden_topic', getMessage(err) || `Forbidden for topic "${params.topic}"`,
+        throw ctx.fail('forbidden_topic', getMessage(err) || 'ntfy refused access to the topic.',
           undefined, { cause: err });
       }
       throw err;
@@ -209,6 +223,7 @@ const ServerConfigSchema = z
     authPassword: z.string().min(1).optional(),
     requestTimeoutMs: z.coerce.number().int().positive().default(15_000),
     maxRetries: z.coerce.number().int().min(0).default(3),
+    clampLimits: z.stringbool().default(true), // NTFY_CLAMP_LIMITS — see `limit-clamp.ts`
   })
   .superRefine((cfg, ctx) => {
     // token vs username/password are mutually exclusive; basic-auth pair must be set together.
@@ -230,6 +245,12 @@ export function getServerConfig() {
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
+**`NTFY_CLAMP_LIMITS`** (`clampLimits`, default `true`) decides how `ntfy_fetch_messages` and `ntfy_search_emoji_tags` treat a `limit` above their per-call cap (100, 200). On, the schema advertises no maximum and `clampLimit` serves the cap, with a notice, a `Clamped limit` log line, and an `ntfy.limit.clamps` counter increment; off, `limitSchema` advertises and enforces `maximum: cap`. Both tools build their `limit` field with `limitSchema` from `src/mcp-server/tools/utils/limit-clamp.ts`, which reads the flag through `getServerConfig()` on every `tools/list` and every parse. `getServerConfig()` parses the environment once, on its first read — the schema emission the framework runs when a tool module loads — so the flag holds for the life of the process, and an invalid `NTFY_*` value still stops startup with the banner naming the variable.
+
+### Server identity, instructions, and shutdown
+
+`createApp()` takes optional identity fields (`name`, `title`, `websiteUrl`, `description`, `icons`) forwarded to the SDK's `initialize` response and the server manifest (`/.well-known/mcp.json`), and `instructions`, sent on every `initialize` as session-level context. This server sets `name`, `title` (the unscoped repo name), `skills`, `sessionMode`, and `instructions`; put deployment-wide orientation in `instructions` rather than repeating it across tool descriptions. `setup()` constructs the services. Anything long-lived it starts (a watcher, socket, or non-`unref()`'d timer) is released in `teardown(core)`, which runs after the transport stops and before the logger closes on every shutdown path; the server has none today.
+
 ---
 
 ## Context
@@ -238,14 +259,15 @@ Handlers receive a unified `ctx` object. Key properties this server uses today (
 
 | Property | Description |
 |:---------|:------------|
-| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat every log line as client-visible — this is why full topic names never go out at info level. |
+| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat every log line as client-visible — this is why no `ctx.log` call carries a topic name. |
 | `ctx.signal` | `AbortSignal` forwarded into `NtfyService` calls so client cancellations propagate to upstream HTTP. |
 | `ctx.requestInput` | Suspend the handler and ask the caller for more input — never returns. Always present, on every transport and both protocol eras. Reached through `confirmAction()`, never called directly from a handler: that helper centralizes the boolean confirmation schema, the consent record, and the reading of the reply. |
 | `ctx.inputs` | Reader over a retried request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped`. Empty on the first round. A response can arrive on a call nothing asked, so `confirmAction` reads one only behind a redeemed consent record; the SDK never re-validates responses, so it also passes its schema to `accepted()` and treats the value as untrusted. |
 | `ctx.state` | Tenant-scoped key-value storage. `confirmAction` keeps consent records here under `consent/<uuid>`. |
 | `ctx.auth` | Authenticated caller (`clientId`, `sub`), bound into each consent record. `undefined` on stdio and under `MCP_AUTH_MODE=none`, where every caller is one principal. |
 | `ctx.fail(reason, ...)` | Throw a typed contract failure declared in the tool's `errors[]` array. The framework puts the entry's `recovery` on the wire as `data.recovery.hint` when the throw carries none. |
-| `ctx.enrich(...)` | Accumulate agent-facing success-path context (empty-result notices, query/filter echo, pagination totals) declared in a tool's `enrichment` block — reaches both `structuredContent` and `content[]`. Helpers: `.notice()`, `.total()`, `.echo()`. |
+| `ctx.enrich(...)` | Accumulate agent-facing success-path context (empty-result notices, query/filter echo, pagination totals) declared in a tool's `enrichment` block — reaches both `structuredContent` and `content[]`; a no-op for a definition with no `enrichment` block. Helpers: `.notice()`, `.total()`, `.echo()`, `.truncated()`. |
+| `ctx.clientCapabilities` | What the client declared for this request, `undefined` when no view exists. Never a reason to skip the consent prompt. |
 | `ctx.requestId` | Request ID — the one every log record of the call carries and its error envelope returns as `data.requestId`. |
 
 ---
@@ -254,7 +276,7 @@ Handlers receive a unified `ctx` object. Key properties this server uses today (
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union. TypeScript catches `ctx.fail('typo')` at compile time, `data.reason` is auto-populated for observability, and the linter enforces conformance against the handler body. The `recovery` field is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. An entry thrown below the handler body — `ntfy_publish_message`'s upstream reasons, raised in `classifyPublishError`, and every surface's `upstream_malformed`, raised in `NtfyService` — carries `thrownBy: 'service'` so `error-contract-unthrown` skips it; lint-only metadata, nothing at runtime reads it. `severity` logs a modeled outcome below `error` — `consent_declined` is `notice` on both gated tools, since a user saying no is not an incident. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union. TypeScript catches `ctx.fail('typo')` at compile time, `data.reason` is auto-populated for observability, and the linter enforces conformance against the handler body. The `recovery` field is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. An entry thrown below the handler body — `ntfy_publish_message`'s upstream reasons, raised in `classifyPublishError`, and every surface's `upstream_malformed` and `not_ntfy_endpoint`, raised in `NtfyService` — carries `thrownBy: 'service'` so `error-contract-unthrown` skips it; lint-only metadata, nothing at runtime reads it. `severity` logs a modeled outcome below `error` — `consent_declined` is `notice` on both gated tools, since a user saying no is not an incident. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 errors: [
@@ -318,6 +340,7 @@ src/
       ntfy-search-emoji-tags.tool.ts    # Look up emoji short codes
     tools/utils/
       confirm-action.ts                 # Multi-round-trip consent gate for side effects
+      limit-clamp.ts                    # `limit` schema + clamp, per NTFY_CLAMP_LIMITS
       markdown-literal.ts               # Render values as literal Markdown (code span / fence)
     resources/definitions/
       ntfy-topic.resource.ts            # ntfy://{topic} snapshot
@@ -428,7 +451,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/` at a package's root, and `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp`, which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases. The agent-doc match is anchored to a package's root because a nested `skills/` can be runtime code: the MCP SDK imports its `dist/ext/skills/` modules at startup (cyanheads/mcp-ts-core#794). The selector lives in both `scripts/clean-mcpb.ts` and `scripts/lint-packaging.ts`, and `tests/scripts/clean-mcpb.test.ts` holds the pair together — re-apply it if a framework script resync reverts it. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp`, which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. The agent-doc match is anchored to a package's root because a nested `skills/` can be runtime code: the MCP SDK imports its `dist/ext/skills/` modules at startup (cyanheads/mcp-ts-core#794). The selector lives in both `scripts/clean-mcpb.ts` and `scripts/lint-packaging.ts`, and `tests/scripts/clean-mcpb.test.ts` holds the pair together. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected.
 
 **Adding an env var:** `server.json` always (registry discovery, `environmentVariables[]`). `manifest.json` only when the var is required with no default, or when bundle users should be prompted for it — then it needs both `mcp_config.env` and a `user_config` field. `lint:packaging` (run by `devcheck`) enforces exactly that pairing and checks the names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`. Optional vars carrying a default stay out of `manifest.json`, which is why `user_config` is empty today.
 
@@ -500,7 +523,7 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
 - [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
 - [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `author`, `repository`, `license`, `keywords` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name. Every user-supplied variable is declared under `userConfig` (`type`, `title`, `description`; `sensitive: true` for keys and tokens; `required: true` or `default: ""`) and referenced from `env` as `"KEY": "${user_config.<option>}"` — mirror the `user_config` block in `manifest.json`. Never write `"KEY": ""` into `env`
-- [ ] `plugin.json` + `mcp.json` (Agent Plugins 1.0.0 — read by Codex, Cursor, GitHub Copilot, VS Code, Kiro) populated — `plugin.json` `name` = the unscoped repo name; `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords` from `package.json`; no other top-level field. `mcp.json` holds one `"type": "stdio"` entry keyed by the unscoped name, `npx -y ntfy-mcp-server`, and the same fixed `env` as `.codex-plugin/mcp.json`. Neither file carries a user-supplied variable: those reach Codex through `.codex-plugin/mcp.json` `env_vars`, which works only while `.codex-plugin/plugin.json` keeps `"mcpServers": "./.codex-plugin/mcp.json"`
+- [ ] `plugin.json` + `mcp.json` (Agent Plugins 1.0.0 — read by Codex, Cursor, GitHub Copilot, VS Code, Kiro) populated — `plugin.json` `name` = the unscoped repo name (lowercase `a-z`, `0-9`, `-`, `.` only); `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords` from `package.json`; no other top-level field, `extensions` included. `mcp.json` holds one `"type": "stdio"` entry keyed by the unscoped name, `npx -y ntfy-mcp-server`, and the same fixed `env` as `.codex-plugin/mcp.json`. Neither file carries a user-supplied variable (no `""`, no `${…}` besides `${PLUGIN_ROOT}`/`${PLUGIN_DATA}`): those reach Codex through `.codex-plugin/mcp.json` `env_vars`, which works only while `.codex-plugin/plugin.json` keeps `"mcpServers": "./.codex-plugin/mcp.json"`
 - [ ] Any new root dev path has a root-anchored line in `.mcpbignore`; `bun run bundle` and `lint:packaging` pass
 - [ ] If the server publishes a skill in root `skills/`: `lint:packaging` passes, and `field-test` verified every gate and identifier claim in it against live tool behavior
 - [ ] `bun run devcheck` passes

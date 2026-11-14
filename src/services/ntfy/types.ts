@@ -60,10 +60,11 @@ export interface NtfyPublishResponse {
   /** `text/markdown` when the body was published as Markdown; absent for plain text. */
   content_type?: string;
   expires?: number;
+  /** Icon URL the publisher set; absent when none was set. */
+  icon?: string;
   id: string;
   message?: string;
   priority?: Priority;
-  scheduled?: boolean;
   sequence_id?: string;
   tags?: string[];
   time: number;
@@ -71,19 +72,29 @@ export interface NtfyPublishResponse {
   topic: string;
 }
 
+/** An action button as a poll returns it: the published action plus the ID ntfy assigned it. */
+export type NtfyActionReadback = NtfyAction & { id?: string };
+
 /**
  * Single line from a `<topic>/json?poll=1` response. The `event` set is wider
  * than `NtfyPublishResponse` because polls can include clear / delete / poll
  * markers in addition to plain messages.
  */
 export interface NtfyMessage {
-  actions?: NtfyAction[];
+  actions?: NtfyActionReadback[];
   attachment?: NtfyAttachment;
   click?: string;
   /** `text/markdown` when the body was published as Markdown; absent for plain text. */
   content_type?: string;
+  /**
+   * `base64` when the stored body was not UTF-8 text (a UnifiedPush publish of
+   * binary data), so `message` holds the base64 of those bytes; absent for text.
+   */
+  encoding?: string;
   event: MessageEvent | 'open' | 'keepalive';
   expires?: number;
+  /** Icon URL the publisher set; absent when none was set. */
+  icon?: string;
   id: string;
   message?: string;
   priority?: Priority;
@@ -112,6 +123,8 @@ export interface NtfyPublishRequest {
   priority?: Priority | undefined;
   sequence_id?: string | undefined;
   tags?: string[] | undefined;
+  /** IANA zone a natural-language `delay` is read in; ntfy ignores it without `delay`. */
+  timezone?: string | undefined;
   title?: string | undefined;
   topic: string;
 }
@@ -132,6 +145,11 @@ export interface NtfyFetchParams {
 export interface NtfyFetchResult {
   /** Every envelope in the poll body, oldest-first, `open` / `keepalive` frames included. */
   messages: NtfyMessage[];
+  /**
+   * ntfy's clock when it answered, in Unix seconds, read from the response's
+   * `Date` header; absent when the header is missing or unparseable.
+   */
+  ntfyClockSeconds?: number | undefined;
   /**
    * ntfy answered with `X-Messages-Truncated: 1`: the replay exceeded its
    * per-topic poll size cap, so it kept only the newest messages and dropped

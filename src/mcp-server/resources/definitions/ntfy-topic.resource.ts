@@ -7,10 +7,12 @@
  * 401/403 carrying its error envelope), a 429 that outlasts the service's
  * retries, an ntfy server that never answers within the
  * retries or the call deadline (or answers 5xx with a `Retry-After` the read
- * cannot wait out), and a poll body that is not ntfy's message stream fail the
- * read with the declared `forbidden_topic` / `rate_limited` /
- * `upstream_unreachable` / `upstream_malformed` reasons. For filtering or
- * replay, callers should use `ntfy_fetch_messages`.
+ * cannot wait out), a poll body that is not ntfy's message stream, and an
+ * answer that never reached an ntfy topic route (no ntfy error envelope, or
+ * ntfy's own 40401) fail the read with the declared `forbidden_topic` /
+ * `rate_limited` / `upstream_unreachable` / `upstream_malformed` /
+ * `not_ntfy_endpoint` reasons. For filtering or replay, callers should use
+ * `ntfy_fetch_messages`.
  * @module mcp-server/resources/definitions/ntfy-topic.resource
  */
 
@@ -46,7 +48,7 @@ const ParamsSchema = z.object({
 
 export const ntfyTopicResource = resource('ntfy://{topic}', {
   name: 'ntfy-topic-snapshot',
-  description: `Snapshot of a topic's recently-cached messages — latest 20 from the last 1 hour, plus the topic's browser URL. Messages are oldest-first with ISO 8601 timestamps, and bodies longer than ~${MESSAGE_TRUNCATE_AT} characters are truncated with the dropped count reported as \`messageTruncated\`. \`upstreamTruncated\` is true when ntfy itself capped the replay and dropped older messages before responding. Discoverable 'what's happening on topic X' lookup; for filters, custom windows, or replay use \`ntfy_fetch_messages\`.`,
+  description: `Snapshot of a topic's recently-cached messages — latest 20 from the last 1 hour, plus the topic's browser URL. Messages are oldest-first with ISO 8601 timestamps, and bodies longer than ~${MESSAGE_TRUNCATE_AT} UTF-16 code units are truncated on a code-point boundary, with the dropped count in the same unit reported as \`messageTruncated\`. \`upstreamTruncated\` is true when ntfy itself capped the replay and dropped older messages before responding. Discoverable 'what's happening on topic X' lookup; for filters, custom windows, or replay use \`ntfy_fetch_messages\`.`,
   mimeType: 'application/json',
   params: ParamsSchema,
 
@@ -83,6 +85,15 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
       recovery:
         "The server at the configured `NTFY_BASE_URL` answered with something other than ntfy's JSON message stream. Read the topic again; if it persists, ask the operator to point `NTFY_BASE_URL` at an ntfy server.",
     },
+    {
+      reason: 'not_ntfy_endpoint',
+      code: JsonRpcErrorCode.NotFound,
+      when: "The read did not reach an ntfy topic route: a non-2xx answer without ntfy's JSON error envelope on a status no other reason covers (such as a 404, 405, or 501, or a 401 or 403 without the envelope), or ntfy's own 40401 `page not found`. The code stays the one the HTTP status maps to",
+      retryable: false,
+      thrownBy: 'service',
+      recovery:
+        'A topic named `docs`, `static`, or `file` is never read as a topic, since ntfy serves its own documentation, web-app files, and attachments under those names: read another topic. Otherwise ask the operator to check that the configured `NTFY_BASE_URL` is the root URL of an ntfy server, not a page under it, and that no proxy in front of it refused the request.',
+    },
   ],
 
   async handler(params, ctx) {
@@ -109,7 +120,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
       if (isAuthRejection(err)) {
         throw ctx.fail(
           'forbidden_topic',
-          getMessage(err) || `Forbidden for topic "${params.topic}"`,
+          getMessage(err) || 'ntfy refused access to the topic.',
           undefined,
           { cause: err },
         );

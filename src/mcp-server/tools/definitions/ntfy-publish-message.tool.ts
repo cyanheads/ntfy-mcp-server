@@ -1,6 +1,6 @@
 /**
  * @fileoverview `ntfy_publish_message` — sends or updates a push notification
- * on an ntfy topic. Single tool covering all 18 publish parameters; updates
+ * on an ntfy topic. Single tool covering all 19 publish parameters; updates
  * ride this tool by setting `sequence_id`. Publishes whose side effects leave
  * the notification drawer (`email`, `call`, `broadcast` / `http` buttons) pass
  * through a user-confirmation gate: the first such call returns an input
@@ -9,7 +9,8 @@
  * `format()` renders every value ntfy echoes as a code span or fence, so it
  * reads as literal text; a body ntfy accepted as `text/markdown` is flagged
  * `markdown: true` and fenced as `markdown`. Failure messages quote a value in
- * double quotes as plain text, since the framework escapes Markdown in them.
+ * double quotes as plain text, since the framework escapes Markdown in them,
+ * and never name the topic, since the framework logs every thrown message.
  * @module mcp-server/tools/definitions/ntfy-publish-message.tool
  */
 
@@ -32,6 +33,7 @@ import {
   isAnonymousSenderRejection,
   isAuthRejection,
   isBaseUrlRejection,
+  isFileStoreFailure,
   isInvalidParamsCode,
   isRateLimitedCode,
   isUpstreamMalformed,
@@ -203,11 +205,15 @@ const InputSchema = z.object({
   filename: z
     .string()
     .optional()
-    .describe("Overrides the attachment's display filename in the client."),
+    .describe(
+      'Display filename of the attachment in the client; with `attach`, it replaces the name ntfy takes from the URL. Without `attach`, ntfy stores the message body itself as a file with this name — a form ntfy v2.20.0 and later fail (`invalid_attachment`).',
+    ),
   markdown: z
     .boolean()
     .optional()
-    .describe('Render the message body as Markdown (web app only; mobile renders plain text).'),
+    .describe(
+      'Render the message body as Markdown (supported by the web app and the Android app).',
+    ),
   actions: z
     .array(ActionSchema)
     .max(3)
@@ -219,13 +225,19 @@ const InputSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Schedule delivery for later. Accepts a duration (`30m`, `2h`, `1d`), a Unix timestamp, or natural-language time (`tomorrow, 10am`, `Tuesday, 7am`). 10s minimum; maximum 3 days by default (configurable per ntfy server).',
+      "Schedule delivery for later. Accepts a duration (`30m`, `2h`, `1d`), a Unix timestamp, an RFC 3339 time with its `Z` or `±hh:mm` offset (`2026-11-15T10:00:00Z`), or natural-language time (`tomorrow, 10am`, `Tuesday, 7am`), which ntfy reads in `timezone` when set and otherwise in the ntfy server's own timezone (UTC on ntfy.sh). A date-time without the offset is not read as RFC 3339. 10s minimum; maximum 3 days by default (configurable per ntfy server).",
+    ),
+  timezone: z
+    .string()
+    .optional()
+    .describe(
+      'IANA zone name (`America/New_York`, `Asia/Tokyo`, `UTC`) that ntfy reads a natural-language `delay` in, spelled as the tz database spells it — ntfy matches case-sensitively and rejects an unknown name (`invalid_timezone`). Durations, Unix timestamps, and RFC 3339 times keep their instant, and without `delay` ntfy ignores it. Sent as given; blank is treated as unset.',
     ),
   email: z
     .string()
     .optional()
     .describe(
-      "Forward to email — an address (`phil@example.com`) or `'yes'` to use the authenticated user's first verified address.",
+      "Forward to email — an address (`phil@example.com`) or `'yes'` to use the authenticated user's primary verified address (the first verified one when none is marked primary).",
     ),
   call: z
     .string()
@@ -309,6 +321,10 @@ const OutputSchema = z.object({
     .optional()
     .describe('Echo of the input tags; absent when none were set.'),
   click: z.string().optional().describe('Echo of the input click URL; absent when not set.'),
+  icon: z
+    .string()
+    .optional()
+    .describe('Echo of the input icon URL, exactly as ntfy returned it; absent when not set.'),
   attachment: AttachmentSchema.optional(),
   actions: z
     .array(ActionSchema)
@@ -334,6 +350,17 @@ function priorityLabel(p?: number): string {
     default:
       return 'default';
   }
+}
+
+/**
+ * `value`, or `undefined` when it is blank (empty or whitespace-only) — what a
+ * form client sends for a field it left untouched. `NtfyService.publish` reads
+ * `filename` and `attach` by presence to tell a publish ntfy stores as a file,
+ * so neither goes out blank; a blank `timezone` or `delay` stays unsent the
+ * same way, and ntfy delivers a publish without `delay` at once.
+ */
+function present(value: string | undefined): string | undefined {
+  return value?.trim() ? value : undefined;
 }
 
 /**
@@ -373,7 +400,9 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
 
   /**
    * Every reason after `consent_declined` is raised by `classifyPublishError`,
-   * outside the handler body the contract lint scans — hence `thrownBy: 'service'`.
+   * or by `NtfyService` and passed through it (`upstream_malformed`,
+   * `not_ntfy_endpoint`), outside the handler body the contract lint scans —
+   * hence `thrownBy: 'service'`.
    */
   errors: [
     {
@@ -414,15 +443,23 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'ntfy rejected `delay`: it could not parse the value, or the time it names is less than 10 seconds out or past the server maximum.',
       recovery:
-        'Resend with `delay` as a duration (`30m`, `2h`, `1d`), a Unix timestamp, or a natural-language time (`tomorrow, 10am`), at least 10 seconds out and within the server maximum (3 days on ntfy.sh).',
+        'Resend with `delay` as a duration (`30m`, `2h`, `1d`), a Unix timestamp, an RFC 3339 time with its `Z` or `±hh:mm` offset (`2026-11-15T10:00:00Z`), or a natural-language time (`tomorrow, 10am`), at least 10 seconds out and within the server maximum (3 days on ntfy.sh).',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_timezone',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'ntfy rejected `timezone` as a zone name it does not know, which it checks only on a publish that also sets a delay',
+      recovery:
+        "Pass `timezone` as an IANA zone name spelled as the tz database spells it (`America/New_York`, `Asia/Tokyo`, `UTC`; ntfy matches case-sensitively), or drop it to read `delay` in the ntfy server's own timezone.",
       thrownBy: 'service',
     },
     {
       reason: 'invalid_attachment',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'ntfy rejected the `attach` URL as malformed.',
+      when: 'ntfy rejected the `attach` URL as malformed, or answered HTTP 500 to a publish carrying `filename` without `attach`, whose body ntfy v2.20.0 and later fail to store as a file',
       recovery:
-        'Pass `attach` an absolute URL (`https://host/path/file.jpg`) to an already-hosted file — the recipient device fetches it, so a local path will not work, and shortening the message will not help.',
+        "Pass `attach` an absolute URL (`https://host/path/file.jpg`) to an already-hosted file — the recipient device fetches it, so a local path will not work, and shortening the message will not help. When `filename` was set without `attach`, pass the hosted file's URL as `attach` alongside it, or drop `filename` to send the text as a plain message.",
       thrownBy: 'service',
     },
     {
@@ -451,6 +488,15 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
         'The notification may already have been delivered — call `ntfy_fetch_messages` on the topic before resending, so a resend does not deliver it twice. Fetch with the same `base_url` this publish used, and with `scheduled: true` if it set `delay`; without them the fetch cannot see this message. If `base_url` (or the configured `NTFY_BASE_URL`) does not point at an ntfy server, correct it first.',
       thrownBy: 'service',
     },
+    {
+      reason: 'not_ntfy_endpoint',
+      code: JsonRpcErrorCode.NotFound,
+      when: "The publish did not reach an ntfy topic route: a non-2xx answer without ntfy's JSON error envelope on a status no other reason covers (such as a 404, 405, or 501, or a 401 or 403 without the envelope), or ntfy's own 40401 `page not found`. The code stays the one the HTTP status maps to",
+      retryable: false,
+      recovery:
+        'Check that `base_url` (or the configured `NTFY_BASE_URL`) is the root URL of an ntfy server, not a page under it, and that no proxy in front of it refused the request, then resend the publish.',
+      thrownBy: 'service',
+    },
   ],
 
   async handler(input: Input, ctx): Promise<Output> {
@@ -472,12 +518,13 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       priority: input.priority as Priority | undefined,
       tags: input.tags?.length ? input.tags : undefined,
       click: input.click,
-      attach: input.attach,
+      attach: present(input.attach),
       icon: input.icon,
-      filename: input.filename,
+      filename: present(input.filename),
       markdown: input.markdown,
       actions: input.actions?.length ? (input.actions as NtfyAction[]) : undefined,
-      delay: input.delay,
+      delay: present(input.delay),
+      timezone: present(input.timezone),
       email: input.email,
       call: input.call,
       sequence_id: input.sequence_id,
@@ -497,7 +544,10 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
         message: `Publish to ntfy topic ${literal(topic)} with ${sideEffects.join(' and ')}?`,
       });
       if (consent === 'declined') {
-        throw ctx.fail('consent_declined', `Publish to "${topic}" was not confirmed.`);
+        throw ctx.fail(
+          'consent_declined',
+          'The publish was not confirmed, so nothing was sent to ntfy.',
+        );
       }
     }
 
@@ -508,13 +558,12 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
         signal: ctx.signal,
       });
     } catch (err) {
-      throw classifyPublishError(err, ctx, topic);
+      throw classifyPublishError(err, ctx);
     }
 
-    // Upstream ntfy.sh does not echo `scheduled` in the publish response, so
-    // synthesize it from the input: a successful publish with `delay` set means
-    // the message was queued for later delivery.
-    const scheduled = response.scheduled === true || Boolean(input.delay);
+    // ntfy's reply carries no scheduled flag, so it comes from the request: a
+    // successful publish that sent `delay` was queued for later delivery.
+    const scheduled = requestBody.delay !== undefined;
 
     ctx.log.info('Published ntfy message', {
       messageId: response.id,
@@ -538,6 +587,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       priority: response.priority,
       tags: response.tags,
       click: response.click,
+      icon: response.icon,
       attachment: response.attachment,
       actions: response.actions as Output['actions'],
     };
@@ -569,7 +619,12 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     if (result.message) {
       lines.push('', literalBlock(result.message, result.markdown ? 'markdown' : 'text'));
     }
-    if (result.click) lines.push('', `Click action: ${literal(result.click)}`);
+    const links: string[] = [];
+    if (result.click) links.push(`Click action: ${literal(result.click)}`);
+    // A code span, never an image: the publisher picks the URL, and an image
+    // would have a rendering client fetch it.
+    if (result.icon) links.push(`Icon: ${literal(result.icon)}`);
+    if (links.length) lines.push('', ...links);
     if (result.attachment) {
       const a = result.attachment;
       const meta: string[] = [];
@@ -602,6 +657,15 @@ const OVERSIZE_HINTS = {
 } as const;
 
 /**
+ * The hint each `invalid_attachment` failure carries: the fix for the one form
+ * ntfy refused, where the declared `recovery` names both.
+ */
+const ATTACHMENT_HINTS = {
+  url: 'Pass `attach` an absolute URL (`https://host/path/file.jpg`) to an already-hosted file — the recipient device fetches it, so a local path will not work, and shortening the message will not help.',
+  file: "With `filename` set and no `attach`, ntfy stores the message body as a file named `filename`, and ntfy v2.20.0 and later fail that write (HTTP 500). Pass the hosted file's URL as `attach` alongside `filename`, or drop `filename` to send the text as a plain message.",
+} as const;
+
+/**
  * The hint an `unverified_contact` failure carries when ntfy refused the
  * `email` or `call` because the request had no credentials (40035, 40053),
  * where the declared `recovery` covers an address or number that is not
@@ -618,7 +682,6 @@ const ANONYMOUS_SENDER_HINT =
 function classifyPublishError(
   err: unknown,
   ctx: Parameters<typeof ntfyPublishMessage.handler>[1],
-  topic: string,
 ): unknown {
   // A locally-rejected `base_url` already carries its own message and hint; the
   // branches below speak for ntfy, not for this server, and one of them matches
@@ -631,8 +694,12 @@ function classifyPublishError(
   const code = getCode(err);
   const message = getMessage(err);
 
+  // The service read ntfy's 500 as the failed write of a file publish and sent it once.
+  if (isFileStoreFailure(err)) {
+    return ctx.fail('invalid_attachment', message, { recovery: { hint: ATTACHMENT_HINTS.file } });
+  }
   if (isAuthRejection(err)) {
-    return ctx.fail('forbidden_topic', message || `Forbidden for topic "${topic}"`);
+    return ctx.fail('forbidden_topic', message || 'ntfy refused access to the topic.');
   }
   if (isRateLimitedCode(code)) {
     return ctx.fail(
@@ -657,6 +724,9 @@ function classifyPublishError(
     }
     if (sub === 'unverified_contact' && isAnonymousSenderRejection(err)) {
       return ctx.fail(sub, message, { recovery: { hint: ANONYMOUS_SENDER_HINT } });
+    }
+    if (sub === 'invalid_attachment') {
+      return ctx.fail(sub, message, { recovery: { hint: ATTACHMENT_HINTS.url } });
     }
     if (sub) return ctx.fail(sub, message);
   }

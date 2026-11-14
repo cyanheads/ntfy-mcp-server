@@ -26,6 +26,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 
 import { getServerConfig } from '@/config/server-config.js';
+import { clampLimit, limitSchema } from '@/mcp-server/tools/utils/limit-clamp.js';
 import { literal, literalBlock } from '@/mcp-server/tools/utils/markdown-literal.js';
 import {
   BASE_URL_HINT,
@@ -61,11 +62,14 @@ const TOPIC_LIST_ERROR =
 /** ntfy's error text for 40008, which the service folds into the error message. */
 const INVALID_SINCE_TEXT = 'invalid since parameter';
 const DEFAULT_SINCE = '10m';
+const TOOL_NAME = 'ntfy_fetch_messages';
 const DEFAULT_LIMIT = 20;
-/** Messages one call returns; a larger `limit` is served up to this and says so. */
+/**
+ * Messages one call returns. Under `NTFY_CLAMP_LIMITS` (the default) a larger
+ * `limit` is served as this and, when more remain, the notice names both
+ * values; with it off, the schema rejects a larger value.
+ */
 const MAX_LIMIT = 100;
-/** Hard ceiling on `limit` itself — rejects absurd input, not an over-cap request. */
-const LIMIT_CEILING = 1000;
 
 /**
  * ntfy reads `since` in this order: keyword, 12-character message ID, Unix
@@ -83,6 +87,30 @@ const GO_DURATION = /^[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|μs|ms|s|m|h))
  */
 export function isDuration(since: string): boolean {
   return !MESSAGE_ID.test(since) && GO_DURATION.test(since);
+}
+
+/**
+ * A `since` ntfy reads as Unix seconds: Go's `strconv.ParseInt` takes an
+ * optional sign and any leading zeros, so `+10` and `0001794636450` are
+ * timestamps. One parse per input — the sign at most once, then one digit run
+ * to the anchor — so a caller's `since` scans in linear time. Twelve digits
+ * exactly are the exception: ntfy tests for a message ID first.
+ */
+const UNIX_SECONDS = /^[-+]?\d+$/;
+const DIGIT_MESSAGE_ID = /^\d{12}$/;
+/**
+ * No message reaches this `time`: ntfy stamps a message when it accepts it, or
+ * schedules it at most `MessageDelayMax` (a Go duration, under 300 years)
+ * ahead. A 13-digit millisecond timestamp is the usual way to get here.
+ */
+const SINCE_SECONDS_CEILING = 1e12;
+/** 2001-09-09T01:46:40Z: an all-digit `since` below it predates ntfy, and is usually a duration missing its unit. */
+const SINCE_SECONDS_FLOOR = 1e9;
+
+/** The ISO instant of Unix `seconds`, or `undefined` past the range a `Date` holds. */
+function unixInstant(seconds: number): string | undefined {
+  const date = new Date(seconds * 1000);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString().replace('.000Z', 'Z');
 }
 
 /**
@@ -122,6 +150,13 @@ const PrioritySchema = z
   .min(1, PRIORITY_ERROR)
   .max(5, PRIORITY_ERROR);
 
+const ActionIdSchema = z
+  .string()
+  .optional()
+  .describe(
+    'ID ntfy assigned this button when the message was published; absent when ntfy sent none.',
+  );
+
 const ActionReadbackSchema = z
   .discriminatedUnion('action', [
     z
@@ -130,6 +165,7 @@ const ActionReadbackSchema = z
         label: z.string().describe('Button label.'),
         url: z.string().describe('URL opened on tap.'),
         clear: z.boolean().optional().describe('Whether the notification dismisses on tap.'),
+        id: ActionIdSchema,
       })
       .describe('Open a URL or app on tap.'),
     z
@@ -142,6 +178,7 @@ const ActionReadbackSchema = z
           .optional()
           .describe('String extras passed alongside the broadcast.'),
         clear: z.boolean().optional().describe('Whether the notification dismisses on tap.'),
+        id: ActionIdSchema,
       })
       .describe('Send an Android broadcast intent on tap.'),
     z
@@ -159,6 +196,7 @@ const ActionReadbackSchema = z
           .boolean()
           .optional()
           .describe('Whether the notification dismisses when the request succeeds.'),
+        id: ActionIdSchema,
       })
       .describe('Fire an HTTP request on tap.'),
     z
@@ -167,6 +205,7 @@ const ActionReadbackSchema = z
         label: z.string().describe('Button label.'),
         value: z.string().describe('Value copied to the device clipboard on tap.'),
         clear: z.boolean().optional().describe('Whether the notification dismisses on tap.'),
+        id: ActionIdSchema,
       })
       .describe('Copy a value to the clipboard on tap.'),
   ])
@@ -197,9 +236,14 @@ const InputSchema = z.object({
     .string()
     .default(DEFAULT_SINCE)
     .describe(
-      "Lower bound of the window. Default `10m`, tighter than ntfy's default to keep the common 'did my recent notification land?' lookup cheap. Accepts a duration in seconds, minutes, or hours (`30s`, `10m`, `2h`, `24h`), a Unix timestamp, the keywords `all` (every cached message — up to ~12h on ntfy.sh) or `latest` (most recent only), or a message ID, which returns only the messages after that one — an ID ntfy no longer holds returns the whole cache rather than an error. To page through a window larger than one call returns, use `cursor`, not `since`; keep `since` the same on every page, even a duration — the cursor holds the window where the walk began.",
+      "Lower bound of the window. Default `10m`, tighter than ntfy's default to keep the common 'did my recent notification land?' lookup cheap. Accepts a duration in seconds, minutes, or hours (`30s`, `10m`, `2h`, `24h`), a Unix timestamp in seconds (`1794577386`; a millisecond value is rejected, and a bare `10` means 1970, not ten minutes), the keywords `all` (every cached message — up to ~12h on ntfy.sh) or `latest` (most recent only), or a message ID, which returns only the messages after that one — an ID ntfy no longer holds returns the whole cache rather than an error. To page through a window larger than one call returns, use `cursor`, not `since`; keep `since` the same on every page, even a duration — the cursor holds the window where the walk began.",
     ),
-  scheduled: z.boolean().default(false).describe('Include delayed/not-yet-delivered messages.'),
+  scheduled: z
+    .boolean()
+    .default(false)
+    .describe(
+      'Include delayed messages ntfy has not delivered yet; a row still queued comes back with `scheduled: true`.',
+    ),
   priority: z
     .array(PrioritySchema.describe('Single priority value (1=min, 5=max).'))
     .optional()
@@ -214,19 +258,16 @@ const InputSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Exact-match a single message ID. Pinning one message this way also returns its body in full — the ~500-char cap that applies to list results is lifted. `since` still bounds which cached messages are searched, so widen it when the target is older than the default window.',
+      'Exact-match a single message ID. Pinning one message this way also returns its body in full — the cap of ~500 UTF-16 code units that applies to list results is lifted. `since` still bounds which cached messages are searched, so widen it when the target is older than the default window.',
     ),
   title: z.string().optional().describe('Exact-match against the title string.'),
   message: z.string().optional().describe('Exact-match against the message body.'),
-  limit: z
-    .number()
-    .int()
-    .positive()
-    .max(LIMIT_CEILING)
-    .default(DEFAULT_LIMIT)
-    .describe(
-      'Client-side cap on returned messages. Default 20; one call returns at most 100, so a larger value is served as 100. Without `cursor`, the newest `limit` of the window are returned (listed oldest-first); with `cursor`, up to `limit` starting at the cursor message. `truncated` and `nextCursor` say when more remain.',
-    ),
+  limit: limitSchema({
+    cap: MAX_LIMIT,
+    defaultLimit: DEFAULT_LIMIT,
+    describe: (capRule) =>
+      `Client-side cap on returned messages. Default ${DEFAULT_LIMIT}. ${capRule} Without \`cursor\`, the newest \`limit\` of the window are returned (listed oldest-first); with \`cursor\`, up to \`limit\` starting at the cursor message. \`truncated\` and \`nextCursor\` say when more remain.`,
+  }),
   cursor: z
     .string()
     .optional()
@@ -249,7 +290,17 @@ const MessageSchema = z
       .describe(
         "Message ID — pass back as `id` to fetch this message with its whole body. To update, clear, or delete the notification it belongs to, pass this row's `sequence_id` when it has one (update, clear, and delete rows do), otherwise this `id`. To page through a window, pass the `nextCursor` enrichment value as `cursor`.",
       ),
-    time: z.string().describe('ISO 8601 timestamp when ntfy accepted the message.'),
+    time: z
+      .string()
+      .describe(
+        'ISO 8601 timestamp: when ntfy accepted an immediate publish, or the scheduled delivery time of a delayed one, which ntfy keeps after delivery.',
+      ),
+    scheduled: z
+      .boolean()
+      .optional()
+      .describe(
+        "True when the call set `scheduled: true` and this row's `time` is later than ntfy's clock at this response (the poll's `Date` header, or this server's clock when that header is missing or unparseable): the message is still queued for later delivery. Absent otherwise. It compares `time`, not ntfy's delivery state, so a message whose time passed seconds ago can still be queued until ntfy's next scheduler run (every 10 s by default) and carries no flag.",
+      ),
     event: z
       .enum(['message', 'message_clear', 'message_delete', 'poll_request'])
       .describe('Event type.'),
@@ -269,19 +320,25 @@ const MessageSchema = z
       .string()
       .optional()
       .describe(
-        `Notification body. Truncated client-side to ~${MESSAGE_TRUNCATE_AT} chars; see \`messageTruncated\` for the count of dropped chars. Returned whole when the call pinned a single message via \`id\`. Absent on clear/delete events.`,
+        `Notification body. Truncated client-side to ~${MESSAGE_TRUNCATE_AT} UTF-16 code units, cut on a code-point boundary; see \`messageTruncated\` for the count dropped. Returned whole when the call pinned a single message via \`id\`. Absent on clear/delete events.`,
       ),
     messageTruncated: z
       .number()
       .optional()
       .describe(
-        "Count of additional characters dropped from `message`. To read the whole body, call this tool again with `id` set to this message's `id` and a `since` window that still covers it — a single-message fetch skips truncation. Absent when the full body fit within the cap or truncation was skipped.",
+        "Count of UTF-16 code units dropped from `message` — a character outside the Basic Multilingual Plane, such as most emoji, counts as 2. To read the whole body, call this tool again with `id` set to this message's `id` and a `since` window that still covers it — a single-message fetch skips truncation. Absent when the full body fit within the cap or truncation was skipped.",
       ),
     markdown: z
       .boolean()
       .optional()
       .describe(
         'True when the message was published as Markdown, so `message` is Markdown source; absent for plain text.',
+      ),
+    encoding: z
+      .string()
+      .optional()
+      .describe(
+        '`base64` when ntfy stored a body that was not UTF-8 text (a UnifiedPush publish of binary data), so `message` is the base64 of those bytes rather than readable text; absent for a text body.',
       ),
     priority: PrioritySchema.optional().describe(
       'Notification priority as published; absent when the publish set none, which ntfy delivers at the default (3). An explicit 3 is returned as 3.',
@@ -291,6 +348,12 @@ const MessageSchema = z
       .optional()
       .describe('Tags applied to the notification; absent when none.'),
     click: z.string().optional().describe('Click URL; absent when no click action was set.'),
+    icon: z
+      .string()
+      .optional()
+      .describe(
+        'Icon URL shown with the notification, exactly as ntfy returned it; absent when no icon was set. An update replaces the whole notification, so pass this as `icon` to `ntfy_publish_message` to keep the icon.',
+      ),
     actions: z
       .array(ActionReadbackSchema)
       .optional()
@@ -358,7 +421,7 @@ function filterSummary(f: FilterEcho | undefined): string {
   return parts.length ? parts.join(', ') : 'none';
 }
 
-export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
+export const ntfyFetchMessages = tool(TOOL_NAME, {
   description:
     'Poll cached messages from one or more ntfy topics with optional filters. Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity. Multiple topics are passed as a comma-separated list. One call returns the newest messages of the window; when more match, page through the whole window oldest-first by passing `nextCursor` back as `cursor`. Long bodies are truncated client-side to keep list responses bounded; refetch with that message `id` to read one in full.',
   annotations: { readOnlyHint: true, openWorldHint: true },
@@ -428,7 +491,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     {
       reason: 'invalid_since',
       code: JsonRpcErrorCode.ValidationError,
-      when: "ntfy rejected `since` as `invalid since parameter` (a malformed duration or timestamp, or a duration unit other than `s`, `m`, `h`). Any other 400 keeps ntfy's own text and carries no reason.",
+      when: "ntfy rejected `since` as `invalid since parameter` (a malformed duration or timestamp, or a duration unit other than `s`, `m`, `h`), or `since` is a whole number of 1000000000000 or more — a millisecond timestamp, which ntfy would read as seconds past any message — refused before any request. Any other 400 from ntfy keeps ntfy's own text and carries no reason",
       recovery:
         'Use one of: `all`, `latest`, a duration like `10m` / `2h` / `24h` (units `s`, `m`, `h`), a Unix timestamp (seconds), or a message ID.',
     },
@@ -464,6 +527,15 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       recovery:
         "The server at the base URL answered with something other than ntfy's JSON message stream. Check that `base_url` (or the configured `NTFY_BASE_URL`) points at an ntfy server, then retry.",
     },
+    {
+      reason: 'not_ntfy_endpoint',
+      code: JsonRpcErrorCode.NotFound,
+      when: "The poll did not reach an ntfy topic route: a non-2xx answer without ntfy's JSON error envelope on a status no other reason covers (such as a 404, 405, or 501, or a 401 or 403 without the envelope), or ntfy's own 40401 `page not found`. The code stays the one the HTTP status maps to",
+      retryable: false,
+      thrownBy: 'service',
+      recovery:
+        'Check that `base_url` (or the configured `NTFY_BASE_URL`) is the root URL of an ntfy server, not a page under it, and that no proxy in front of it refused the request. A `topic` of `docs`, `static`, or `file` is never polled as a topic, since ntfy serves its own documentation, web-app files, and attachments under those names: poll another topic.',
+    },
   ],
 
   async handler(input: Input, ctx): Promise<Output> {
@@ -486,6 +558,24 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
      * to ntfy's `all`, and a blank `id` would lift the cap on an unfiltered list.
      */
     const requestedSince = input.since.trim() || DEFAULT_SINCE;
+    /**
+     * Read off the caller's own `since`, never the window start a cursor
+     * carries: that is a current 10-digit time, sent only under a duration.
+     */
+    const digitMessageId = DIGIT_MESSAGE_ID.test(requestedSince);
+    const sinceSeconds =
+      !digitMessageId && UNIX_SECONDS.test(requestedSince) ? Number(requestedSince) : undefined;
+    if (sinceSeconds !== undefined && sinceSeconds >= SINCE_SECONDS_CEILING) {
+      throw ctx.fail(
+        'invalid_since',
+        `since "${requestedSince}" is 1000000000000 or more: ntfy reads a numeric since as Unix seconds, which puts it so far ahead that no message can match.`,
+        {
+          recovery: {
+            hint: 'A numeric `since` is a Unix timestamp in seconds (10 digits today): divide a millisecond timestamp by 1000, or send a duration such as `10m`.',
+          },
+        },
+      );
+    }
     const tags = input.tags?.map((t) => t.trim()).filter((t) => t.length > 0);
     const filters: FilterEcho = {
       priority: input.priority?.length ? input.priority : undefined,
@@ -533,7 +623,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       const code = getCode(err);
       const msg = getMessage(err);
       if (isAuthRejection(err)) {
-        throw ctx.fail('forbidden_topic', msg || `Forbidden for topic "${topic}"`);
+        throw ctx.fail('forbidden_topic', msg || 'ntfy refused access to the topic.');
       }
       if (isRateLimitedCode(code)) {
         throw ctx.fail(
@@ -580,7 +670,11 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     }
     const { upstreamTruncated } = polled;
     const totalCount = notifications.length;
-    const limit = Math.min(input.limit, MAX_LIMIT);
+    const { applied: limit, clamped } = clampLimit(
+      input.limit,
+      { cap: MAX_LIMIT, tool: TOOL_NAME },
+      ctx,
+    );
 
     /**
      * ntfy returns the window oldest-first. Without a cursor the page is the
@@ -594,7 +688,7 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       if (start === -1) {
         throw ctx.fail(
           'cursor_not_found',
-          `Cursor "${rawCursor}" names none of the ${totalCount} messages in the window for topic "${topic}" (since "${since}"${pinned === undefined ? '' : ', where the walk began'}).`,
+          `Cursor "${rawCursor}" names none of the ${totalCount} messages in the fetched window (since "${since}"${pinned === undefined ? '' : ', where the walk began'}).`,
         );
       }
     }
@@ -639,15 +733,34 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     // `notice` is last-wins, so every condition contributes a sentence here and
     // the joined text is set once.
     const notices: string[] = [];
+    // How ntfy read a numeric `since` leads, since it explains the window the rest describes.
+    if (digitMessageId) {
+      notices.push(
+        `ntfy reads the 12-digit \`since\` ${literal(requestedSince)} as a message ID, not a Unix timestamp; an ID it does not hold returns the whole cache.`,
+      );
+    } else if (sinceSeconds !== undefined && sinceSeconds < SINCE_SECONDS_FLOOR) {
+      // Out of a `Date`'s range only far below zero: a large positive value was refused above.
+      notices.push(
+        `ntfy reads \`since\` ${literal(requestedSince)} as Unix seconds, ${unixInstant(sinceSeconds) ?? 'a time before 1970'}, not as a duration; for a duration, add a unit, such as \`10m\`.`,
+      );
+    }
     // Under ntfy's replay cap the count is of what ntfy sent, not of every match.
     const found = upstreamTruncated
       ? `ntfy returned ${totalCount} messages`
       : `${totalCount} messages matched`;
     if (page.length === 0) {
+      // `all` is already the widest window, so there is nothing wider to suggest.
+      const advice =
+        since === 'all'
+          ? `That window is everything ntfy still caches, so ${hasFilters ? 'drop filters or ' : ''}verify the topic name.`
+          : `Try a wider \`since\` window${hasFilters ? ', drop filters,' : ''} or verify the topic name.`;
+      const queued = input.scheduled
+        ? ''
+        : ' A delayed message ntfy has not delivered yet is returned only with `scheduled: true`.';
       notices.push(
         `No messages on topic ${literal(topic)} (since ${literal(since)})${
           hasFilters ? ` with filters ${filterSummary(filters)}` : ''
-        }. Try a wider \`since\` window${hasFilters ? ', drop filters,' : ''} or verify the topic name. A message published in the last few seconds may not be returned yet, so retry shortly before concluding it is missing.`,
+        }. ${advice}${queued} A message published in the last few seconds may not be returned yet, so retry shortly before concluding it is missing.`,
       );
     } else if (nextCursor !== undefined) {
       const continuation = `call again with \`cursor\` set to ${literal(nextCursor)} and the same \`topic\`, \`since\`, and filters`;
@@ -657,18 +770,18 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
         input.limit < MAX_LIMIT && totalCount < MAX_LIMIT && pinned === undefined
           ? ` Or raise \`limit\` to ${totalCount}${cursor === undefined ? '' : ' and drop `cursor`'} to get the whole window in one call.`
           : '';
+      const served = clamped
+        ? `one call returns at most ${MAX_LIMIT} (\`limit\` ${input.limit} was served as ${MAX_LIMIT})`
+        : undefined;
       if (cursor === undefined) {
-        const cut =
-          input.limit > MAX_LIMIT
-            ? `one call returns at most ${MAX_LIMIT}`
-            : `\`limit\` was ${input.limit}`;
+        const cut = served ?? `\`limit\` was ${input.limit}`;
         notices.push(
           `${found} (\`totalCount\`) but ${cut}, so this response holds the newest ${page.length} and leaves out the older ${start}. To read the whole window oldest-first, ${continuation}, then pass each response's \`nextCursor\` as the next \`cursor\`.${raise}`,
         );
       } else {
         const of = upstreamTruncated ? 'messages ntfy returned' : 'messages in the window';
         notices.push(
-          `This page holds ${page.length} of the ${totalCount} ${of} (\`totalCount\`), oldest-first from \`cursor\`. For the next page, ${continuation}.${raise}`,
+          `This page holds ${page.length} of the ${totalCount} ${of} (\`totalCount\`), oldest-first from \`cursor\`${served ? `; ${served}` : ''}. For the next page, ${continuation}.${raise}`,
         );
       }
     } else if (truncated) {
@@ -688,10 +801,19 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     // A call pinned to one message by `id` returns its body whole — the only
-    // path to a body the ~500-char list cap would otherwise cut. A blank `id`
-    // was resolved to no filter above, so that response is still a capped list.
+    // path to a body the list cap (~500 UTF-16 code units) would otherwise cut.
+    // A blank `id` was resolved to no filter above, so that response is still a
+    // capped list.
     const truncateBody = filters.id === undefined;
-    return { messages: page.map((m) => shapeMessage(m, { truncateBody })) };
+    // Only a `scheduled` poll can return a row ntfy still holds. ntfy schedules
+    // by its own clock, so its `Date` decides; this server's clock stands in
+    // only when that header is missing or unparseable.
+    const scheduledAsOfSeconds = input.scheduled
+      ? (polled.ntfyClockSeconds ?? Date.now() / 1000)
+      : undefined;
+    return {
+      messages: page.map((m) => shapeMessage(m, { truncateBody, scheduledAsOfSeconds })),
+    };
   },
 
   format(result) {
@@ -702,7 +824,8 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
     const blocks = result.messages.map((m) => {
       const lines: string[] = [
         `### ${literal(m.id)} — ${literal(m.event)} on ${literal(m.topic)}`,
-        `Time: ${m.time}`,
+        // A queued row's `time` is its future delivery time, not when it was sent.
+        m.scheduled ? `Delivers: ${m.time} (scheduled)` : `Time: ${m.time}`,
       ];
       if (m.expires) lines.push(`Cache expires: ${m.expires}`);
       if (m.sequence_id) lines.push(`References sequence: ${literal(m.sequence_id)}`);
@@ -712,6 +835,9 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
       }
       if (m.tags?.length) lines.push(`Tags: ${m.tags.map(literal).join(' · ')}`);
       if (m.click) lines.push(`Click action: ${literal(m.click)}`);
+      // A code span, never an image: the publisher picks the URL, and an image
+      // would have a rendering client fetch it.
+      if (m.icon) lines.push(`Icon: ${literal(m.icon)}`);
       if (m.attachment) {
         const a = m.attachment;
         const meta: string[] = [];
@@ -725,10 +851,11 @@ export const ntfyFetchMessages = tool('ntfy_fetch_messages', {
         lines.push('Actions:');
         for (const a of m.actions) lines.push(`- ${literal(JSON.stringify(a))}`);
       }
+      if (m.encoding) lines.push(`Body encoding: ${literal(m.encoding)}`);
       if (m.message !== undefined) {
         lines.push('', literalBlock(m.message, m.markdown ? 'markdown' : 'text'));
         if (m.messageTruncated !== undefined) {
-          lines.push(`_(${m.messageTruncated} chars more)_`);
+          lines.push(`_(${m.messageTruncated} more UTF-16 code units)_`);
         }
       }
       return lines.join('\n');

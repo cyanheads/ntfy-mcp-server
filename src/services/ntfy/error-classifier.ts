@@ -98,21 +98,86 @@ function isDeadlineExceeded(err: unknown): boolean {
 }
 
 /**
- * True when ntfy itself refused access: the captured body (`data.body`) is its
- * error envelope with a `401xx` or `403xx` code. A 401 or 403 without that
- * envelope — the HTML page a reverse proxy or CDN answers with, for a reason of
- * its own — says nothing about the topic's auth, so it stays unclassified and
- * keeps its upstream status in the message. ntfy always answers with the status
- * its code names (`40301` with 403), so the code must also match the status the
- * response carried (`data.status`): an auth code on a 429, 5xx, or 400 is no
- * auth refusal ntfy sent. Every surface that maps an auth failure to
- * `forbidden_topic` asks this, never the status-derived JSON-RPC code.
+ * ntfy's own five-digit error code from the captured error envelope
+ * (`data.body`), or `undefined` when the body is no envelope or its code is not
+ * an integer. ntfy always answers with the HTTP status its code names (`40301`
+ * with 403, `40059` with 400, `50001` with 500), so a code whose status differs
+ * from the one the response carried (`data.status`) is no answer ntfy sent, and
+ * counts as none.
+ */
+function ntfyErrorCode(err: unknown): number | undefined {
+  const { code } = parseErrorEnvelope(getDataBody(err)) ?? {};
+  if (typeof code !== 'number' || !Number.isInteger(code)) return;
+  return Math.floor(code / 100) === getDataStatus(err) ? code : undefined;
+}
+
+/**
+ * True when the answer carried ntfy's own error envelope, with a code on the
+ * status that code names (see `ntfyErrorCode`). ntfy answers every failure on
+ * its routes with one, so an answer without it came from something else: a
+ * proxy, a host that is not ntfy, ntfy.sh's docs or static file server.
+ */
+export function hasNtfyEnvelope(err: unknown): boolean {
+  return ntfyErrorCode(err) !== undefined;
+}
+
+/**
+ * True when ntfy itself refused access: its error envelope carries a `401xx` or
+ * `403xx` code on the status that code names (see `ntfyErrorCode`). A 401 or 403
+ * without that envelope — the HTML page a reverse proxy or CDN answers with, for
+ * a reason of its own — says nothing about the topic's auth, so it is no
+ * `forbidden_topic` (it is `isNotNtfyEndpoint`'s), and an auth code on a 429,
+ * 5xx, or 400 is no auth refusal ntfy sent. Every surface that maps an auth
+ * failure to `forbidden_topic` asks this, never the status-derived JSON-RPC
+ * code.
  */
 export function isAuthRejection(err: unknown): boolean {
-  const { code } = parseErrorEnvelope(getDataBody(err)) ?? {};
-  if (typeof code !== 'number' || !Number.isInteger(code)) return false;
-  const family = Math.floor(code / 100);
-  return (family === 401 || family === 403) && family === getDataStatus(err);
+  const code = ntfyErrorCode(err);
+  if (code === undefined) return false;
+  const status = Math.floor(code / 100);
+  return status === 401 || status === 403;
+}
+
+/** 4xx statuses the retry boundary treats as transient: a timeout, too early, a rate limit. */
+const TRANSIENT_4XX = new Set([408, 425, 429]);
+
+/**
+ * True when the request did not reach an ntfy topic route, the failure
+ * `NtfyService` labels `not_ntfy_endpoint`: ntfy's own `40401` route miss (a
+ * `base_url` with a path that is not the server root), or an answer without
+ * ntfy's envelope (see `hasNtfyEnvelope`) on a status whose answer is final —
+ * a 3xx, a 4xx, or a 501. A 429 and the transient 408 and 425 are left to
+ * `rate_limited` and the retry boundary, and so is every other 5xx, which
+ * `upstream_unreachable` claims once the retries run out. Every other ntfy
+ * envelope is an answer from a topic route, whatever it says.
+ */
+export function isNotNtfyEndpoint(err: unknown): boolean {
+  const code = ntfyErrorCode(err);
+  if (code !== undefined) return code === 40401;
+  const status = getDataStatus(err);
+  if (status === undefined) return false;
+  return status === 501 || (status >= 300 && status < 500 && !TRANSIENT_4XX.has(status));
+}
+
+/**
+ * True when ntfy itself answered with its generic 500, envelope code `50001`
+ * (`internal server error`). A 500 without that envelope — a proxy's page, a
+ * body cut off before ntfy finished it — is not one.
+ */
+export function isNtfyInternalError(err: unknown): boolean {
+  return ntfyErrorCode(err) === 50001;
+}
+
+/**
+ * True for the failure `NtfyService.publish` raises when ntfy answers a publish
+ * it stores as a file — `filename` set, no `attach` — with its own 500 `50001`:
+ * ntfy v2.20.0 and later fail writing that file for every JSON publish, so the
+ * service sends it once and labels it `invalid_attachment`. Only the service
+ * sets that label on an error; `classifyInvalidParams` returns the same reason
+ * for a malformed `attach` URL without setting it.
+ */
+export function isFileStoreFailure(err: unknown): boolean {
+  return (err as { data?: { reason?: unknown } })?.data?.reason === 'invalid_attachment';
 }
 
 export function isRateLimitedCode(code: unknown): boolean {
@@ -185,8 +250,8 @@ export function isNotFoundCode(code: unknown): boolean {
  * only when an earlier attempt was really retried, so a first answer arrives
  * with `data.retryAfter` and no suffix: as an over-budget 429 classifies as
  * `rate_limited` without claiming a retry, this one classifies here. A 5xx
- * marked `retryable: false` (a 501) was never going to be retried, and stays
- * out.
+ * marked `retryable: false` (a 501, or ntfy's 500 to a publish it stores as a
+ * file — `isFileStoreFailure`) was never going to be retried, and stays out.
  */
 export function isUpstreamUnreachable(err: unknown): boolean {
   if (isDeadlineExceeded(err)) return true;
@@ -202,9 +267,10 @@ export function isUpstreamUnreachable(err: unknown): boolean {
 }
 
 /**
- * The `McpError` message ("ntfy returned HTTP …") and the captured upstream body
- * (`err.data.body`), lowercased — the distinguishing keywords live in the body,
- * not the status-line message.
+ * The `McpError` message ("ntfy returned HTTP …", or the request URL's host
+ * in place of `ntfy` for an answer without ntfy's envelope) and the captured
+ * upstream body (`err.data.body`), lowercased — the distinguishing keywords live
+ * in the body, not the status-line message.
  */
 function rejectionText(err: unknown): string {
   return `${getMessage(err)} ${getDataBody(err)}`.toLowerCase();
@@ -220,16 +286,21 @@ const ANONYMOUS_SENDER = [
 ];
 
 /**
- * Heuristic split of a 4xx-classed error into one of the publish contract
- * sub-reasons, read from both the status-line message and the captured body.
- * Returns `undefined` when no case matches.
+ * Split of a 4xx-classed error into one of the publish contract sub-reasons:
+ * `invalid_timezone` by ntfy's envelope code, the rest by phrase, read from
+ * both the status-line message and the captured body. Returns `undefined` when
+ * no case matches.
+ *
+ * `invalid_timezone` is ntfy's 40059, a `timezone` its zone database does not
+ * know, read from ntfy's error envelope (see `ntfyErrorCode`) rather than its
+ * words, so a proxy page that happens to say "invalid timezone" is not one.
  *
  * ntfy's three `delay` rejections (40004 unparseable, 40005 too soon, 40006 too
- * far out) share the prefix `invalid delay parameter`, matched first because
- * 40006 also says "too large". Nothing looser is matched: ntfy's other
+ * far out) share the prefix `invalid delay parameter`, matched before "too
+ * large" because 40006 also says it. Nothing looser is matched: ntfy's other
  * delay-related rejections (a delayed message with caching off, e-mail, or a
- * call; an attachment that expires first; a bad timezone) mention a delay or
- * link the scheduled-delivery docs, but their text already names the conflict.
+ * call; an attachment that expires first) mention a delay or link the
+ * scheduled-delivery docs, but their text already names the conflict.
  *
  * Size rejections are recognized by the phrase "too large" — a bare mention of
  * an attachment is not one, since ntfy's "attachment URL is invalid" rejection
@@ -248,7 +319,16 @@ const ANONYMOUS_SENDER = [
  */
 export function classifyInvalidParams(
   err: unknown,
-): 'invalid_delay' | 'invalid_attachment' | 'payload_too_large' | 'unverified_contact' | undefined {
+):
+  | 'invalid_timezone'
+  | 'invalid_delay'
+  | 'invalid_attachment'
+  | 'payload_too_large'
+  | 'unverified_contact'
+  | undefined {
+  if (ntfyErrorCode(err) === 40059) {
+    return 'invalid_timezone';
+  }
   const haystack = rejectionText(err);
   if (haystack.includes('invalid delay parameter')) {
     return 'invalid_delay';

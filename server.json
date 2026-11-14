@@ -74,6 +74,13 @@
           "default": "false"
         },
         {
+          "name": "NTFY_CLAMP_LIMITS",
+          "description": "When true, a `limit` above a tool's per-call cap (100 for ntfy_fetch_messages, 200 for ntfy_search_emoji_tags) is served as the cap with a notice, and the input schema advertises no maximum. Set to false to advertise and enforce a schema maximum at the cap instead, so a larger value is rejected.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
           "name": "NTFY_ENABLE_EMOJI_TAGS",
           "description": "Set to false to disable the ntfy_search_emoji_tags tool: it leaves tools/list, and the server instructions and ntfy_publish_message stop pointing at it.",
           "format": "string",
@@ -176,6 +183,13 @@
           "format": "string",
           "isRequired": false,
           "default": "false"
+        },
+        {
+          "name": "NTFY_CLAMP_LIMITS",
+          "description": "When true, a `limit` above a tool's per-call cap (100 for ntfy_fetch_messages, 200 for ntfy_search_emoji_tags) is served as the cap with a notice, and the input schema advertises no maximum. Set to false to advertise and enforce a schema maximum at the cap instead, so a larger value is rejected.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "NTFY_ENABLE_EMOJI_TAGS",

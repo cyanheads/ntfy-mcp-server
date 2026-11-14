@@ -1,16 +1,18 @@
 /**
  * @fileoverview Tests for the `ntfy://{topic}` resource — fixed snapshot
  * window, open/keepalive filtering, forbidden-topic mapping (only on ntfy's own
- * 401/403 envelope; a proxy's HTML 403 stays unlabelled), the topic quoted as
- * plain text in the fallback message, generic-error rethrow, the newest-20
+ * 401/403 envelope; a proxy's HTML 403 is `not_ntfy_endpoint`), a fallback message that
+ * names no topic, generic-error rethrow, the newest-20
  * truncation cap, message normalization (ISO 8601
- * timestamps, body truncation, sparse payloads), the snapshot envelope
+ * timestamps, body truncation that never splits a surrogate pair, `icon`,
+ * `encoding`, and action ids carried through, sparse payloads), the snapshot envelope
  * shape (baseUrl, since, count, truncated, upstreamTruncated), and — through
  * the real service — a damaged poll body failing the read as
  * `upstream_malformed`, a 429 (status line or mid-replay error line) failing it
  * as `rate_limited`, a refused connection, an exhausted 5xx, or a call deadline
  * failing it as `upstream_unreachable` (so does a 503 whose `Retry-After`
- * outlasts the call, carrying the wait), a cancelled read left unlabelled, and
+ * outlasts the call, carrying the wait), an answer without ntfy's envelope
+ * failing it as `not_ntfy_endpoint`, a cancelled read left unlabelled, and
  * each declared reason's recovery hint as a client reads
  * it through the server factory. Retry ladders and the deadline run on a fake clock.
  * @module tests/resources/ntfy-topic.resource
@@ -129,7 +131,7 @@ describe('ntfyTopicResource handler', () => {
     });
   });
 
-  it('names the topic in double quotes, as plain text, when ntfy gave no explanation', async () => {
+  it('falls back to a message without the topic when ntfy gave no explanation', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'fetch').mockRejectedValue(
       forbidden('', { status: 403, body: '{"code":40301,"http":403,"error":"forbidden"}' }),
@@ -139,7 +141,7 @@ describe('ntfyTopicResource handler', () => {
       uri: new URL('ntfy://_secret_'),
     });
     await expect(ntfyTopicResource.handler({ topic: '_secret_' }, ctx)).rejects.toMatchObject({
-      message: 'Forbidden for topic "_secret_"',
+      message: 'ntfy refused access to the topic.',
       data: { reason: 'forbidden_topic' },
     });
   });
@@ -242,6 +244,22 @@ describe('ntfyTopicResource handler', () => {
     };
     expect(result.messages[0]?.message).toHaveLength(500);
     expect(result.messages[0]?.messageTruncated).toBe(200);
+  });
+
+  it('cuts before a surrogate pair the cap would split, so the JSON payload stays well-formed (#48)', async () => {
+    const svc = freshService();
+    const body = `${'a'.repeat(499)}🚀${'b'.repeat(20)}`;
+    stubFetch(svc, [{ id: 'm', time: 1, event: 'message', topic: 'alerts', message: body }]);
+    const ctx = createMockContext({
+      errors: ntfyTopicResource.errors,
+      uri: new URL('ntfy://alerts'),
+    });
+    const result = (await ntfyTopicResource.handler({ topic: 'alerts' }, ctx)) as {
+      messages: Array<{ message?: string; messageTruncated?: number }>;
+    };
+    expect(result.messages[0]).toMatchObject({ message: 'a'.repeat(499), messageTruncated: 22 });
+    // A lone high surrogate serializes as a `\ud83d` escape, which strict JSON parsers reject.
+    expect(JSON.stringify(result)).not.toMatch(/\\ud[89ab][0-9a-f]{2}/i);
   });
 
   it('leaves omitted upstream fields undefined (sparse payload)', async () => {
@@ -607,6 +625,17 @@ describe('ntfyTopicResource handler', () => {
         poll('<html><body>Captive portal</body></html>'),
         'NTFY_BASE_URL',
       ],
+      // #55: ntfy.sh's `static` file server answers a poll of that name without ntfy's envelope.
+      [
+        'not_ntfy_endpoint',
+        JsonRpcErrorCode.NotFound,
+        () =>
+          new Response('404 page not found\n', {
+            status: 404,
+            headers: { 'content-type': 'text/plain; charset=utf-8' },
+          }),
+        'NTFY_BASE_URL',
+      ],
     ])(
       'hands a reader the declared `%s` recovery hint, never one naming `base_url`',
       async (reason, code, respond, hint) => {
@@ -621,6 +650,14 @@ describe('ntfyTopicResource handler', () => {
       },
     );
 
+    it('points the operator at `NTFY_BASE_URL` and the reader at the reserved `docs`, `static`, and `file` (#55)', () => {
+      const entry = ntfyTopicResource.errors?.find((e) => e.reason === 'not_ntfy_endpoint');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.NotFound, retryable: false });
+      for (const term of ['operator', '`NTFY_BASE_URL`', 'proxy', '`docs`', '`static`', '`file`']) {
+        expect(entry?.recovery).toContain(term);
+      }
+    });
+
     it.each([
       ["ntfy's 401 envelope", ntfyError(401, 'unauthorized'), 'forbidden_topic'],
       [
@@ -630,7 +667,8 @@ describe('ntfyTopicResource handler', () => {
             status: 403,
             headers: { 'content-type': 'text/html' },
           }),
-        undefined,
+        // Something other than ntfy answered (#55): its own reason, never the auth one.
+        'not_ntfy_endpoint',
       ],
     ])(
       'labels %s as a client reads it through the server (#45)',
@@ -642,7 +680,12 @@ describe('ntfyTopicResource handler', () => {
         // `forbidden_topic` carries its declared `Forbidden`; the HTML 403 keeps the status-mapped one.
         expect(error?.code).toBe(JsonRpcErrorCode.Forbidden);
         expect(error?.data?.reason).toBe(reason);
-        if (reason === undefined) expect(error?.data?.recovery).toBeUndefined();
+        expect(error?.data?.recovery?.hint).toBe(
+          ntfyTopicResource.errors?.find((e) => e.reason === reason)?.recovery,
+        );
+        // The captured upstream body stays on the server.
+        expect(error?.data).not.toHaveProperty('body');
+        expect(error?.data).not.toHaveProperty('responseBody');
       },
     );
 
@@ -702,6 +745,73 @@ describe('ntfyTopicResource handler', () => {
       expect(messages[0]).toMatchObject({ message: '**bold**', markdown: true });
       expect(messages[0]).not.toHaveProperty('content_type');
       expect(messages[1]).not.toHaveProperty('markdown');
+    });
+
+    it('carries `icon`, `encoding`, and action ids as ntfy sent them, and omits what it omitted (#49)', async () => {
+      freshService();
+      const action = {
+        id: 'DAaFWDY6Vc',
+        action: 'view',
+        label: 'Open',
+        clear: false,
+        url: 'https://example.com/view',
+      };
+      stubUpstream(
+        poll(
+          [
+            JSON.stringify({
+              id: 'Z4MeYFR5eSYs',
+              time: 1794636448,
+              event: 'message',
+              topic: 'alerts',
+              message: 'icon probe raw',
+              icon: 'https://example.com/icon.png',
+              actions: [action],
+            }),
+            JSON.stringify({
+              id: 'up1',
+              time: 1794636449,
+              event: 'message',
+              topic: 'alerts',
+              message: 'AAECAwQ=',
+              encoding: 'base64',
+            }),
+            line('plain', 1794636450),
+          ].join('\n'),
+        ),
+      );
+      const ctx = createMockContext({
+        errors: ntfyTopicResource.errors,
+        uri: new URL('ntfy://alerts'),
+      });
+      const result = await ntfyTopicResource.handler({ topic: 'alerts' }, ctx);
+      const { messages } = JSON.parse(JSON.stringify(result)) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      expect(messages[0]).toMatchObject({
+        icon: 'https://example.com/icon.png',
+        actions: [action],
+      });
+      expect(messages[1]).toMatchObject({ message: 'AAECAwQ=', encoding: 'base64' });
+      expect(messages[2]).not.toHaveProperty('icon');
+      expect(messages[2]).not.toHaveProperty('encoding');
+    });
+
+    it('never marks a row `scheduled`, even one whose `time` is ahead of every clock (#51)', async () => {
+      freshService();
+      // 2100-01-01T00:00:00Z: later than ntfy's clock or this server's, whichever a flag would read.
+      stubUpstream(poll(line('ahead', 4102444800)));
+      const ctx = createMockContext({
+        errors: ntfyTopicResource.errors,
+        uri: new URL('ntfy://alerts'),
+      });
+      const result = await ntfyTopicResource.handler({ topic: 'alerts' }, ctx);
+      const { messages } = JSON.parse(JSON.stringify(result)) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ id: 'ahead', time: '2100-01-01T00:00:00.000Z' });
+      expect(messages[0]).not.toHaveProperty('scheduled');
     });
   });
 

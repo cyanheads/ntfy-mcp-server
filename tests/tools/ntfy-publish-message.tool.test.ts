@@ -3,20 +3,23 @@
  * upstream, default-topic resolution, the priority schema's single-node
  * validation and advertised shape, byte-length message validation,
  * format-rendering (including the scheduled delivery-time label), scheduled-flag
- * synthesis, base_url override and its scheme validation, the consent gate
+ * synthesis, `timezone` sent as given (blank unsent), the `icon` echo as a code
+ * span or absent, base_url override and its scheme validation, the consent gate
  * across both round trips (which inputs prompt and which publish straight
  * through, the first round's `input_required` result and the consent record
  * it stores, every reply on the round that redeems that record, and every
  * round that must ask again instead of publishing — replay, pre-answer,
- * fabricated or malformed id, a record minted for other content, target, tool,
- * or caller), and the full contract error mapping
+ * fabricated or malformed id, a record minted for other content — another
+ * `timezone` included — target, tool, or caller), and the full contract error mapping
  * (forbidden only from ntfy's own 401/403 envelope / rate-limit /
  * payload-too-large from a 413, an oversize title or tags, or a refused
- * attachment, each with its own hint / invalid-delay / invalid-attachment /
+ * attachment, each with its own hint / invalid-delay / invalid-timezone from
+ * ntfy's 40059 envelope / invalid-attachment /
  * unverified-contact from ntfy's refusal phrases, with a credentials hint for an
- * anonymous sender / upstream-unreachable / generic rethrow) with the upstream
- * explanation preserved on the error message, values in thrown messages quoted
- * as plain text, and a 200 reply that is not an ntfy message failing as
+ * anonymous sender / upstream-unreachable / not-ntfy-endpoint for an answer
+ * without ntfy's envelope or ntfy's 40401 / generic rethrow) with the upstream
+ * explanation preserved on the error message, a declined publish's message
+ * naming no topic, and a 200 reply that is not an ntfy message failing as
  * `upstream_malformed` without a resend.
  * @module tests/tools/ntfy-publish-message.tool
  */
@@ -38,7 +41,7 @@ import {
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
 
 import { resetServerConfig } from '@/config/server-config.js';
 import { ntfyManageMessage } from '@/mcp-server/tools/definitions/ntfy-manage-message.tool.js';
@@ -63,6 +66,20 @@ function freshService() {
     requestTimeoutMs: 1000,
     maxRetries: 0,
   } as never);
+}
+
+/** Answer every `fetch` to `ntfy.test` with `respond()`; a call to any other host fails the test. */
+function stubNtfyHttp(respond: () => Response) {
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+    return respond();
+  });
+}
+
+/** The JSON body of the `n`th outbound request `upstream` saw. */
+function sentBody(upstream: MockInstance<typeof fetch>, n = 0): Record<string, unknown> {
+  return JSON.parse(String((upstream.mock.calls[n]?.[1] as RequestInit | undefined)?.body));
 }
 
 /** The wire shape of the embedded `elicitation/create` request the gate emits. */
@@ -307,15 +324,18 @@ describe('ntfyPublishMessage handler', () => {
       );
       const { error, text } = await failed();
       expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
-      expect(error.data.reason).toBeUndefined();
-      expect(error.data.recovery).toBeUndefined();
+      // Something other than ntfy answered (#55): its own reason, never the auth one.
+      expect(error.data.reason).toBe('not_ntfy_endpoint');
+      expect(error.data.recovery).toEqual({
+        hint: ntfyPublishMessage.errors?.find((e) => e.reason === 'not_ntfy_endpoint')?.recovery,
+      });
       expect(error.message).toContain('HTTP 403');
       expect(text).toContain('HTTP 403');
       expect(text).not.toContain('forbidden_topic');
       expect(text).not.toContain('NTFY_AUTH_TOKEN');
     });
 
-    it('names the topic in double quotes, as plain text, when ntfy gave no explanation', async () => {
+    it('falls back to a message without the topic when ntfy gave no explanation', async () => {
       const svc = freshService();
       vi.spyOn(svc, 'publish').mockRejectedValue(
         new McpError(JsonRpcErrorCode.Forbidden, '', {
@@ -328,14 +348,87 @@ describe('ntfyPublishMessage handler', () => {
         error: { message: string; data: { reason?: string } };
       };
       expect(error).toMatchObject({
-        message: 'Forbidden for topic "_secret_"',
+        message: 'ntfy refused access to the topic.',
         data: { reason: 'forbidden_topic' },
       });
       const text = readCommonMark(
         result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
       );
-      expect(text).toContain('Error: Forbidden for topic "_secret_"');
+      expect(text).toContain('Error: ntfy refused access to the topic.');
     });
+  });
+
+  /**
+   * #55 through the real service, with retries allowed so the single request
+   * shows none was resent: example.com's 405 to `POST /`, Python
+   * `http.server`'s 501, and ntfy's own 40401 for a base URL with a path.
+   */
+  describe('not_ntfy_endpoint (#55)', () => {
+    const HINT = ntfyPublishMessage.errors?.find((e) => e.reason === 'not_ntfy_endpoint')
+      ?.recovery as string;
+
+    it.each([
+      [
+        'an HTML 405',
+        405,
+        'Method Not Allowed',
+        '<!doctype html><html lang="en"><head><title>Example Domain</title></head><body><h1>Example Domain</h1></body></html>',
+        JsonRpcErrorCode.InvalidRequest,
+        'ntfy.test returned HTTP 405 Method Not Allowed.',
+      ],
+      [
+        'an HTML 501',
+        501,
+        "Unsupported method ('POST')",
+        "<!DOCTYPE HTML><html><head><title>Error response</title></head><body><p>Error code: 501</p><p>Message: Unsupported method ('POST').</p></body></html>",
+        JsonRpcErrorCode.ServiceUnavailable,
+        "ntfy.test returned HTTP 501 Unsupported method ('POST').",
+      ],
+      [
+        "ntfy's own 40401",
+        404,
+        'Not Found',
+        '{"code":40401,"http":404,"error":"page not found"}',
+        JsonRpcErrorCode.NotFound,
+        'ntfy returned HTTP 404 Not Found: page not found',
+      ],
+    ])(
+      'fails %s once, with its status-derived code and declared recovery on both surfaces',
+      async (_label, status, statusText, body, code, message) => {
+        initNtfyService({
+          servers: [{ baseUrl: 'https://ntfy.test' }],
+          requestTimeoutMs: 1000,
+          maxRetries: 3,
+        } as never);
+        const upstream = stubNtfyHttp(
+          () =>
+            new Response(body, { status, statusText, headers: { 'content-type': 'text/html' } }),
+        );
+        const result = await runToolContract(ntfyPublishMessage, { topic: 'alerts', message: 'x' });
+        expect(upstream).toHaveBeenCalledTimes(1);
+        expect(result.isError).toBe(true);
+        const { error } = result.structuredContent as {
+          error: { code: number; message: string; data: Record<string, unknown> };
+        };
+        expect(error.code).toBe(code);
+        expect(error.message).toBe(message);
+        expect(error.data).toMatchObject({
+          reason: 'not_ntfy_endpoint',
+          retryable: false,
+          recovery: { hint: HINT },
+        });
+        for (const term of ['`base_url`', '`NTFY_BASE_URL`', 'proxy']) {
+          expect(HINT).toContain(term);
+        }
+        const text = readCommonMark(
+          result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+        );
+        expect(text).toContain(`Error: ${message}`);
+        expect(text).toContain(`Recovery: ${HINT}`);
+        expect(text).toContain('(reason not_ntfy_endpoint · not retryable)');
+        expect(JSON.stringify(result)).not.toContain('<title>');
+      },
+    );
   });
 
   it('maps a RateLimited upstream to reason `rate_limited`', async () => {
@@ -540,7 +633,6 @@ describe('ntfyPublishMessage handler', () => {
         { delay: '30m', attach: 'https://example.com/a.jpg' },
       ],
       [40037, 'invalid request: delayed call notifications are not supported', { delay: '30m' }],
-      [40059, 'invalid request: invalid timezone', { delay: '30m' }],
     ])(
       'never maps %i to `invalid_delay` — it reaches the caller as ntfy worded it',
       async (code, upstream, input) => {
@@ -784,6 +876,420 @@ describe('ntfyPublishMessage handler', () => {
     );
   });
 
+  /**
+   * A publish carrying `filename` without `attach`, which ntfy stores as a file
+   * and from v2.20.0 fails writing with its own 500 `50001` (#46). Only the
+   * network is stubbed, so the service's resend decision runs: the request
+   * count is how many publishes went out.
+   */
+  describe('`filename` without `attach` (#46)', () => {
+    function answer(respond: () => Response, maxRetries = 3) {
+      initNtfyService({
+        servers: [{ baseUrl: 'https://ntfy.test' }],
+        requestTimeoutMs: 1000,
+        maxRetries,
+      } as never);
+      return stubNtfyHttp(respond);
+    }
+
+    /** ntfy.sh's answer to a JSON publish carrying `filename` without `attach`. */
+    const fileWriteFailure = () =>
+      new Response('{"code":50001,"http":500,"error":"internal server error"}', {
+        status: 500,
+        headers: { 'content-type': 'application/json' },
+      });
+
+    async function failed(input: Record<string, unknown>) {
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'probe',
+        ...input,
+      });
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as {
+        error: {
+          code: number;
+          message: string;
+          data: { reason?: string; recovery?: { hint: string } };
+        };
+      };
+      const text = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
+      return { error, text };
+    }
+
+    /** `invalid_attachment`'s recovery as it read before #46, for a malformed `attach` URL. */
+    const URL_HINT =
+      'Pass `attach` an absolute URL (`https://host/path/file.jpg`) to an already-hosted file — the recipient device fetches it, so a local path will not work, and shortening the message will not help.';
+
+    it.each([
+      ['no `attach`', {}],
+      ['an empty `attach`', { attach: '' }],
+      ['a whitespace-only `attach`', { attach: '   ' }],
+    ])(
+      "fails ntfy's 500 `50001` with %s as `invalid_attachment` after one request, on both surfaces",
+      async (_label, extra) => {
+        const upstream = answer(fileWriteFailure);
+        const { error, text } = await failed({ filename: 'probe.txt', ...extra });
+        expect(upstream).toHaveBeenCalledTimes(1);
+        // A blank `attach` is never sent.
+        expect(sentBody(upstream)).toEqual({
+          topic: 'alerts',
+          message: 'probe',
+          filename: 'probe.txt',
+        });
+        expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+        expect(error.data.reason).toBe('invalid_attachment');
+        expect(error.message).toContain('internal server error');
+        const hint = error.data.recovery?.hint ?? '';
+        expect(hint).toContain("the hosted file's URL as `attach` alongside `filename`");
+        expect(hint).toContain('drop `filename`');
+        expect(hint).toContain('v2.20.0');
+        expect(hint).not.toBe(URL_HINT);
+        expect(hint).not.toContain('Shorten the message');
+        expect(text).toContain(`Recovery: ${hint}`);
+        expect(text).toContain('reason invalid_attachment');
+        expect(text).not.toContain('upstream_unreachable');
+      },
+    );
+
+    it("keeps a 500 without ntfy's envelope on `upstream_unreachable`", async () => {
+      const upstream = answer(
+        () => new Response('boom', { status: 500, headers: { 'content-type': 'text/plain' } }),
+        0,
+      );
+      const { error } = await failed({ filename: 'probe.txt' });
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data.reason).toBe('upstream_unreachable');
+    });
+
+    it('keeps the malformed-URL hint on 40013, without the `filename` advice', async () => {
+      answer(
+        () =>
+          new Response(
+            '{"code":40013,"http":400,"error":"invalid request: attachment URL is invalid"}',
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          ),
+      );
+      const { error, text } = await failed({ attach: 'not-a-url', filename: 'a.jpg' });
+      expect(error.data.reason).toBe('invalid_attachment');
+      expect(error.data.recovery?.hint).toBe(URL_HINT);
+      expect(text).toContain(`Recovery: ${URL_HINT}`);
+    });
+
+    it('returns the hosted file when the ntfy server stores the publish', async () => {
+      // ntfy v2.19.2 and earlier store the message as a file and answer 200.
+      const attachment = {
+        name: 'probe.txt',
+        type: 'text/plain; charset=utf-8',
+        size: 5,
+        expires: 1_794_647_316,
+        url: 'https://ntfy.test/file/rtonOynHg48f.txt',
+      };
+      const upstream = answer(() =>
+        Response.json({
+          id: 'rtonOynHg48f',
+          time: 1_794_636_516,
+          expires: 1_794_679_716,
+          event: 'message',
+          topic: 'alerts',
+          message: 'You received a file: probe.txt',
+          attachment,
+        }),
+      );
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'probe',
+        filename: 'probe.txt',
+      });
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        id: 'rtonOynHg48f',
+        message: 'You received a file: probe.txt',
+        attachment,
+      });
+    });
+
+    it.each([
+      ['an empty', ''],
+      ['a whitespace-only', '   '],
+    ])(
+      'publishes %s `filename` as a plain message, without the field',
+      async (_label, filename) => {
+        const upstream = answer(() =>
+          Response.json({ id: 'mid_1', time: 1_700_000_000, event: 'message', topic: 'alerts' }),
+        );
+        const result = await runToolContract(ntfyPublishMessage, {
+          topic: 'alerts',
+          message: 'probe',
+          filename,
+        });
+        expect(result.isError).toBeFalsy();
+        expect(upstream).toHaveBeenCalledTimes(1);
+        expect(sentBody(upstream)).toEqual({ topic: 'alerts', message: 'probe' });
+      },
+    );
+
+    it('declares `invalid_attachment` for a malformed `attach` URL and for `filename` without `attach`', () => {
+      const entry = ntfyPublishMessage.errors?.find((e) => e.reason === 'invalid_attachment');
+      expect(entry?.when).toContain('`attach` URL');
+      expect(entry?.when).toContain('`filename`');
+      expect(entry?.recovery).toContain('absolute URL');
+      expect(entry?.recovery).toContain('drop `filename`');
+    });
+
+    it('describes what `filename` does without `attach`, and which ntfy versions fail it', () => {
+      const description = ntfyPublishMessage.input.shape.filename.description ?? '';
+      expect(description).toContain('Without `attach`, ntfy stores the message body');
+      expect(description).toContain('v2.20.0');
+    });
+  });
+
+  /**
+   * `timezone`, the zone ntfy reads a natural-language `delay` in (#50). Only
+   * the network is stubbed, so the JSON body is what the service sends and the
+   * error is what `ntfyHttpError` raises from ntfy's envelope.
+   */
+  describe('`timezone` for a natural-language `delay` (#50)', () => {
+    function answer(respond: () => Response) {
+      freshService();
+      return stubNtfyHttp(respond);
+    }
+
+    /** ntfy.sh's reply to `delay: "tomorrow, 10am"` with `timezone: "Asia/Tokyo"`: 01:00 UTC. */
+    const tokyoReply = () =>
+      Response.json({
+        id: 't0g8p5U1GEHh',
+        time: 1_794_704_400,
+        expires: 1_794_747_600,
+        event: 'message',
+        topic: 'alerts',
+        message: 'tz tokyo',
+      });
+
+    const DELAY = 'tomorrow, 10am';
+
+    it('sends `timezone` beside `delay` and relays the delivery time ntfy computed, on both surfaces', async () => {
+      const upstream = answer(tokyoReply);
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'tz tokyo',
+        delay: DELAY,
+        timezone: 'Asia/Tokyo',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(upstream).toHaveBeenCalledTimes(1);
+      expect(sentBody(upstream)).toEqual({
+        topic: 'alerts',
+        message: 'tz tokyo',
+        delay: DELAY,
+        timezone: 'Asia/Tokyo',
+      });
+      expect(result.structuredContent).toMatchObject({
+        time: '2026-11-15T01:00:00.000Z',
+        scheduled: true,
+      });
+      const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      expect(text).toContain('Delivers: 2026-11-15T01:00:00.000Z');
+    });
+
+    it.each([
+      ['a lowercase name', 'america/los_angeles'],
+      ['`Local`', 'Local'],
+      ['a space-padded name', '  America/Los_Angeles  '],
+      ['a legacy alias', 'US/Pacific'],
+    ])('sends %s exactly as given, leaving the check to ntfy', async (_label, timezone) => {
+      const upstream = answer(tokyoReply);
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'x',
+        delay: DELAY,
+        timezone,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentBody(upstream)).toEqual({ topic: 'alerts', message: 'x', delay: DELAY, timezone });
+    });
+
+    it.each([
+      ['an empty', ''],
+      ['a whitespace-only', '   '],
+    ])('publishes %s `timezone` as if unset, without the field', async (_label, timezone) => {
+      const upstream = answer(tokyoReply);
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'x',
+        delay: DELAY,
+        timezone,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentBody(upstream)).toEqual({ topic: 'alerts', message: 'x', delay: DELAY });
+    });
+
+    /** The recovery #50 specifies for `invalid_timezone`. */
+    const TIMEZONE_HINT =
+      "Pass `timezone` as an IANA zone name spelled as the tz database spells it (`America/New_York`, `Asia/Tokyo`, `UTC`; ntfy matches case-sensitively), or drop it to read `delay` in the ntfy server's own timezone.";
+
+    it("fails ntfy's 40059 as `invalid_timezone`, its recovery on both surfaces", async () => {
+      const upstream = answer(
+        () =>
+          new Response(
+            '{"code":40059,"http":400,"error":"invalid request: invalid timezone","link":"https://ntfy.sh/docs/publish/#scheduled-delivery"}',
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          ),
+      );
+      const result = await runToolContract(ntfyPublishMessage, {
+        topic: 'alerts',
+        message: 'x',
+        delay: DELAY,
+        timezone: 'america/los_angeles',
+      });
+      expect(result.isError).toBe(true);
+      expect(upstream).toHaveBeenCalledTimes(1);
+      const { error } = result.structuredContent as {
+        error: {
+          code: number;
+          message: string;
+          data: { reason?: string; recovery?: { hint: string } };
+        };
+      };
+      const text = readCommonMark(
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      );
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.data.reason).toBe('invalid_timezone');
+      expect(error.data.recovery?.hint).toBe(TIMEZONE_HINT);
+      // ntfy's own explanation and docs link stay in the message.
+      expect(error.message).toContain(
+        'invalid request: invalid timezone (see https://ntfy.sh/docs/publish/#scheduled-delivery)',
+      );
+      expect(text).toContain('invalid request: invalid timezone');
+      expect(text).toContain(`Recovery: ${TIMEZONE_HINT}`);
+      expect(text).toContain('reason invalid_timezone');
+      // The topic name works as an access token, so the failure never carries it.
+      expect(JSON.stringify(error)).not.toContain('alerts');
+      expect(text).not.toContain('alerts');
+    });
+
+    it('names RFC 3339 with its required offset in the `delay` description and the `invalid_delay` recovery', () => {
+      const description = ntfyPublishMessage.input.shape.delay.description ?? '';
+      const recovery = ntfyPublishMessage.errors?.find((e) => e.reason === 'invalid_delay')
+        ?.recovery as string;
+      for (const text of [description, recovery]) {
+        expect(text).toContain('RFC 3339');
+        expect(text).toContain('`Z`');
+        expect(text).toContain('`±hh:mm`');
+      }
+      expect(description).toContain('`timezone`');
+    });
+  });
+
+  /** ntfy's `icon` on the publish reply (#49), through the real service with only the network stubbed. */
+  describe('`icon` on the publish output (#49)', () => {
+    function reply(echo: Record<string, unknown>) {
+      freshService();
+      stubNtfyHttp(() =>
+        Response.json({
+          id: 'Z4MeYFR5eSYs',
+          time: 1_794_636_448,
+          expires: 1_794_679_648,
+          event: 'message',
+          topic: 'alerts',
+          ...echo,
+        }),
+      );
+    }
+
+    async function published(input: Record<string, unknown>) {
+      const result = await runToolContract(ntfyPublishMessage, { topic: 'alerts', ...input });
+      expect(result.isError).toBeFalsy();
+      const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      return { structured: result.structuredContent as Record<string, unknown>, text };
+    }
+
+    it('echoes the icon ntfy returned, as a code span on the line after the click URL', async () => {
+      // ntfy.sh's reply to a publish setting both, fields as captured.
+      reply({
+        message: 'icon probe raw',
+        click: 'https://example.com/click',
+        icon: 'https://example.com/icon.png',
+      });
+      const { structured, text } = await published({
+        message: 'icon probe raw',
+        click: 'https://example.com/click',
+        icon: 'https://example.com/icon.png',
+      });
+      expect(structured.icon).toBe('https://example.com/icon.png');
+      const lines = text.split('\n');
+      const click = lines.indexOf('Click action: `https://example.com/click`');
+      expect(click).toBeGreaterThan(-1);
+      expect(lines[click + 1]).toBe('Icon: `https://example.com/icon.png`');
+    });
+
+    it('renders the icon after the message body when no click URL was set', async () => {
+      reply({ message: 'no click', icon: 'https://example.com/icon.png' });
+      const { structured, text } = await published({
+        message: 'no click',
+        icon: 'https://example.com/icon.png',
+      });
+      expect(structured.icon).toBe('https://example.com/icon.png');
+      expect(text).not.toContain('Click action:');
+      expect(text.endsWith('\n\nIcon: `https://example.com/icon.png`')).toBe(true);
+    });
+
+    it.each([
+      [
+        'Markdown image syntax',
+        '![pwn](https://evil.example/p.png)',
+        '`![pwn](https://evil.example/p.png)`',
+      ],
+      ['a backtick', 'https://e.x/`a`.png', '``https://e.x/`a`.png``'],
+    ])(
+      'keeps an icon carrying %s a literal code span, never an image or link',
+      async (_label, icon, span) => {
+        reply({ message: 'x', icon });
+        const { structured, text } = await published({ message: 'x', icon });
+        expect(structured.icon).toBe(icon);
+        expect(text).toContain(`Icon: ${span}`);
+      },
+    );
+
+    it('omits `icon` from both surfaces when ntfy returns none', async () => {
+      reply({ message: 'plain', click: 'https://example.com/click' });
+      const { structured, text } = await published({
+        message: 'plain',
+        click: 'https://example.com/click',
+      });
+      expect(structured.icon).toBeUndefined();
+      // What reaches the client: the serialized result carries no `icon` key.
+      expect(JSON.parse(JSON.stringify(structured))).not.toHaveProperty('icon');
+      expect(text).not.toContain('Icon:');
+    });
+
+    it('relays the icon ntfy returned, not the one the input sent', async () => {
+      reply({ message: 'x', icon: 'https://example.com/stored.png' });
+      const { structured, text } = await published({
+        message: 'x',
+        icon: 'https://example.com/sent.png',
+      });
+      expect(structured.icon).toBe('https://example.com/stored.png');
+      expect(text).toContain('Icon: `https://example.com/stored.png`');
+      expect(text).not.toContain('sent.png');
+    });
+
+    it('omits `icon` from both surfaces when ntfy returns none, even though the input set one', async () => {
+      reply({ message: 'x' });
+      const { structured, text } = await published({
+        message: 'x',
+        icon: 'https://example.com/sent.png',
+      });
+      expect(JSON.parse(JSON.stringify(structured))).not.toHaveProperty('icon');
+      expect(text).not.toContain('Icon:');
+    });
+  });
+
   it('renders every output field in format()', () => {
     const blocks = ntfyPublishMessage.format!({
       id: 'mid_42',
@@ -798,6 +1304,7 @@ describe('ntfyPublishMessage handler', () => {
       priority: 4,
       tags: ['warning', 'cd'],
       click: 'https://example.com/click',
+      icon: 'https://example.com/icon.png',
       attachment: {
         name: 'flower.jpg',
         url: 'https://example.com/flower.jpg',
@@ -807,6 +1314,7 @@ describe('ntfyPublishMessage handler', () => {
       },
     });
     const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Icon: `https://example.com/icon.png`');
     expect(text).toContain('mid_42');
     expect(text).toContain('alerts');
     // Unscheduled publishes report the accept time under the plain `Time:` label.
@@ -839,21 +1347,25 @@ describe('ntfyPublishMessage handler', () => {
     expect(result.scheduled).toBe(true);
   });
 
-  it('preserves upstream `scheduled: true` when delay is not set', async () => {
+  it('sends a blank `delay` as unset and reports no schedule', async () => {
     const svc = freshService();
-    vi.spyOn(svc, 'publish').mockResolvedValue({
+    const publish = vi.spyOn(svc, 'publish').mockResolvedValue({
       id: 'mid_44',
       time: 1700000000,
       topic: 'alerts',
-      scheduled: true,
     });
     const ctx = createMockContext({ errors: ntfyPublishMessage.errors });
-    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'queued' });
+    const input = ntfyPublishMessage.input.parse({ topic: 'alerts', message: 'now', delay: '   ' });
     const result = await ntfyPublishMessage.handler(input, ctx);
-    expect(result.scheduled).toBe(true);
+    expect(publish.mock.calls[0]?.[0].delay).toBeUndefined();
+    expect(result.scheduled).toBeUndefined();
+    const blocks = ntfyPublishMessage.format!(result);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Time: 2023-11-14T22:13:20.000Z');
+    expect(text).not.toContain('Delivers:');
   });
 
-  it('omits `scheduled` from the output when neither delay nor upstream flag is set', async () => {
+  it('omits `scheduled` from the output when no delay is set', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'publish').mockResolvedValue({
       id: 'mid_45',
@@ -1373,11 +1885,6 @@ describe('ntfyPublishMessage consent gate', () => {
       );
   }
 
-  /** The JSON body of the `n`th outbound publish. */
-  function sentBody(upstream: ReturnType<typeof fakeUpstream>, n = 0): Record<string, unknown> {
-    return JSON.parse(String((upstream.mock.calls[n]?.[1] as RequestInit | undefined)?.body));
-  }
-
   const ALICE: AuthContext = { clientId: 'client-a', sub: 'alice', scopes: [] };
   const EMAIL = { email: 'ops@example.com' } as const;
 
@@ -1465,7 +1972,7 @@ describe('ntfyPublishMessage consent gate', () => {
     expect(message).toContain('an email forward to \n```text\nops@example.com\n# forged\n```\n?');
   });
 
-  it('names the topic in double quotes, as plain text, when the user declines', async () => {
+  it('leaves the topic out of the message when the user declines', async () => {
     fakeUpstream();
     const err = (await Promise.resolve(
       ntfyPublishMessage.handler(
@@ -1474,12 +1981,12 @@ describe('ntfyPublishMessage consent gate', () => {
       ),
     ).catch((e: unknown) => e)) as McpError;
     expect(err).toMatchObject({
-      message: 'Publish to "alerts" was not confirmed.',
+      message: 'The publish was not confirmed, so nothing was sent to ntfy.',
       data: { reason: 'consent_declined' },
     });
     // `content[]` is the message as the framework escapes it; a parse reads it back exactly.
     expect(readCommonMark(`Error: ${escapeMarkdownInline(err.message)}`)).toBe(
-      'Error: Publish to "alerts" was not confirmed.',
+      'Error: The publish was not confirmed, so nothing was sent to ntfy.',
     );
   });
 
@@ -1625,6 +2132,38 @@ describe('ntfyPublishMessage consent gate', () => {
     await expectInputRequired(() => ntfyPublishMessage.handler(inputWith(overrides), ctx));
 
     expect(upstream).not.toHaveBeenCalled();
+  });
+
+  describe('a scheduled gated publish and its `timezone` (#50)', () => {
+    const scheduled = (timezone: string) =>
+      inputWith({ actions: [HTTP_ACTION], delay: 'tomorrow, 10am', timezone });
+
+    it('publishes with the `timezone` its record was approved for', async () => {
+      const upstream = fakeUpstream();
+
+      await ntfyPublishMessage.handler(
+        scheduled('Asia/Tokyo'),
+        await approvedCtx(scheduled('Asia/Tokyo')),
+      );
+
+      expect(upstream).toHaveBeenCalledOnce();
+      expect(sentBody(upstream)).toMatchObject({
+        delay: 'tomorrow, 10am',
+        timezone: 'Asia/Tokyo',
+      });
+    });
+
+    it('asks again when a record approved for one `timezone` is redeemed with another', async () => {
+      const upstream = fakeUpstream();
+      const { asked, record } = await askFirst(scheduled('Asia/Tokyo'));
+      const ctx = await roundTwoCtx(asked.requestState, record);
+
+      await expectInputRequired(() =>
+        ntfyPublishMessage.handler(scheduled('America/Los_Angeles'), ctx),
+      );
+
+      expect(upstream).not.toHaveBeenCalled();
+    });
   });
 
   it('asks again on a record minted by ntfy_manage_message', async () => {
