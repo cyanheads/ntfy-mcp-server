@@ -3,6 +3,7 @@
  * limit, offset paging past the limit cap, enrichment (normalized query echo,
  * total, truncation, next-page and empty-result notices, the query rendered
  * literally), `:code:` / spaced / emoji queries on both surfaces, the
+ * exact-name-first match order as advertised and served, the
  * `limit` clamp's wiring (clamped / not clamped, advertised in both
  * `NTFY_CLAMP_LIMITS` modes), format-rendering of matches, and the `NTFY_ENABLE_EMOJI_TAGS`
  * gate that wraps the definition in `disabledTool()`.
@@ -260,6 +261,22 @@ describe('ntfySearchEmojiTags handler', () => {
       totalCount: 1,
     });
     expect(contentText(result)).toContain('| `+1` | 👍 |');
+  });
+
+  it('advertises the exact-name-first order on `matches`, and serves `x` ahead of the tags containing it', async () => {
+    const advertised = (
+      z.toJSONSchema(ntfySearchEmojiTags.output) as unknown as {
+        properties: { matches: { description: string } };
+      }
+    ).properties.matches;
+    expect(advertised.description).toBe(
+      'Tag → emoji rows: the tag named exactly by the query first, then the rest in the order they appear in the upstream reference.',
+    );
+
+    const result = await runToolContract(ntfySearchEmojiTags, { query: 'x' });
+    const { matches } = result.structuredContent as { matches: Array<{ tag: string }> };
+    expect(matches[0]?.tag).toBe('x');
+    expect(matches.length).toBeGreaterThan(1);
   });
 
   it('lists the reference with no effectiveQuery for a query that normalizes to nothing', async () => {

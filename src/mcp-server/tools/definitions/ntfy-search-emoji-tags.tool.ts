@@ -64,7 +64,9 @@ const OutputSchema = z.object({
         })
         .describe('A single tag → emoji pairing.'),
     )
-    .describe('Tag → emoji rows in the order they appear in the upstream reference.'),
+    .describe(
+      'Tag → emoji rows: the tag named exactly by the query first, then the rest in the order they appear in the upstream reference.',
+    ),
 });
 
 const definition = tool(TOOL_NAME, {
