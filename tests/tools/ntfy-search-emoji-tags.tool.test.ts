@@ -129,7 +129,7 @@ describe('ntfySearchEmojiTags handler', () => {
       expect((ctx.log as MockContextLogger).calls).toContainEqual({
         level: 'info',
         msg: 'Clamped limit',
-        data: { tool: 'ntfy_search_emoji_tags', requested: 5000, applied: 200 },
+        data: { tool: 'ntfy_search_emoji_tags', input: 'limit', requested: 5000, applied: 200 },
       });
     });
 

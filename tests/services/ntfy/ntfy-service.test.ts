@@ -14,7 +14,9 @@
  * text kept off the message and every topic name masked in its captured body, the module-level
  * init/get/reset accessors, and `base_url` override validation — the always-on absolute
  * http(s) check plus the opt-in private-host guard, its registered-base bypass,
- * and its redirect refusal.
+ * and its redirect refusal. `waitForMessage` on a stream the test feeds: the
+ * stream's request (query, base, credentials, redirect rule), each way a wait
+ * ends, the bound on the line it holds, and the per-process wait cap.
  * @module tests/services/ntfy/ntfy-service
  */
 
@@ -30,7 +32,9 @@ import {
   CALL_DEADLINE_MS,
   getNtfyService,
   initNtfyService,
+  MAX_OPEN_WAITS,
   NtfyService,
+  openWaitCount,
   resetNtfyService,
 } from '@/services/ntfy/ntfy-service.js';
 
@@ -237,6 +241,211 @@ describe('NtfyService base_url validation (always on)', () => {
     await svc.publish(PUBLISH_BODY);
     expect(calls[0]?.url).toBe('https://ntfy.test/');
     expect(calls[0]?.redirect).toBeUndefined();
+  });
+
+  /** #58: a probe credential that must never reach the upstream, a message, or `data`. */
+  const CREDENTIALED = 'https://probeuser:pwSECRET@ntfy.example.com';
+
+  it.each([
+    ['publish', (svc: NtfyService) => svc.publish(PUBLISH_BODY, { baseUrl: CREDENTIALED })],
+    [
+      'manage',
+      (svc: NtfyService) => svc.manage('alerts', 'seq_1', 'clear', { baseUrl: CREDENTIALED }),
+    ],
+    ['fetch', (svc: NtfyService) => svc.fetch({ topic: 'alerts' }, { baseUrl: CREDENTIALED })],
+  ])(
+    'refuses a %s override carrying credentials before any request goes out (#58)',
+    async (_operation, call) => {
+      const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+      const { calls } = captureFetch();
+      const err = (await call(svc).catch((e: unknown) => e)) as Error & {
+        data?: Record<string, unknown>;
+      };
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining('"ntfy.example.com"'),
+        data: { baseUrlRejected: true },
+      });
+      expect(JSON.stringify({ message: err.message, data: err.data })).not.toMatch(
+        /probeuser|pwSECRET/,
+      );
+      expect(calls).toHaveLength(0);
+    },
+  );
+});
+
+/**
+ * The error the retry boundary, the logs, and the caller read from a `fetch`
+ * rejection carries no request URL, and nothing else about the failure changes.
+ */
+describe('NtfyService fetch rejections carry no request URL', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const TOPIC = 'ntfyval-5e1f0c2a9b7d3864';
+
+  /** A `fetch` rejection quoting the request URL in its message, its stack, and a `path` property. */
+  function urlQuotingFetchError(code: string, url: string): TypeError {
+    return Object.assign(
+      new TypeError(
+        `${code} fetching "${url}". For more information, pass \`verbose: true\` in the second argument to fetch()`,
+      ),
+      { code, path: url, errno: 0 },
+    );
+  }
+
+  /** Every string an error carries — message, stack, each own property — down its whole cause chain. */
+  function everythingIn(err: unknown): string {
+    const parts: string[] = [];
+    for (let e: unknown = err; e instanceof Error; e = e.cause) {
+      parts.push(e.message, String(e.stack));
+      for (const key of Object.getOwnPropertyNames(e)) {
+        const value: unknown = Reflect.get(e, key);
+        parts.push(`${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
+      }
+    }
+    return parts.join('\n');
+  }
+
+  it('retries a URL-quoting poll failure to exhaustion with no topic in the error or the retry log', async () => {
+    const { logger } = await import('@cyanheads/mcp-ts-core/utils');
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 2,
+    });
+    const { calls } = captureFetch((call) => {
+      throw urlQuotingFetchError('Malformed_HTTP_Response', call.url);
+    });
+    const { outcome } = await runOnFakeClock(svc.fetch({ topic: TOPIC, since: '10m' }));
+    const { error } = outcome as { error: Error };
+
+    expect(calls).toHaveLength(3);
+    expect(new URL(calls[0]?.url ?? '').pathname).toBe(`/${TOPIC}/json`);
+    expect(error.message).toBe('Malformed_HTTP_Response (failed after 3 attempts)');
+    expect(isUpstreamUnreachable(error)).toBe(true);
+    // The transport failure keeps what the retry boundary and the classifiers read.
+    expect(error.cause).toBeInstanceOf(TypeError);
+    expect(error.cause).toMatchObject({
+      name: 'TypeError',
+      code: 'Malformed_HTTP_Response',
+      message: 'Malformed_HTTP_Response',
+    });
+    expect(Object.hasOwn(error.cause as Error, 'path')).toBe(false);
+    expect((error.cause as Error).cause).toBeUndefined();
+    const carried = everythingIn(error);
+    expect(carried).not.toContain(TOPIC);
+    expect(carried).not.toContain('verbose');
+
+    const retries = debug.mock.calls.filter(([msg]) => String(msg).startsWith('Retry '));
+    expect(retries).toHaveLength(2);
+    for (const call of retries) {
+      expect(String(call[0])).toContain('Malformed_HTTP_Response');
+      expect(JSON.stringify(call)).not.toContain(TOPIC);
+    }
+  });
+
+  it('refuses a URL-quoting redirect rejection on a guarded override, with no topic anywhere in the refusal', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }], true),
+      maxRetries: 2,
+    });
+    const { calls } = captureFetch((call) => {
+      throw urlQuotingFetchError('UnexpectedRedirect', call.url);
+    });
+    const err = (await svc
+      .fetch({ topic: TOPIC }, { baseUrl: 'https://1.1.1.1' })
+      .catch((e: unknown) => e)) as Error & { data?: Record<string, unknown> };
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.redirect).toBe('error');
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('redirects are not followed'),
+      data: { baseUrlRejected: true },
+    });
+    expect(err.message).toContain('"1.1.1.1"');
+    expect(err.cause).toMatchObject({ code: 'UnexpectedRedirect' });
+    expect(everythingIn(err)).not.toContain(TOPIC);
+  });
+
+  it('keeps a topic named for a redirect out of the redirect check', async () => {
+    const topic = `redirect-${TOPIC}`;
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }], true));
+    const { calls } = captureFetch((call) => {
+      throw urlQuotingFetchError('Malformed_HTTP_Response', call.url);
+    });
+    const err = (await svc
+      .fetch({ topic }, { baseUrl: 'https://1.1.1.1' })
+      .catch((e: unknown) => e)) as Error;
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.redirect).toBe('error');
+    expect(getErrorCode(err)).not.toBe(JsonRpcErrorCode.ValidationError);
+    expect(err.message).toBe('Malformed_HTTP_Response (failed after 1 attempt)');
+    expect(isUpstreamUnreachable(err)).toBe(true);
+    expect(everythingIn(err)).not.toContain(topic);
+  });
+
+  it('keeps a per-attempt timeout the timer’s own abort reason', async () => {
+    vi.useFakeTimers();
+    const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+    const { calls } = captureFetch(abortAwareResponder);
+    const { elapsed, outcome } = await runOnFakeClock(svc.fetch({ topic: TOPIC }));
+    const { error } = outcome as { error: Error };
+
+    expect(elapsed).toBe(1000);
+    expect(error.message).toBe('Timeout (failed after 1 attempt)');
+    expect(error.cause).toBeInstanceOf(Error);
+    expect(error.cause).toBe(calls[0]?.signal?.reason);
+    expect(isUpstreamUnreachable(error)).toBe(true);
+  });
+
+  it('surfaces the caller’s cancellation as RequestCancelled around its own abort reason', async () => {
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 3,
+    });
+    const controller = new AbortController();
+    const { calls } = captureFetch((call) => {
+      queueMicrotask(() => controller.abort());
+      return abortAwareResponder(call);
+    });
+    const err = (await svc
+      .fetch({ topic: TOPIC }, { signal: controller.signal })
+      .catch((e: unknown) => e)) as Error;
+
+    expect(calls).toHaveLength(1);
+    expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(err.cause).toMatchObject({ name: 'AbortError' });
+    expect(err.cause).toBe(controller.signal.reason);
+  });
+
+  it('passes a `fetch failed` rejection that quotes no URL through untouched, and retries it', async () => {
+    vi.useFakeTimers();
+    const svc = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      maxRetries: 1,
+    });
+    const fetchFailed = new TypeError('fetch failed', {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), {
+        code: 'ECONNREFUSED',
+      }),
+    });
+    const { calls } = captureFetch(() => {
+      throw fetchFailed;
+    });
+    const { outcome } = await runOnFakeClock(svc.fetch({ topic: TOPIC }));
+    const { error } = outcome as { error: Error };
+
+    expect(calls).toHaveLength(2);
+    expect(error.cause).toBe(fetchFailed);
+    expect(fetchFailed.message).toBe('fetch failed');
+    expect(error.message).toBe('fetch failed (failed after 2 attempts)');
+    expect(isUpstreamUnreachable(error)).toBe(true);
   });
 });
 
@@ -513,9 +722,9 @@ describe('NtfyService upstream error messages', () => {
         link: 'https://ntfy.sh/docs/publish/#scheduled-delivery',
       }),
     );
-    const err = await svc
+    const err = (await svc
       .publish({ topic: 'alerts', message: 'x', delay: '9 fortnights' })
-      .catch((e: unknown) => e as Error);
+      .catch((e: unknown) => e)) as Error;
     expect(err.message).toContain('invalid delay parameter: unable to parse delay');
     expect(err.message).toContain('https://ntfy.sh/docs/publish/#scheduled-delivery');
   });
@@ -565,7 +774,7 @@ describe('NtfyService upstream error messages', () => {
           headers: { 'content-type': 'text/plain' },
         }),
     );
-    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    const err = (await svc.publish(PUBLISH_BODY).catch((e: unknown) => e)) as Error;
     expect(err.message).toBe('ntfy.test returned HTTP 403 Forbidden.');
   });
 
@@ -575,8 +784,8 @@ describe('NtfyService upstream error messages', () => {
    * ntfy root, a proxy, ntfy.sh's docs or static file server.
    */
   describe('an answer without ntfy’s envelope (#55)', () => {
-    /** Userinfo, a port, and a path on the base; the topic rides the path or body. */
-    const OVERRIDE = 'https://agent:s3cret@proxy.test:8443/ntfy';
+    /** A port and a path on the base; the topic rides the path or body. */
+    const OVERRIDE = 'https://proxy.test:8443/ntfy';
     const TOPIC = 'tok_q81zv';
     const page =
       (status: number, statusText: string, body = EXAMPLE_PAGE) =>
@@ -613,7 +822,7 @@ describe('NtfyService upstream error messages', () => {
           retryable: false,
           status: 404,
         });
-        for (const leak of ['agent', 's3cret', '/ntfy', TOPIC, 'poll']) {
+        for (const leak of ['/ntfy', TOPIC, 'poll']) {
           expect(err.message).not.toContain(leak);
         }
       },
@@ -1295,8 +1504,97 @@ describe('NtfyService publish and manage reply validation', () => {
     it("returns ntfy's reply unchanged", async () => {
       const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
       captureFetch(reply(envelope({ expires: 99 }), 'application/json'));
-      await expect(call(svc)).resolves.toEqual(JSON.parse(envelope({ expires: 99 })));
+      await expect(call(svc)).resolves.toEqual({ envelope: JSON.parse(envelope({ expires: 99 })) });
     });
+
+    it.each([
+      [
+        'both policies',
+        {
+          'ratelimit-policy': '"requests";q=60;w=300, "messages";q=250;w=86400',
+          ratelimit: '"requests";r=58;t=1, "messages";r=246;t=50750',
+        },
+        {
+          messages: { limit: 250, remaining: 246, resetsInSeconds: 50750 },
+          requests: { limit: 60, remaining: 58, nextRequestInSeconds: 1 },
+        },
+      ],
+      [
+        'only the messages policy',
+        { 'ratelimit-policy': '"messages";q=250;w=86400', ratelimit: '"messages";r=246;t=50750' },
+        { messages: { limit: 250, remaining: 246, resetsInSeconds: 50750 } },
+      ],
+      // ntfy before v2.37.0, or an exempt visitor: absent, never zero.
+      ['no rate-limit headers', {}, undefined],
+    ])(
+      'reports the quota a reply with %s carried, beside its envelope (#60)',
+      async (_label, headers, quota) => {
+        const svc = new NtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
+        captureFetch(
+          () =>
+            new Response(envelope(), {
+              status: 200,
+              headers: { 'content-type': 'application/json', ...headers },
+            }),
+        );
+        const result = await call(svc);
+        expect(result.envelope).toEqual(JSON.parse(envelope()));
+        expect(result.quota).toEqual(quota);
+      },
+    );
+  });
+
+  describe('a reply that follows a retried 429 (#60)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it.each(REPLIES)(
+      '%s reports the quota of the response that succeeded, not the 429 before it',
+      async (_operation, event, call) => {
+        const svc = new NtfyService({
+          ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+          maxRetries: 1,
+        });
+        const answers = [
+          new Response('{"code":42901,"http":429,"error":"limit reached: too many requests"}', {
+            status: 429,
+            headers: {
+              'content-type': 'application/json',
+              'retry-after': '2',
+              'ratelimit-policy': '"requests";q=60;w=300, "messages";q=250;w=86400',
+              ratelimit: '"requests";r=0;t=2, "messages";r=200;t=40000',
+            },
+          }),
+          new Response(
+            JSON.stringify({ id: 'e2', time: 2, event, topic: 'alerts', sequence_id: 'seq_1' }),
+            {
+              status: 200,
+              headers: {
+                'content-type': 'application/json',
+                'ratelimit-policy': '"requests";q=60;w=300, "messages";q=250;w=86400',
+                ratelimit: '"requests";r=0;t=5, "messages";r=199;t=39998',
+              },
+            },
+          ),
+        ];
+        const { calls } = captureFetch(() => answers.shift() as Response);
+        const { outcome } = await runOnFakeClock(call(svc));
+        expect(calls).toHaveLength(2);
+        expect(outcome).toEqual({
+          value: {
+            envelope: expect.objectContaining({ id: 'e2' }),
+            quota: {
+              messages: { limit: 250, remaining: 199, resetsInSeconds: 39998 },
+              requests: { limit: 60, remaining: 0, nextRequestInSeconds: 5 },
+            },
+          },
+        });
+      },
+    );
   });
 
   it('fails a clear or delete reply that names no `sequence_id`', async () => {
@@ -1317,7 +1615,7 @@ describe('NtfyService publish and manage reply validation', () => {
         'application/json',
       ),
     );
-    await expect(svc.publish(PUBLISH_BODY)).resolves.toMatchObject({ id: 'm1' });
+    await expect(svc.publish(PUBLISH_BODY)).resolves.toMatchObject({ envelope: { id: 'm1' } });
   });
 });
 
@@ -1333,7 +1631,7 @@ describe('NtfyService cancellation vs timeout', () => {
       requestTimeoutMs: 20,
     });
     captureFetch(abortAwareResponder);
-    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    const err = (await svc.publish(PUBLISH_BODY).catch((e: unknown) => e)) as Error;
     expect(getErrorCode(err)).not.toBe(JsonRpcErrorCode.RequestCancelled);
     expect(err.message).toContain('Timeout');
     // Retry-exhausted, so the network classifier still claims it.
@@ -1401,9 +1699,9 @@ describe('NtfyService cancellation vs timeout', () => {
       queueMicrotask(() => controller.abort());
       return abortAwareResponder(call);
     });
-    const err = await svc
+    const err = (await svc
       .publish(PUBLISH_BODY, { signal: controller.signal })
-      .catch((e: unknown) => e as Error);
+      .catch((e: unknown) => e)) as Error;
     expect(calls).toHaveLength(2);
     expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RequestCancelled);
     // The retry budget was not spent re-issuing a request nobody is waiting for.
@@ -2046,7 +2344,7 @@ describe('NtfyService retry exhaustion', () => {
     const { calls } = captureFetch(
       () => new Response('bad gateway', { status: 502, headers: { 'content-type': 'text/plain' } }),
     );
-    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    const err = (await svc.publish(PUBLISH_BODY).catch((e: unknown) => e)) as Error;
     expect(calls).toHaveLength(3);
     expect(getErrorCode(err)).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(err.message).toMatch(/\(failed after 3 attempts\)/);
@@ -2075,7 +2373,7 @@ describe('NtfyService retry exhaustion', () => {
     const { calls } = captureFetch(
       () => new Response('slow down', { status: 429, headers: { 'content-type': 'text/plain' } }),
     );
-    const err = await svc.publish(PUBLISH_BODY).catch((e: unknown) => e as Error);
+    const err = (await svc.publish(PUBLISH_BODY).catch((e: unknown) => e)) as Error;
     expect(calls).toHaveLength(2);
     expect(getErrorCode(err)).toBe(JsonRpcErrorCode.RateLimited);
     expect(isUpstreamUnreachable(err)).toBe(false);
@@ -2104,5 +2402,834 @@ describe('NtfyService module-level accessors', () => {
     initNtfyService(makeConfig([{ baseUrl: 'https://ntfy.test' }]));
     resetNtfyService();
     expect(() => getNtfyService()).toThrow(/not initialized/i);
+  });
+});
+
+const NDJSON = { 'content-type': 'application/x-ndjson; charset=utf-8' };
+
+/**
+ * An ntfy JSON stream the test writes to as the wait reads it: `write()` sends
+ * raw text as one read, `writeBytes()` raw bytes as one read, `send()` whole
+ * lines, `close()` ends the stream as a dropped connection would, and `fail()`
+ * errors it as a reset would. Once the request signal aborts, the body errors
+ * with its reason — what Bun's and Node's `fetch` both do to a body still being
+ * read — and `aborted` records it. `highWaterMark: 0`, so nothing is pulled
+ * ahead of the reader.
+ */
+interface FakeStream {
+  aborted: boolean;
+  close: () => void;
+  fail: (err: Error) => void;
+  send: (...lines: string[]) => void;
+  write: (text: string) => void;
+  writeBytes: (bytes: Uint8Array) => void;
+}
+
+function fakeStream(signal: AbortSignal | undefined): { response: Response; stream: FakeStream } {
+  const encoder = new TextEncoder();
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const stream: FakeStream = {
+    aborted: false,
+    writeBytes: (bytes) => controller.enqueue(bytes),
+    write: (text) => stream.writeBytes(encoder.encode(text)),
+    send: (...lines) => stream.write(lines.map((l) => `${l}\n`).join('')),
+    close: () => controller.close(),
+    fail: (err) => controller.error(err),
+  };
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(c) {
+        controller = c;
+        signal?.addEventListener(
+          'abort',
+          () => {
+            stream.aborted = true;
+            c.error(signal.reason);
+          },
+          { once: true },
+        );
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return { response: new Response(body, { status: 200, headers: NDJSON }), stream };
+}
+
+/**
+ * Answers a poll of `ntfy.test` with an empty window, and every other request —
+ * the wait's stream — with a fresh {@link fakeStream}, collected in `streams`.
+ */
+function streamUpstream() {
+  const streams: FakeStream[] = [];
+  const captured = captureFetch((call) => {
+    if (new URL(call.url).searchParams.has('poll')) {
+      return new Response('', { status: 200, headers: NDJSON });
+    }
+    const { response, stream } = fakeStream(call.signal);
+    streams.push(stream);
+    return response;
+  });
+  return { ...captured, streams };
+}
+
+/** Records when, in fake ms, `promise` settled and with what, without awaiting it. */
+function track<T>(promise: Promise<T>) {
+  const startedAt = Date.now();
+  const state: { error?: unknown; settledAfterMs?: number; value?: T } = {};
+  promise.then(
+    (value) => {
+      state.settledAfterMs = Date.now() - startedAt;
+      state.value = value;
+    },
+    (error: unknown) => {
+      state.settledAfterMs = Date.now() - startedAt;
+      state.error = error;
+    },
+  );
+  return state;
+}
+
+const WAIT_PARAMS = { topic: 'alerts,backups', since: '10m' };
+/** ntfy's `open` line for a stream of `alerts,backups`, at ntfy's Unix second `time`. */
+const openLine = (time: number) =>
+  JSON.stringify({ id: 'opn0000000ab', time, event: 'open', topic: 'alerts,backups' });
+const rowLine = (id: string, extra: Record<string, unknown> = {}) =>
+  JSON.stringify({
+    id,
+    time: 1_794_000_010,
+    event: 'message',
+    topic: 'alerts',
+    message: `body ${id}`,
+    ...extra,
+  });
+/** A message line of exactly `length` characters, its `message` padded with `x`. */
+const rowLineOf = (length: number) =>
+  rowLine('m1', { message: 'x'.repeat(length - rowLine('m1', { message: '' }).length) });
+
+/** Write `text` to `stream` in reads of 64 KiB, so a long line is assembled from many reads. */
+function writeInReads(stream: FakeStream, text: string) {
+  for (let at = 0; at < text.length; at += 65_536) stream.write(text.slice(at, at + 65_536));
+}
+
+describe('NtfyService.waitForMessage (#61)', () => {
+  const svc = () =>
+    new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      requestTimeoutMs: 15_000,
+    });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    // Every path ends with its timers cleared and its wait slot given back.
+    expect(vi.getTimerCount()).toBe(0);
+    expect(openWaitCount()).toBe(0);
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("opens the stream with the poll's own query, minus `poll`", async () => {
+    const service = svc();
+    const { calls, streams } = streamUpstream();
+    const params = {
+      topic: 'alerts,backups',
+      since: 'AbCdEf123456',
+      scheduled: true,
+      priority: [4, 5] as Array<4 | 5>,
+      tags: ['a', 'b'],
+      title: 'Hit',
+      message: 'exact body',
+    };
+    await service.fetch(params);
+    const waited = service.waitForMessage(params, { holdMs: 5_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.send(openLine(1_794_000_000), rowLine('m1'));
+    await waited;
+
+    expect(calls).toHaveLength(2);
+    const poll = new URL(calls[0]!.url);
+    const stream = new URL(calls[1]!.url);
+    expect(stream.searchParams.has('poll')).toBe(false);
+    poll.searchParams.delete('poll');
+    expect(stream.href).toBe(poll.href);
+    expect(stream.pathname).toBe('/alerts%2Cbackups/json');
+    expect(Object.fromEntries(stream.searchParams)).toEqual({
+      since: 'AbCdEf123456',
+      scheduled: '1',
+      priority: '4,5',
+      tags: 'a,b',
+      title: 'Hit',
+      message: 'exact body',
+    });
+    expect(calls[1]?.method).toBe('GET');
+  });
+
+  /**
+   * The stream goes where the poll before it went, and as the poll went: to the
+   * call's `baseUrl`, with the credentials registered for that base (none for an
+   * unregistered one), refusing redirects on an override the private-host guard
+   * checked.
+   */
+  describe('opens the stream where the poll went, as the poll went', () => {
+    /** Poll, then wait, on `service` with `baseUrl`; returns the two requests. */
+    async function pollThenWait(service: NtfyService, baseUrl?: string) {
+      const { calls, streams } = streamUpstream();
+      const opts = baseUrl === undefined ? {} : { baseUrl };
+      await service.fetch(WAIT_PARAMS, opts);
+      const waited = service.waitForMessage(WAIT_PARAMS, { ...opts, holdMs: 5_000 });
+      await vi.advanceTimersByTimeAsync(0);
+      streams[0]?.send(openLine(1_794_000_000), rowLine('m1'));
+      await expect(waited).resolves.toMatchObject({ outcome: 'arrived', message: { id: 'm1' } });
+      expect(calls).toHaveLength(2);
+      return { poll: calls[0]!, stream: calls[1]! };
+    }
+
+    it('to the `baseUrl` override, not the default server', async () => {
+      const { poll, stream } = await pollThenWait(svc(), 'https://other.example.com/ntfy/');
+      for (const call of [poll, stream]) {
+        const url = new URL(call.url);
+        expect(url.origin).toBe('https://other.example.com');
+        expect(url.pathname).toBe('/ntfy/alerts%2Cbackups/json');
+      }
+    });
+
+    it.each([
+      [
+        "the default server's credentials to the default server",
+        undefined,
+        'https://ntfy.test',
+        'Bearer tk_default',
+      ],
+      [
+        "a registered override's own credentials to that override",
+        'https://corp.example.com',
+        'https://corp.example.com',
+        `Basic ${Buffer.from('user:pass', 'utf-8').toString('base64')}`,
+      ],
+      [
+        'no credentials to an unregistered override',
+        'https://stranger.example.com',
+        'https://stranger.example.com',
+        undefined,
+      ],
+    ])('sends %s', async (_case, baseUrl, origin, auth) => {
+      const service = new NtfyService({
+        ...makeConfig([
+          { baseUrl: 'https://ntfy.test', authToken: 'tk_default' },
+          { baseUrl: 'https://corp.example.com', authUsername: 'user', authPassword: 'pass' },
+        ]),
+        requestTimeoutMs: 15_000,
+      });
+      const { poll, stream } = await pollThenWait(service, baseUrl);
+      expect(new URL(stream.url).origin).toBe(origin);
+      expect(stream.auth).toBe(auth);
+      expect(poll.auth).toBe(auth);
+    });
+
+    const guarded = () =>
+      new NtfyService({
+        ...makeConfig([{ baseUrl: 'https://ntfy.test' }], true),
+        requestTimeoutMs: 15_000,
+      });
+
+    it('refuses redirects on an override the private-host guard checked', async () => {
+      // A public address, for the poll's lookup and then the wait's.
+      const answer = [{ address: '93.184.215.14', family: 4 }] as never;
+      vi.mocked(lookup).mockResolvedValueOnce(answer).mockResolvedValueOnce(answer);
+      const { poll, stream } = await pollThenWait(guarded(), 'https://public.example.org');
+      expect(new URL(stream.url).origin).toBe('https://public.example.org');
+      expect(stream.redirect).toBe('error');
+      expect(poll.redirect).toBe('error');
+    });
+
+    it('leaves redirects to `fetch` on the default server, which the guard never checks', async () => {
+      const { poll, stream } = await pollThenWait(guarded());
+      expect(stream.redirect).toBeUndefined();
+      expect(poll.redirect).toBeUndefined();
+    });
+  });
+
+  it('returns the first row after `open` and `keepalive`, then aborts the request', async () => {
+    const { calls, streams } = streamUpstream();
+    const waited = track(svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 }));
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.send(
+      openLine(1_794_000_000),
+      JSON.stringify({
+        id: 'kpa0000000ab',
+        time: 1_794_000_001,
+        event: 'keepalive',
+        topic: 'alerts',
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(waited.settledAfterMs).toBeUndefined();
+    streams[0]?.send(rowLine('m1'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(waited.value).toEqual({
+      outcome: 'arrived',
+      message: JSON.parse(rowLine('m1')),
+      // The `open` second plus one, plus the 2.5 s since that line arrived.
+      ntfyClockSeconds: 1_794_000_003.5,
+      waitedMs: 2_500,
+    });
+    expect(streams[0]?.aborted).toBe(true);
+    expect(calls[0]?.signal?.aborted).toBe(true);
+  });
+
+  it("falls back to this server's clock for a row that arrives with no `open` line before it", async () => {
+    vi.setSystemTime(new Date('2026-11-17T12:00:00Z'));
+    const { streams } = streamUpstream();
+    const waited = svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.send(rowLine('m1'));
+    await expect(waited).resolves.toMatchObject({
+      outcome: 'arrived',
+      ntfyClockSeconds: Date.parse('2026-11-17T12:00:00Z') / 1000,
+    });
+  });
+
+  it('ends at the first row: a message ntfy delivers twice (replay, then re-delivery) comes back once', async () => {
+    const { streams } = streamUpstream();
+    const waited = svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.send(openLine(1_794_000_000), rowLine('m1'), rowLine('m1'), rowLine('m2'));
+    await expect(waited).resolves.toMatchObject({
+      outcome: 'arrived',
+      message: { id: 'm1' },
+    });
+    expect(streams[0]?.aborted).toBe(true);
+  });
+
+  it.each(['message_clear', 'message_delete'])(
+    'ends on a `%s` event like any row',
+    async (event) => {
+      const { streams } = streamUpstream();
+      const waited = svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 });
+      await vi.advanceTimersByTimeAsync(0);
+      const line = JSON.stringify({
+        id: 'clr0000000ab',
+        time: 1_794_000_010,
+        event,
+        topic: 'alerts',
+        sequence_id: 'backup-42',
+      });
+      streams[0]?.send(openLine(1_794_000_000), line);
+      await expect(waited).resolves.toMatchObject({
+        outcome: 'arrived',
+        message: { event, sequence_id: 'backup-42' },
+      });
+    },
+  );
+
+  it('reads a line that arrives in pieces, and CRLF line ends', async () => {
+    const { streams } = streamUpstream();
+    const waited = svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    const line = rowLine('m1');
+    streams[0]?.write(`${openLine(1_794_000_000)}\r\n${line.slice(0, 7)}`);
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.write(line.slice(7, 20));
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.write(`${line.slice(20)}\r\n`);
+    await expect(waited).resolves.toMatchObject({ outcome: 'arrived', message: { id: 'm1' } });
+  });
+
+  it('reads a character whose UTF-8 bytes arrive in two reads', async () => {
+    const { streams } = streamUpstream();
+    const waited = svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    const bytes = new TextEncoder().encode(
+      `${openLine(1_794_000_000)}\n${rowLine('m1', { message: 'café' })}\n`,
+    );
+    // `é` is the two bytes C3 A9: the first read ends between them.
+    const split = bytes.lastIndexOf(0xc3) + 1;
+    streams[0]?.writeBytes(bytes.subarray(0, split));
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.writeBytes(bytes.subarray(split));
+    await expect(waited).resolves.toMatchObject({
+      outcome: 'arrived',
+      message: { id: 'm1', message: 'café' },
+    });
+  });
+
+  it.each([
+    // The open line shifts the long one across the reads, so its last read carries its break.
+    ['in the read that ends it', (line: string) => [`${openLine(1_794_000_000)}\n${line}\n`]],
+    // The long line fills whole reads, so all of it is held before the break comes.
+    ['in a read of its own', (line: string) => [line, '\n']],
+  ])(
+    'reads a line of exactly 1048576 characters, the most it holds, its break %s',
+    async (_layout, layout) => {
+      const { streams } = streamUpstream();
+      const waited = svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 });
+      await vi.advanceTimersByTimeAsync(0);
+      const line = rowLineOf(1_048_576);
+      for (const text of layout(line)) writeInReads(streams[0]!, text);
+      await expect(waited).resolves.toMatchObject({
+        outcome: 'arrived',
+        message: JSON.parse(line),
+      });
+    },
+  );
+
+  it('times out when the hold passes, and aborts the request', async () => {
+    const { calls, streams } = streamUpstream();
+    const waited = track(svc().waitForMessage(WAIT_PARAMS, { holdMs: 5_000 }));
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.send(openLine(1_794_000_000));
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(waited.settledAfterMs).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(waited).toEqual({
+      settledAfterMs: 5_000,
+      value: { outcome: 'timedOut', waitedMs: 5_000 },
+    });
+    expect(streams[0]?.aborted).toBe(true);
+    expect(calls[0]?.signal?.aborted).toBe(true);
+  });
+
+  it('times out at a hold shorter than the request timeout, even with no `open` line yet', async () => {
+    const { streams } = streamUpstream();
+    const waited = track(svc().waitForMessage(WAIT_PARAMS, { holdMs: 3_000 }));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(waited.value).toEqual({ outcome: 'timedOut', waitedMs: 3_000 });
+    expect(streams[0]?.aborted).toBe(true);
+  });
+
+  /**
+   * ntfy re-sends a message it has just written to every stream that subscribed
+   * after the message went out, applying the stream's filters but not its
+   * `since`, so a stream can deliver a row the poll before it could not return.
+   */
+  describe('skips a row from before `windowStart` and goes on waiting', () => {
+    it.each([
+      ['a 12-character message ID', 'AbCdEf123456'],
+      // The later row is timed far below the digits' value: an ID is never compared as a time.
+      ['a 12-digit message ID', '123456789012'],
+    ])('the marker message itself, under %s', async (_label, marker) => {
+      const { streams } = streamUpstream();
+      const waited = track(
+        svc().waitForMessage(
+          { ...WAIT_PARAMS, since: marker },
+          { holdMs: 30_000, windowStart: { kind: 'id', id: marker } },
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      streams[0]?.send(openLine(1_794_000_000), rowLine(marker));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(waited.settledAfterMs).toBeUndefined();
+      // Sparse, as ntfy writes a message with no optional field set.
+      const later = { id: 'm2', time: 1_794_000_001, event: 'message', topic: 'alerts' };
+      streams[0]?.send(JSON.stringify(later));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(waited.value).toEqual({
+        outcome: 'arrived',
+        message: later,
+        ntfyClockSeconds: 1_794_000_002,
+        waitedMs: 1_000,
+      });
+      expect(streams[0]?.aborted).toBe(true);
+    });
+
+    it('a row timed before a Unix-seconds start; a row timed at that second arrives', async () => {
+      const start = 1_794_000_010;
+      const { streams } = streamUpstream();
+      const waited = track(
+        svc().waitForMessage(
+          { ...WAIT_PARAMS, since: String(start) },
+          { holdMs: 30_000, windowStart: { kind: 'time', seconds: start } },
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      streams[0]?.send(openLine(start + 1), rowLine('old', { time: start - 1 }));
+      await vi.advanceTimersByTimeAsync(500);
+      expect(waited.settledAfterMs).toBeUndefined();
+      streams[0]?.send(rowLine('m2', { time: start }));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(waited.value).toMatchObject({
+        outcome: 'arrived',
+        message: { id: 'm2', time: start },
+        waitedMs: 500,
+      });
+    });
+
+    it('times out at the hold when the marker is all that arrives, and aborts the request', async () => {
+      const { calls, streams } = streamUpstream();
+      const waited = track(
+        svc().waitForMessage(
+          { ...WAIT_PARAMS, since: 'AbCdEf123456' },
+          { holdMs: 4_000, windowStart: { kind: 'id', id: 'AbCdEf123456' } },
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      streams[0]?.send(openLine(1_794_000_000), rowLine('AbCdEf123456'));
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(waited.settledAfterMs).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(waited).toEqual({
+        settledAfterMs: 4_000,
+        value: { outcome: 'timedOut', waitedMs: 4_000 },
+      });
+      expect(streams[0]?.aborted).toBe(true);
+      expect(calls[0]?.signal?.aborted).toBe(true);
+    });
+  });
+
+  describe('fails, with a cause that names no topic, when the stream never opens', () => {
+    const TIMEOUT_CAUSE =
+      'ntfy did not confirm the stream within the 1000 ms request timeout (NTFY_REQUEST_TIMEOUT_MS)';
+    const quick = () =>
+      new NtfyService({
+        ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+        requestTimeoutMs: 1_000,
+      });
+
+    it('on headers with no `open` line within NTFY_REQUEST_TIMEOUT_MS', async () => {
+      const { streams } = streamUpstream();
+      const waited = track(quick().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 }));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(waited).toEqual({
+        settledAfterMs: 1_000,
+        value: { outcome: 'failed', cause: TIMEOUT_CAUSE, waitedMs: 0 },
+      });
+      expect(streams[0]?.aborted).toBe(true);
+    });
+
+    it('on no headers within NTFY_REQUEST_TIMEOUT_MS', async () => {
+      const { calls } = captureFetch(abortAwareResponder);
+      const waited = track(quick().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 }));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(waited).toEqual({
+        settledAfterMs: 1_000,
+        value: { outcome: 'failed', cause: TIMEOUT_CAUSE, waitedMs: 0 },
+      });
+      expect(calls[0]?.signal?.aborted).toBe(true);
+    });
+
+    it('on a guarded `baseUrl` lookup that does not answer within NTFY_REQUEST_TIMEOUT_MS, before any request', async () => {
+      vi.mocked(lookup).mockImplementationOnce(() => new Promise(() => {}) as never);
+      const { calls } = captureFetch();
+      const guarded = new NtfyService({
+        ...makeConfig([{ baseUrl: 'https://ntfy.test' }], true),
+        requestTimeoutMs: 1_000,
+      });
+      const waited = track(
+        guarded.waitForMessage(WAIT_PARAMS, {
+          holdMs: 30_000,
+          baseUrl: 'https://slow-dns.example',
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(waited).toEqual({
+        settledAfterMs: 1_000,
+        value: { outcome: 'failed', cause: TIMEOUT_CAUSE, waitedMs: 0 },
+      });
+      expect(calls).toHaveLength(0);
+    });
+
+    it.each([
+      [
+        "ntfy's subscription limit (42903)",
+        429,
+        '{"code":42903,"http":429,"error":"limit reached: too many active subscriptions","link":"https://ntfy.sh/docs/publish/#limitations"}',
+        'application/json',
+        'ntfy returned HTTP 429: limit reached: too many active subscriptions (see https://ntfy.sh/docs/publish/#limitations)',
+      ],
+      [
+        "ntfy's auth refusal",
+        403,
+        '{"code":40301,"http":403,"error":"forbidden"}',
+        'application/json',
+        'ntfy returned HTTP 403: forbidden',
+      ],
+      [
+        'a proxy page that repeats the request path',
+        404,
+        '<html><body>No route for /alerts,backups/json</body></html>',
+        'text/html',
+        'ntfy.test returned HTTP 404',
+      ],
+    ])('on %s, after one request', async (_case, status, body, type, cause) => {
+      const { calls } = captureFetch(
+        () => new Response(body, { status, headers: { 'content-type': type } }),
+      );
+      const waited = await svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 });
+      expect(waited).toEqual({ outcome: 'failed', cause, waitedMs: 0 });
+      expect(calls).toHaveLength(1);
+    });
+
+    it('on a connection that fails before any answer', async () => {
+      captureFetch(() => {
+        throw new TypeError('fetch failed', {
+          cause: new Error('connect ECONNREFUSED 127.0.0.1:443'),
+        });
+      });
+      await expect(svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 })).resolves.toEqual({
+        outcome: 'failed',
+        cause: 'fetch failed (connect ECONNREFUSED 127.0.0.1:443)',
+        waitedMs: 0,
+      });
+    });
+  });
+
+  describe('fails, naming the cause and the time waited, when the stream breaks after it opened', () => {
+    /** Open a wait, let ntfy confirm it, and wait 2 s before `breakIt` runs. */
+    async function brokenAfterTwoSeconds(breakIt: (stream: FakeStream) => void) {
+      const { streams } = streamUpstream();
+      const waited = track(svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000 }));
+      await vi.advanceTimersByTimeAsync(0);
+      streams[0]?.send(openLine(1_794_000_000));
+      await vi.advanceTimersByTimeAsync(2_000);
+      breakIt(streams[0]!);
+      await vi.advanceTimersByTimeAsync(0);
+      return { waited, stream: streams[0]! };
+    }
+
+    it('on ntfy closing the stream', async () => {
+      const { waited } = await brokenAfterTwoSeconds((s) => s.close());
+      expect(waited.value).toEqual({
+        outcome: 'failed',
+        cause: 'the stream closed before any message arrived',
+        waitedMs: 2_000,
+      });
+    });
+
+    it.each([
+      ['Bun', BUN_RESET, 'ECONNRESET: The socket connection was closed unexpectedly'],
+      ['Node', NODE_RESET, 'terminated (other side closed)'],
+    ])('on a reset connection, as %s reports it', async (_runtime, reset, cause) => {
+      const { waited } = await brokenAfterTwoSeconds((s) => s.fail(reset()));
+      expect(waited.value).toEqual({ outcome: 'failed', cause, waitedMs: 2_000 });
+    });
+
+    it.each([
+      ['a line that is not JSON', '<html>', 'line 2 is not valid JSON'],
+      [
+        'JSON that is not an ntfy message',
+        '{"hello":"world"}',
+        'line 2 is not an ntfy message (string `id`, `event`, and `topic`, numeric `time`)',
+      ],
+    ])('on %s, without reading on', async (_case, line, problem) => {
+      const { waited, stream } = await brokenAfterTwoSeconds((s) => s.send(line, rowLine('m1')));
+      expect(waited.value).toEqual({
+        outcome: 'failed',
+        cause: `the stream is not ntfy's JSON message stream (content-type application/x-ndjson; charset=utf-8): ${problem}`,
+        waitedMs: 2_000,
+      });
+      expect(stream.aborted).toBe(true);
+    });
+
+    it("on ntfy's error line, with ntfy's own text", async () => {
+      const { waited } = await brokenAfterTwoSeconds((s) =>
+        s.send('{"code":42905,"http":429,"error":"limit reached: daily bandwidth reached"}'),
+      );
+      expect(waited.value).toEqual({
+        outcome: 'failed',
+        cause: 'ntfy returned HTTP 429: limit reached: daily bandwidth reached',
+        waitedMs: 2_000,
+      });
+    });
+
+    /**
+     * A per-call `base_url` can point the wait at any host, and a line in
+     * progress is held until its break arrives: past the bound the read ends,
+     * where ntfy's own lines run to a few kilobytes.
+     */
+    it.each([
+      ['more than 1048576 characters with no line break', 'x'.repeat(1_048_577)],
+      [
+        'a message line that passes 1048576 characters before its break arrives',
+        `${rowLineOf(1_048_577)}\n`,
+      ],
+    ])('on %s, without reading on', async (_case, text) => {
+      const { waited, stream } = await brokenAfterTwoSeconds((s) => writeInReads(s, text));
+      expect(waited.value).toEqual({
+        outcome: 'failed',
+        cause:
+          "the stream is not ntfy's JSON message stream (content-type application/x-ndjson; charset=utf-8): line 2 is longer than 1048576 characters",
+        waitedMs: 2_000,
+      });
+      expect(stream.aborted).toBe(true);
+      expect(openWaitCount()).toBe(0);
+    });
+  });
+
+  describe("the caller's cancellation", () => {
+    it('fails as RequestCancelled with the caller’s abort as its cause, and aborts the stream', async () => {
+      const { calls, streams } = streamUpstream();
+      const caller = new AbortController();
+      const reason = new Error('client went away');
+      const waited = track(
+        svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000, signal: caller.signal }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      streams[0]?.send(openLine(1_794_000_000));
+      await vi.advanceTimersByTimeAsync(2_000);
+      caller.abort(reason);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(waited.settledAfterMs).toBe(2_000);
+      const err = waited.error as Error & { code?: number };
+      expect(err.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(err.message).toBe('The ntfy request was cancelled by the caller.');
+      expect(err.cause).toBe(reason);
+      expect(streams[0]?.aborted).toBe(true);
+      expect(calls[0]?.signal?.reason).toBe(reason);
+    });
+
+    it('fails as RequestCancelled when it lands before ntfy answered', async () => {
+      const { calls } = captureFetch(abortAwareResponder);
+      const caller = new AbortController();
+      const waited = track(
+        svc().waitForMessage(WAIT_PARAMS, { holdMs: 30_000, signal: caller.signal }),
+      );
+      await vi.advanceTimersByTimeAsync(500);
+      caller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(waited.settledAfterMs).toBe(500);
+      expect((waited.error as { code?: number }).code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(calls[0]?.signal?.aborted).toBe(true);
+    });
+  });
+
+  it(`holds at most ${MAX_OPEN_WAITS} waits open, and a slot a cancelled wait frees is reused`, async () => {
+    const service = svc();
+    const { calls, streams } = streamUpstream();
+    const held = Array.from({ length: MAX_OPEN_WAITS }, () => {
+      const caller = new AbortController();
+      return {
+        caller,
+        waited: track(
+          service.waitForMessage(WAIT_PARAMS, { holdMs: 30_000, signal: caller.signal }),
+        ),
+      };
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    for (const stream of streams) stream.send(openLine(1_794_000_000));
+    expect(calls).toHaveLength(MAX_OPEN_WAITS);
+    expect(openWaitCount()).toBe(MAX_OPEN_WAITS);
+
+    // The eleventh returns at once, without asking ntfy for a stream.
+    await expect(service.waitForMessage(WAIT_PARAMS, { holdMs: 30_000 })).resolves.toEqual({
+      outcome: 'busy',
+    });
+    expect(calls).toHaveLength(MAX_OPEN_WAITS);
+
+    const [cancelled] = held;
+    cancelled?.caller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cancelled?.waited.error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(openWaitCount()).toBe(MAX_OPEN_WAITS - 1);
+
+    const reused = track(service.waitForMessage(WAIT_PARAMS, { holdMs: 30_000 }));
+    await vi.advanceTimersByTimeAsync(0);
+    streams.at(-1)?.send(openLine(1_794_000_000));
+    expect(calls).toHaveLength(MAX_OPEN_WAITS + 1);
+    expect(openWaitCount()).toBe(MAX_OPEN_WAITS);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    for (const { waited } of held.slice(1)) {
+      expect(waited.value).toMatchObject({ outcome: 'timedOut' });
+    }
+    expect(reused.value).toMatchObject({ outcome: 'timedOut' });
+  });
+});
+
+describe('NtfyService.waitForMessage on a caller-sized stream', () => {
+  /** Per-call CPU budget at every size; a run past it already fails, so the remaining runs are skipped. */
+  const CPU_LIMIT_MS = 50;
+  /**
+   * The size a stream arrives in, so a long line is assembled from many reads.
+   * Small enough that a scanner rescanning the pending line on every read
+   * grows several hundred times over the span, where a linear one grows about
+   * 25×.
+   */
+  const CHUNK = 256;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Answers every request with `text` as a 200 stream, `CHUNK` characters per read, then closes. */
+  function answerWith(text: string) {
+    const encoder = new TextEncoder();
+    const chunks: Uint8Array[] = [];
+    for (let i = 0; i < text.length; i += CHUNK) {
+      chunks.push(encoder.encode(text.slice(i, i + CHUNK)));
+    }
+    captureFetch(() => {
+      let next = 0;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            const chunk = chunks[next++];
+            if (chunk) controller.enqueue(chunk);
+            else controller.close();
+          },
+        }),
+        { status: 200, headers: NDJSON },
+      );
+    });
+  }
+
+  /** Thread CPU milliseconds for one wait over `text`: the least of three calls. */
+  async function cpuMs(text: string): Promise<number> {
+    answerWith(text);
+    const service = new NtfyService({
+      ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+      requestTimeoutMs: 60_000,
+    });
+    let least = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < 3; run++) {
+      const start = process.threadCpuUsage();
+      await service.waitForMessage(WAIT_PARAMS, { holdMs: 60_000 });
+      const { user, system } = process.threadCpuUsage(start);
+      least = Math.min(least, (user + system) / 1000);
+      if (least > CPU_LIMIT_MS) break;
+    }
+    return least;
+  }
+
+  /**
+   * Each shape doubles from 5k to 320k characters (64×), checking the budget at
+   * each size before the next and re-timing the 5k baseline beside it; the
+   * assertion is on the least growth of three full-span pairs. A linear scan
+   * grows about 64×, one that rescans the pending line on every read about 4096×.
+   */
+  it.each([
+    [
+      'one long line ending in a break',
+      (n: number) => `${'§1 x'.repeat(n / 4)}\ny`,
+      "the stream is not ntfy's JSON message stream (content-type application/x-ndjson; charset=utf-8): line 1 is not valid JSON",
+    ],
+    [
+      'line breaks throughout',
+      (n: number) => '  \r\n'.repeat(n / 4),
+      'the stream closed before any message arrived',
+    ],
+  ])('reads %s in time linear in its length', { timeout: 0 }, async (_shape, make, cause) => {
+    const small = 5_000;
+    answerWith(make(small));
+    await expect(
+      new NtfyService({
+        ...makeConfig([{ baseUrl: 'https://ntfy.test' }]),
+        requestTimeoutMs: 60_000,
+      }).waitForMessage(WAIT_PARAMS, { holdMs: 60_000 }),
+    ).resolves.toEqual({ outcome: 'failed', cause, waitedMs: 0 });
+    const pair = async (n: number) => {
+      const largeMs = await cpuMs(make(n));
+      expect(largeMs).toBeLessThan(CPU_LIMIT_MS);
+      return largeMs / (await cpuMs(make(small)));
+    };
+    for (let n = small * 2; n < small * 64; n *= 2) await pair(n);
+    const growth = Math.min(await pair(small * 64), await pair(small * 64), await pair(small * 64));
+    expect(growth).toBeLessThan(256);
+    expect(openWaitCount()).toBe(0);
   });
 });

@@ -6,7 +6,8 @@
  * user-confirmation gate: the first call returns an input request, and the
  * clear/delete only fires on the retried call whose approval redeems the
  * consent record that request stored for this exact topic, message, and
- * operation. The prompt and `format()` render every topic, sequence ID, and
+ * operation. A clear or delete reports the rate limits ntfy's reply carried as
+ * the `quota` enrichment. The prompt and `format()` render every topic, sequence ID, and
  * event ID through `literal()`, so each reads as literal text; failure messages
  * quote a `sequence_id` in double quotes as plain text, since the framework
  * escapes Markdown in them, and never name the topic.
@@ -19,6 +20,7 @@ import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors
 import { getServerConfig } from '@/config/server-config.js';
 import { confirmAction } from '@/mcp-server/tools/utils/confirm-action.js';
 import { literal } from '@/mcp-server/tools/utils/markdown-literal.js';
+import { quotaEnrichment, renderQuota } from '@/mcp-server/tools/utils/quota-enrichment.js';
 import {
   BASE_URL_HINT,
   BASE_URL_PATTERN,
@@ -32,11 +34,11 @@ import {
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
-  retryAfterData,
+  rateLimitedData,
   unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
-import type { NtfyManageResponse } from '@/services/ntfy/types.js';
+import type { NtfyManageResponse, NtfyReply } from '@/services/ntfy/types.js';
 
 const TOPIC_REGEX = /^[a-zA-Z0-9_-]+$/;
 const SEQUENCE_ID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -92,6 +94,8 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
   },
   input: InputSchema,
   output: OutputSchema,
+  enrichment: { quota: quotaEnrichment },
+  enrichmentTrailer: { quota: { render: renderQuota } },
 
   errors: [
     {
@@ -179,9 +183,9 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       );
     }
 
-    let response: NtfyManageResponse;
+    let reply: NtfyReply<NtfyManageResponse>;
     try {
-      response = await getNtfyService().manage(topic, input.sequence_id, input.operation, {
+      reply = await getNtfyService().manage(topic, input.sequence_id, input.operation, {
         baseUrl: overrideBase,
         signal: ctx.signal,
       });
@@ -204,7 +208,7 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
         throw ctx.fail(
           'rate_limited',
           msg || 'ntfy returned 429 after retries.',
-          retryAfterData(err),
+          rateLimitedData(err),
         );
       }
       if (isUpstreamUnreachable(err)) {
@@ -217,6 +221,9 @@ export const ntfyManageMessage = tool('ntfy_manage_message', {
       }
       throw err;
     }
+    const { envelope: response, quota } = reply;
+    // An unreported quota stays absent: `ctx.enrich({ quota: undefined })` would render.
+    if (quota) ctx.enrich({ quota });
 
     ctx.log.info('Managed ntfy message', {
       eventId: response.id,

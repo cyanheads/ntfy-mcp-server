@@ -13,10 +13,14 @@
  *    `NTFY_AUTH_USERNAME`, `NTFY_AUTH_PASSWORD`) — convenience for the
  *    common one-server case, expressed internally as a single-entry registry.
  *
+ * Credentials live in those auth fields only: a base URL carrying them
+ * (`https://user:password@host`) fails startup, naming the fields to move them
+ * to, and no startup message quotes a base URL.
+ *
  * `NTFY_ENABLE_EMOJI_TAGS` is parsed on its own by `isEmojiTagsEnabled()`,
  * since it is read at module load rather than inside `createApp()`.
  * `NTFY_CLAMP_LIMITS` (`clampLimits`) is read through `getServerConfig()` on
- * every `tools/list` and every `limit` parse (`limit-clamp.ts`), so `setup()`'s
+ * every `tools/list` and every `limit` and `wait_seconds` parse (`limit-clamp.ts`), so `setup()`'s
  * own call is what fails startup on an invalid value.
  * @module config/server-config
  */
@@ -25,13 +29,35 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { normalizeEnv, parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 import { configurationError } from '@cyanheads/mcp-ts-core/errors';
 
+import { withoutEmptyUserinfo, withoutTrailingSlashes } from '@/services/ntfy/base-url-guard.js';
+
+/**
+ * The `params.reason` of the issue an entry's `baseUrl` raises when it carries
+ * credentials. The entry schema cannot tell which variable the entry came
+ * from, so `formatIssues` words the fields to move them to.
+ */
+const CREDENTIALS_IN_URL = 'credentials_in_url';
+
+/**
+ * True for a URL that parses with a username or a password. One that does not
+ * parse is `.url()`'s to report — Zod runs this check either way.
+ */
+function carriesCredentials(raw: string): boolean {
+  const url = URL.parse(raw);
+  return Boolean(url && (url.username || url.password));
+}
+
 const NtfyServerEntrySchema = z
   .object({
     baseUrl: z
       .string()
       .url()
-      .transform((u) => u.replace(/\/+$/, ''))
-      .describe('Base URL of the ntfy server (no trailing slash).'),
+      .refine((u) => !carriesCredentials(u), {
+        message: 'The base URL carries credentials (user:password@).',
+        params: { reason: CREDENTIALS_IN_URL },
+      })
+      .transform((u) => withoutEmptyUserinfo(withoutTrailingSlashes(u)))
+      .describe('Base URL of the ntfy server (no trailing slash, no credentials).'),
     authToken: z
       .string()
       .min(1)
@@ -75,19 +101,25 @@ const ServerConfigSchema = z.object({
   servers: z
     .array(NtfyServerEntrySchema)
     .min(1)
+    /**
+     * Names the earlier entry, never the URL, so no startup message quotes a
+     * base URL, whatever the entry's own checks found.
+     */
     .superRefine((arr, ctx) => {
-      const seen = new Set<string>();
+      const firstIndex = new Map<string, number>();
       for (let i = 0; i < arr.length; i++) {
         const base = arr[i]?.baseUrl;
         if (base === undefined) continue;
-        if (seen.has(base)) {
+        const first = firstIndex.get(base);
+        if (first !== undefined) {
           ctx.addIssue({
             code: 'custom',
-            message: `Duplicate server baseUrl: ${base}`,
+            message: `Duplicate server baseUrl: NTFY_SERVERS[${first}] registers the same base.`,
             path: [i, 'baseUrl'],
           });
+        } else {
+          firstIndex.set(base, i);
         }
-        seen.add(base);
       }
     }),
   defaultTopic: z
@@ -109,7 +141,7 @@ const ServerConfigSchema = z.object({
     .stringbool()
     .default(true)
     .describe(
-      "When true, a tool's `limit` above its per-call cap is served as the cap with a notice; when false, the schema advertises and enforces a maximum at the cap instead.",
+      "When true, a count above its per-call cap — a tool's `limit`, or `ntfy_fetch_messages`' `wait_seconds` (cap 40) — is served as the cap with a notice; when false, the schema advertises and enforces a maximum at the cap instead.",
     ),
 });
 
@@ -193,13 +225,18 @@ function loadFromEnv(rawEnv: Record<string, string | undefined>): ServerConfig {
   return result.data;
 }
 
+/**
+ * `NTFY_SERVERS` parsed as JSON. A value that does not parse fails startup with
+ * a message that quotes none of it and keeps no cause: the value holds
+ * credentials, and a parser's own message quotes the text around the fault.
+ */
 function parseServersJson(raw: string): unknown {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch (err) {
+  } catch {
     throw configurationError(
-      `NTFY_SERVERS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      'NTFY_SERVERS is not valid JSON: check its quotes, commas, and brackets. It takes a JSON array of server entries, such as [{"baseUrl":"https://ntfy.example.com","authToken":"…"}].',
     );
   }
   if (!Array.isArray(parsed)) {
@@ -240,9 +277,20 @@ function formatIssues(issues: z.ZodIssue[], env: RawEnv): string {
     const envVar = usingRegistry
       ? envVarForRegistryPath(issue.path)
       : envVarForSingleServerPath(path);
-    return envVar ? `  - ${envVar} (${path}): ${issue.message}` : `  - ${path}: ${issue.message}`;
+    const message =
+      issue.code === 'custom' && issue.params?.reason === CREDENTIALS_IN_URL
+        ? credentialsInUrlMessage(usingRegistry)
+        : issue.message;
+    return envVar ? `  - ${envVar} (${path}): ${message}` : `  - ${path}: ${message}`;
   });
   return `Server config validation failed:\n${lines.join('\n')}`;
+}
+
+/** The fix for a base URL carrying credentials, worded for the variable it came from. */
+function credentialsInUrlMessage(usingRegistry: boolean): string {
+  return usingRegistry
+    ? "The URL carries credentials (user:password@); remove them from it and set them as this entry's `authUsername` + `authPassword`, or `authToken`."
+    : 'The URL carries credentials (user:password@); remove them from it and set them as NTFY_AUTH_USERNAME + NTFY_AUTH_PASSWORD, or NTFY_AUTH_TOKEN.';
 }
 
 function envVarForSingleServerPath(path: string): string | undefined {

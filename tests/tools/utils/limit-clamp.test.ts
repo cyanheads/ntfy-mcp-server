@@ -45,9 +45,21 @@ const field = limitSchema({
   describe: (capRule) => `Rows to return. Default 25. ${capRule}`,
 });
 
-/** The `limit` property as `tools/list` advertises it. */
-function advertised(): Record<string, unknown> {
-  const schema = z.toJSONSchema(z.object({ limit: field }).strict(), {
+/** A count input that can be 0, with cap sentences of its own (the shape of `wait_seconds`). */
+const zeroBased = limitSchema({
+  cap: 40,
+  defaultLimit: 0,
+  min: 0,
+  capRules: {
+    clamping: 'One call waits at most 40 s; a larger value is served as 40, with a notice.',
+    strict: 'At most 40.',
+  },
+  describe: (capRule) => `Seconds to wait. Default 0. ${capRule}`,
+});
+
+/** The property `of` (by default the `limit` field) as `tools/list` advertises it. */
+function advertised(of: typeof field = field): Record<string, unknown> {
+  const schema = z.toJSONSchema(z.object({ limit: of }).strict(), {
     io: 'input',
     target: 'draft-2020-12',
   }) as unknown as { properties: { limit: Record<string, unknown> } };
@@ -119,6 +131,41 @@ describe('limitSchema with NTFY_CLAMP_LIMITS=false', () => {
   });
 });
 
+describe('limitSchema with a minimum of 0 and cap sentences of its own', () => {
+  it('parses 0 and applies the default 0, and rejects a negative or fractional value', () => {
+    expect(zeroBased.parse(0)).toBe(0);
+    expect(zeroBased.parse(undefined)).toBe(0);
+    expect(zeroBased.parse(90)).toBe(90);
+    expect(zeroBased.safeParse(-1).success).toBe(false);
+    expect(zeroBased.safeParse(0.5).success).toBe(false);
+  });
+
+  it('advertises minimum 0, default 0, no maximum, and its own clamping sentence', () => {
+    const wait = advertised(zeroBased);
+    expect(wait).toMatchObject({ type: 'integer', minimum: 0, default: 0 });
+    expect(wait).not.toHaveProperty('maximum');
+    expect(wait.description).toBe(
+      'Seconds to wait. Default 0. One call waits at most 40 s; a larger value is served as 40, with a notice.',
+    );
+  });
+
+  it('advertises and enforces its cap with its own strict sentence when NTFY_CLAMP_LIMITS=false', () => {
+    process.env[FLAG] = 'false';
+    expect(advertised(zeroBased)).toMatchObject({ minimum: 0, maximum: 40, default: 0 });
+    expect(advertised(zeroBased).description).toBe('Seconds to wait. Default 0. At most 40.');
+    expect(zeroBased.safeParse(41).error?.issues).toEqual([
+      expect.objectContaining({ code: 'too_big', maximum: 40, inclusive: true }),
+    ]);
+    expect(zeroBased.parse(40)).toBe(40);
+    expect(zeroBased.parse(0)).toBe(0);
+  });
+
+  it('leaves the `limit` field it sits beside as it was', () => {
+    expect(advertised()).toMatchObject({ minimum: 1, default: 25 });
+    expect(field.safeParse(0).success).toBe(false);
+  });
+});
+
 describe('limitSchema reads the mode on every use', () => {
   it('changes what it advertises and enforces when the setting changes after definition', () => {
     expect(advertised()).not.toHaveProperty('maximum');
@@ -143,7 +190,7 @@ describe('clampLimit', () => {
     ]);
   });
 
-  it('serves a value above the cap as the cap, with one log line and one count for the tool', () => {
+  it('serves a value above the cap as the cap, with one log line naming `limit` and one count for the tool', () => {
     const ctx = createMockContext();
     expect(clampLimit(500, { cap: 200, tool: 'some_tool' }, ctx)).toEqual({
       applied: 200,
@@ -153,7 +200,23 @@ describe('clampLimit', () => {
       {
         level: 'info',
         msg: 'Clamped limit',
-        data: { tool: 'some_tool', requested: 500, applied: 200 },
+        data: { tool: 'some_tool', input: 'limit', requested: 500, applied: 200 },
+      },
+    ]);
+    expect(telemetry.adds).toEqual([{ value: 1, attributes: { 'mcp.tool.name': 'some_tool' } }]);
+  });
+
+  it('names the input it clamped when that is not `limit`', () => {
+    const ctx = createMockContext();
+    expect(clampLimit(90, { cap: 40, tool: 'some_tool', input: 'wait_seconds' }, ctx)).toEqual({
+      applied: 40,
+      clamped: true,
+    });
+    expect((ctx.log as MockContextLogger).calls).toEqual([
+      {
+        level: 'info',
+        msg: 'Clamped limit',
+        data: { tool: 'some_tool', input: 'wait_seconds', requested: 90, applied: 40 },
       },
     ]);
     expect(telemetry.adds).toEqual([{ value: 1, attributes: { 'mcp.tool.name': 'some_tool' } }]);

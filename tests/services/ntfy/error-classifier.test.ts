@@ -3,16 +3,19 @@
  * extraction, upstream JSON error-body parsing, the envelope check, the auth
  * rejection read from ntfy's own error envelope, the `not_ntfy_endpoint` split
  * (no envelope on a final status, or ntfy's 40401), the rate/invalid/not-found
- * predicates, the malformed-poll-body marker, the "retry-exhausted" heuristic
+ * predicates, the limit a 429 names and its hint (`rateLimitedData`), the
+ * malformed-poll-body marker, the "retry-exhausted" heuristic
  * (call-deadline expiry included), the phrase-based 4xx sub-reason split (`invalid_delay` vs
  * `invalid_attachment` vs `payload_too_large` vs `unverified_contact`) and the
  * `invalid_timezone` read from ntfy's envelope code, the anonymous-sender
- * refusal, and which publish field an oversize rejection names.
+ * refusal, which publish field an oversize rejection names, the poll's
+ * `invalid since parameter` rejection, and every phrase read from ntfy's
+ * envelope alone — never a reason phrase or a page that borrows its words.
  * @module tests/services/ntfy/error-classifier
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { httpStatusToErrorCode } from '@cyanheads/mcp-ts-core/utils';
+import { httpErrorFromResponse, httpStatusToErrorCode } from '@cyanheads/mcp-ts-core/utils';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -26,6 +29,7 @@ import {
   isAuthRejection,
   isFileStoreFailure,
   isInvalidParamsCode,
+  isInvalidSinceRejection,
   isNotFoundCode,
   isNotNtfyEndpoint,
   isNtfyInternalError,
@@ -33,6 +37,7 @@ import {
   isUpstreamMalformed,
   isUpstreamUnreachable,
   oversizedPublishField,
+  rateLimitedData,
   upstreamErrorDetail,
 } from '@/services/ntfy/error-classifier.js';
 
@@ -339,6 +344,138 @@ describe('error-classifier predicates', () => {
   });
 });
 
+describe('rateLimitedData', () => {
+  /**
+   * An answer as `NtfyService` raises it: `httpErrorFromResponse` over the
+   * response, with the request's topic in `data` as the service puts it there.
+   */
+  const answer = (status: number, body: string, retryAfter?: string) =>
+    httpErrorFromResponse(
+      new Response(body, {
+        status,
+        headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter },
+      }),
+      { service: 'ntfy', data: { operation: 'publish', topic: 'secret-topic' } },
+    );
+
+  /** ntfy's 429 envelope, texts from `server/errors.go`. */
+  const envelope = (code: number, error: string) =>
+    JSON.stringify({ code, http: 429, error, link: 'https://ntfy.sh/docs/publish/#limitations' });
+
+  /** The hint `data` carries, or `undefined` when it carries none. */
+  const hintOf = (data: ReturnType<typeof rateLimitedData>) =>
+    data && 'recovery' in data ? data.recovery.hint : undefined;
+
+  /** [code, ntfy's text, `data.limit`, the hint with `Retry-After: 40`, the hint without one]. */
+  const LIMITS: [number, string, string, string, string][] = [
+    [
+      42901,
+      'limit reached: too many requests',
+      'requests',
+      'refills one request every few seconds. Retry in 40 seconds',
+      'refills one request every few seconds. Retry in a few seconds',
+    ],
+    [
+      42902,
+      'limit reached: too many emails',
+      'emails',
+      'drop `email` and publish without it, or retry in 40 seconds',
+      'drop `email` and publish without it, or retry once it resets, within 24 hours',
+    ],
+    [
+      42903,
+      'limit reached: too many active subscriptions',
+      'subscriptions',
+      'every open stream counts, an `ntfy_fetch_messages` call waiting with `wait_seconds` included. Retry once one has ended.',
+      'every open stream counts, an `ntfy_fetch_messages` call waiting with `wait_seconds` included. Retry once one has ended.',
+    ],
+    [
+      42905,
+      'limit reached: daily bandwidth reached',
+      'bandwidth',
+      'daily attachment bandwidth (limit `bandwidth`) is used up: retry in 40 seconds',
+      'daily attachment bandwidth (limit `bandwidth`) is used up: retry once it resets, within 24 hours',
+    ],
+    [
+      42908,
+      'limit reached: daily message quota reached',
+      'messages',
+      'every publish, update, clear, and delete fails until it resets in 40 seconds',
+      'every publish, update, clear, and delete fails until it resets within 24 hours',
+    ],
+    [
+      42910,
+      'limit reached: daily phone call quota reached',
+      'calls',
+      'drop `call` and publish without it, or retry in 40 seconds',
+      'drop `call` and publish without it, or retry once it resets, within 24 hours',
+    ],
+    [
+      42911,
+      'limit reached: too many new topics, please wait',
+      'topics',
+      'use one that already exists, or retry in 40 seconds',
+      'use one that already exists, or retry in about a minute',
+    ],
+  ];
+
+  it.each(LIMITS)(
+    "names ntfy's %i as the limit, with that limit's hint and the wait it named",
+    async (code, error, limit, withWait) => {
+      const data = rateLimitedData(await answer(429, envelope(code, error), '40'));
+      expect(data).toEqual({ retryAfter: '40', limit, recovery: { hint: expect.any(String) } });
+      const hint = hintOf(data) ?? '';
+      expect(hint).toContain(withWait);
+      // `content[]` renders the wait but not `limit`, so the hint names it.
+      expect(hint).toContain(`(limit \`${limit}\`)`);
+      expect(JSON.stringify(data)).not.toContain('secret-topic');
+    },
+  );
+
+  it.each(LIMITS)(
+    "names ntfy's %i without a `Retry-After`, as on an error line written into a replay",
+    async (code, error, limit, _withWait, withoutWait) => {
+      const data = rateLimitedData(await answer(429, envelope(code, error)));
+      expect(data).toEqual({ limit, recovery: { hint: expect.any(String) } });
+      expect(hintOf(data)).toContain(withoutWait);
+      expect(hintOf(data)).toContain(`(limit \`${limit}\`)`);
+    },
+  );
+
+  it("names no limit for ntfy's 429 whose code is not one, keeping the wait alone", async () => {
+    const authFailures = envelope(42909, 'limit reached: too many auth failures');
+    expect(rateLimitedData(await answer(429, authFailures, '40'))).toEqual({ retryAfter: '40' });
+    expect(rateLimitedData(await answer(429, authFailures))).toBeUndefined();
+  });
+
+  it.each([
+    ['plain text', 'Too Many Requests\n'],
+    [
+      "an HTML page quoting ntfy's daily-quota envelope",
+      `<html><body><pre>${envelope(42908, 'limit reached: daily message quota reached')}</pre></body></html>`,
+    ],
+    [
+      "JSON without ntfy's `code`",
+      JSON.stringify({ error: 'limit reached: daily message quota reached' }),
+    ],
+  ])('names no limit for a 429 carrying %s, keeping the wait alone', async (_label, body) => {
+    expect(rateLimitedData(await answer(429, body, '40'))).toEqual({ retryAfter: '40' });
+    expect(rateLimitedData(await answer(429, body))).toBeUndefined();
+  });
+
+  it('names no limit for an envelope whose code names another status than the one it came on', async () => {
+    const quota = envelope(42908, 'limit reached: daily message quota reached');
+    expect(rateLimitedData(await answer(503, quota, '40'))).toEqual({ retryAfter: '40' });
+  });
+
+  it('names no limit, and no wait, for an error that is not an HTTP answer', () => {
+    expect(
+      rateLimitedData(new Error('limit reached: daily message quota reached')),
+    ).toBeUndefined();
+    expect(rateLimitedData(undefined)).toBeUndefined();
+  });
+});
+
 describe('isUpstreamMalformed', () => {
   it('matches the retry-exhausted malformed-body failure the fetch path raises', () => {
     const err = new McpError(
@@ -577,28 +714,33 @@ describe('isUpstreamUnreachable', () => {
 });
 
 describe('classifyInvalidParams', () => {
-  it('returns `payload_too_large` when the message hints at attachment size', () => {
-    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'attachment too large for topic');
-    expect(classifyInvalidParams(err)).toBe('payload_too_large');
+  it("returns `payload_too_large` for ntfy's attachment-size rejection", () => {
+    expect(
+      classifyInvalidParams(
+        ntfyRejection(413, 41301, 'attachment too large, or bandwidth limit reached'),
+      ),
+    ).toBe('payload_too_large');
   });
 
-  it('returns `payload_too_large` when the captured body mentions a size rejection', () => {
-    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'request rejected', {
-      body: 'HTTP 413 Payload Too Large',
+  it('returns `payload_too_large` when the size rejection is only in the captured body', () => {
+    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ntfy returned HTTP 400 Bad Request', {
+      status: 400,
+      body: '{"code":40057,"http":400,"error":"invalid request: title is too large"}',
     });
     expect(classifyInvalidParams(err)).toBe('payload_too_large');
   });
 
   it("returns `invalid_attachment` for ntfy's attachment-URL rejection", () => {
-    const err = new McpError(
-      JsonRpcErrorCode.InvalidParams,
-      'ntfy returned HTTP 400 Bad Request: invalid request: attachment URL is invalid',
-    );
-    expect(classifyInvalidParams(err)).toBe('invalid_attachment');
+    expect(
+      classifyInvalidParams(
+        ntfyRejection(400, 40013, 'invalid request: attachment URL is invalid'),
+      ),
+    ).toBe('invalid_attachment');
   });
 
   it('returns `invalid_attachment` when the rejection is only in the captured body', () => {
     const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ntfy returned HTTP 400 Bad Request', {
+      status: 400,
       body: '{"code":40013,"http":400,"error":"invalid request: attachment URL is invalid"}',
     });
     expect(classifyInvalidParams(err)).toBe('invalid_attachment');
@@ -607,10 +749,7 @@ describe('classifyInvalidParams', () => {
   it('does not treat a bare attachment mention as a size rejection', () => {
     // The old keyword match fired on the word "attachment" alone, telling the
     // agent to shorten its message when the real problem was the `attach` URL.
-    const err = new McpError(
-      JsonRpcErrorCode.InvalidParams,
-      'ntfy returned HTTP 400 Bad Request: invalid request: attachment URL is invalid',
-    );
+    const err = ntfyRejection(400, 40013, 'invalid request: attachment URL is invalid');
     expect(classifyInvalidParams(err)).not.toBe('payload_too_large');
   });
 
@@ -648,33 +787,32 @@ describe('classifyInvalidParams', () => {
 
   it('reads a contact refusal from the captured body alone', () => {
     const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ntfy returned HTTP 400 Bad Request', {
+      status: 400,
       body: '{"code":40052,"http":400,"error":"invalid request: email address not verified"}',
     });
     expect(classifyInvalidParams(err)).toBe('unverified_contact');
   });
 
-  it('matches case-insensitively', () => {
-    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ATTACHMENT TOO LARGE');
-    expect(classifyInvalidParams(err)).toBe('payload_too_large');
+  it("matches ntfy's error text case-insensitively", () => {
+    expect(
+      classifyInvalidParams(ntfyRejection(400, 40057, 'INVALID REQUEST: TITLE IS TOO LARGE')),
+    ).toBe('payload_too_large');
     expect(
       classifyInvalidParams(
-        new McpError(JsonRpcErrorCode.InvalidParams, 'Invalid request: Email address not verified'),
+        ntfyRejection(400, 40052, 'Invalid request: Email address not verified'),
       ),
     ).toBe('unverified_contact');
   });
 
   it('returns undefined when neither pattern matches', () => {
-    const err = new McpError(JsonRpcErrorCode.InvalidParams, 'something else went wrong');
+    const err = ntfyRejection(400, 40010, 'invalid request: topic name is not allowed');
     expect(classifyInvalidParams(err)).toBeUndefined();
   });
 
   it('payload_too_large takes precedence when both phrases are present', () => {
     // Order in the implementation: delay, attachment URL, "too large", then the
     // contact refusals. Lock that in so a refactor doesn't silently flip it.
-    const err = new McpError(
-      JsonRpcErrorCode.InvalidParams,
-      'title is too large; email address not verified',
-    );
+    const err = ntfyRejection(400, 40057, 'title is too large; email address not verified');
     expect(classifyInvalidParams(err)).toBe('payload_too_large');
   });
 
@@ -700,6 +838,7 @@ describe('classifyInvalidParams', () => {
 
   it('returns `invalid_delay` when the delay rejection is only in the captured body', () => {
     const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ntfy returned HTTP 400 Bad Request', {
+      status: 400,
       body: '{"code":40006,"http":400,"error":"invalid delay parameter: too large, please refer to the docs"}',
     });
     expect(classifyInvalidParams(err)).toBe('invalid_delay');
@@ -795,6 +934,7 @@ describe('oversizedPublishField', () => {
 
   it('reads the field from the captured body alone', () => {
     const err = new McpError(JsonRpcErrorCode.InvalidParams, 'ntfy returned HTTP 400 Bad Request', {
+      status: 400,
       body: '{"code":40058,"http":400,"error":"invalid request: tags are too large"}',
     });
     expect(oversizedPublishField(err)).toBe('tags');
@@ -811,20 +951,30 @@ describe('oversizedPublishField', () => {
         ),
       ),
     ).toBe('attachment');
-    // 41302 (Matrix) and 41303 (JSON body) are body overflows, not attachments.
+    // 41302 (Matrix) is a body overflow, not an attachment.
     expect(
       oversizedPublishField(
         ntfyRejection(413, 41302, 'Matrix request is larger than the max allowed length'),
       ),
     ).toBeUndefined();
-    expect(oversizedPublishField(ntfyRejection(413, 41303, 'JSON body too large'))).toBeUndefined();
+  });
+
+  it.each([
+    ['JSON body too large'],
+    // ntfy.sh appends its plan pitch.
+    ['JSON body too large; increase your limits with a paid plan'],
+  ])("names the whole request for ntfy's 41303 %j, whatever the message size", (error) => {
+    expect(oversizedPublishField(ntfyRejection(413, 41303, error))).toBe('request');
   });
 
   it('names no field for a body overflow, a templated overflow, or another rejection', () => {
     const bodyOverflow = new McpError(
       JsonRpcErrorCode.InvalidRequest,
-      'ntfy returned HTTP 413 Request Entity Too Large: JSON body too large',
-      { status: 413, body: '{"code":41303,"http":413,"error":"JSON body too large"}' },
+      'ntfy returned HTTP 413 Request Entity Too Large: Matrix request is larger than the max allowed length',
+      {
+        status: 413,
+        body: '{"code":41302,"http":413,"error":"Matrix request is larger than the max allowed length"}',
+      },
     );
     expect(oversizedPublishField(bodyOverflow)).toBeUndefined();
     // 40041 says "title is too large" mid-sentence but is about a rendered template.
@@ -838,5 +988,102 @@ describe('oversizedPublishField', () => {
         ntfy400(40006, 'invalid delay parameter: too large, please refer to the docs'),
       ),
     ).toBeUndefined();
+  });
+});
+
+describe('isInvalidSinceRejection', () => {
+  it("matches ntfy's 40008 envelope", () => {
+    const err = ntfyRejection(
+      400,
+      40008,
+      'invalid since parameter',
+      'https://ntfy.sh/docs/subscribe/api/#fetch-cached-messages',
+    );
+    expect(isInvalidSinceRejection(err)).toBe(true);
+  });
+
+  it.each([
+    [40010, 'invalid request: topic name is not allowed'],
+    [40061, 'invalid request: too many topics'],
+    [40004, 'invalid delay parameter: unable to parse delay'],
+  ])("does not match ntfy's %i, another 400 envelope", (code, error) => {
+    expect(isInvalidSinceRejection(ntfyRejection(400, code, error))).toBe(false);
+  });
+
+  it('is null-safe', () => {
+    expect(isInvalidSinceRejection(undefined)).toBe(false);
+    expect(isInvalidSinceRejection(new Error('invalid since parameter'))).toBe(false);
+  });
+});
+
+/**
+ * #57: ntfy's words without ntfy's envelope behind them. Each carrier is an
+ * answer as `NtfyService` raises it for a host that is not ntfy: the status
+ * line names the host and carries the upstream's reason phrase, no `error`
+ * string is folded into it, and the body sits under `data.body`. ntfy sends
+ * every rejection these phrases name in its envelope, so none of them is one.
+ */
+describe("ntfy's phrases outside its envelope (#57)", () => {
+  /** Every phrase a matcher in this module reads, as ntfy words it (`server/errors.go`). */
+  const PHRASES: [code: number, phrase: string][] = [
+    [40004, 'invalid delay parameter: unable to parse delay'],
+    [40013, 'invalid request: attachment URL is invalid'],
+    [40057, 'invalid request: title is too large'],
+    [40058, 'invalid request: tags are too large'],
+    [41301, 'attachment too large, or bandwidth limit reached'],
+    [41303, 'JSON body too large'],
+    [40034, 'invalid request: phone number not verified, or no matching verified numbers found'],
+    [40052, 'invalid request: email address not verified'],
+    [40035, 'invalid request: anonymous phone calls are not allowed'],
+    [40053, 'invalid request: anonymous email sending is not allowed'],
+    [40008, 'invalid since parameter'],
+  ];
+
+  /** A non-ntfy answer as the service raises it: the status, its reason phrase, the body. */
+  const foreign = (status: number, statusText: string, body: string) =>
+    new McpError(
+      httpStatusToErrorCode(status) ?? JsonRpcErrorCode.InternalError,
+      `127.0.0.1:8080 returned HTTP ${status} ${statusText}.`,
+      { status, statusText, body },
+    );
+
+  const CARRIERS: [label: string, carry: (code: number, phrase: string) => McpError][] = [
+    ['a 400 reason phrase', (_code, phrase) => foreign(400, phrase, '')],
+    [
+      'an HTML page',
+      (_code, phrase) =>
+        foreign(
+          400,
+          'Bad Request',
+          `<html>\n<head><title>400 Bad Request</title></head>\n<body>\n<center><h1>400 Bad Request</h1></center>\n<p>${phrase}</p>\n</body>\n</html>\n`,
+        ),
+    ],
+    [
+      "JSON without ntfy's `code`",
+      (_code, phrase) => foreign(400, 'Bad Request', JSON.stringify({ error: phrase })),
+    ],
+    [
+      'ntfy-shaped JSON whose `code` and `http` name 413, on a 400',
+      (_code, phrase) =>
+        foreign(400, 'Bad Request', JSON.stringify({ code: 41301, http: 413, error: phrase })),
+    ],
+    [
+      "a 422 quoting ntfy's envelope in its reason phrase and its body",
+      (code, phrase) =>
+        foreign(422, phrase, JSON.stringify({ code, http: Math.floor(code / 100), error: phrase })),
+    ],
+  ];
+
+  const ROWS = PHRASES.flatMap(([code, phrase]) =>
+    CARRIERS.map(([label, carry]) => [phrase, label, carry(code, phrase)] as const),
+  );
+
+  it.each(ROWS)('reads no ntfy rejection from %j in %s', (_phrase, _carrier, err) => {
+    // The carrier is no envelope, so none of the phrase matchers may claim it.
+    expect(hasNtfyEnvelope(err)).toBe(false);
+    expect(classifyInvalidParams(err)).toBeUndefined();
+    expect(oversizedPublishField(err)).toBeUndefined();
+    expect(isAnonymousSenderRejection(err)).toBe(false);
+    expect(isInvalidSinceRejection(err)).toBe(false);
   });
 });

@@ -26,7 +26,7 @@ import {
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
-  retryAfterData,
+  rateLimitedData,
   unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { MESSAGE_TRUNCATE_AT, shapeMessage } from '@/services/ntfy/message-shape.js';
@@ -114,7 +114,7 @@ export const ntfyTopicResource = resource('ntfy://{topic}', {
         throw ctx.fail(
           'rate_limited',
           getMessage(err) || 'ntfy returned 429 after retries.',
-          retryAfterData(err),
+          rateLimitedData(err),
         );
       }
       if (isAuthRejection(err)) {

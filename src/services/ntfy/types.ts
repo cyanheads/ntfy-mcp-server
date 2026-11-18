@@ -158,6 +158,58 @@ export interface NtfyFetchResult {
   upstreamTruncated: boolean;
 }
 
+/**
+ * Where a poll's window opens when ntfy reads its `since` as a message ID —
+ * after that message — or as Unix seconds — at that second.
+ */
+export type WindowStart = { kind: 'id'; id: string } | { kind: 'time'; seconds: number };
+
+/** How long `NtfyService.waitForMessage` holds ntfy's stream open, beside the per-call options. */
+export interface NtfyWaitOptions extends NtfyCallOptions {
+  /** Milliseconds from the call to `waitForMessage` until the wait ends with nothing. */
+  holdMs: number;
+  /**
+   * Where the poll's window opened, when its `since` named a message or a time.
+   * ntfy re-sends a message it wrote in the last second to every stream that
+   * subscribed after the message went out, applying the stream's filters but
+   * not its `since`, so the stream can deliver the marker message itself or a
+   * row timed before the window; the wait skips such a row and goes on.
+   * Omitted under a duration or a keyword: a message re-sent this way went out
+   * within the last two seconds, inside any duration's window longer than that,
+   * and `all` and `latest` take it in.
+   */
+  windowStart?: WindowStart | undefined;
+}
+
+/**
+ * How one wait for the next message ended. `waitedMs` runs on this server's
+ * clock from the start of the wait to its end.
+ */
+export type NtfyWaitResult =
+  | {
+      outcome: 'arrived';
+      /** The first envelope the stream delivered other than `open`, `keepalive`, and a row before `windowStart`. */
+      message: NtfyMessage;
+      /**
+       * The latest ntfy's clock can have read when the message arrived, in Unix
+       * seconds: the stream's `open` line `time` (whole seconds) plus one, plus
+       * the time since that line arrived; this server's clock when ntfy sent no
+       * `open` line first.
+       */
+      ntfyClockSeconds: number;
+      waitedMs: number;
+    }
+  | { outcome: 'timedOut'; waitedMs: number }
+  | {
+      outcome: 'failed';
+      /** What refused or broke the stream, as plain text that names no topic. */
+      cause: string;
+      /** 0 when the stream never opened. */
+      waitedMs: number;
+    }
+  /** This process already holds its most waits open, so no stream was requested. */
+  | { outcome: 'busy' };
+
 export type ManageOperation = 'clear' | 'delete';
 
 export interface NtfyManageResponse {
@@ -176,4 +228,27 @@ export interface NtfyCallOptions {
    */
   baseUrl?: string | undefined;
   signal?: AbortSignal | undefined;
+}
+
+/**
+ * The rate-limit policies one ntfy response reported in its `RateLimit-Policy`
+ * and `RateLimit` headers (ntfy v2.37.0+). A policy is present only when the
+ * response carried all three of its numbers; an absent key was not reported,
+ * never zero.
+ */
+export interface NtfyQuota {
+  /** Daily message allowance: `limit` = q, `remaining` = r, `resetsInSeconds` = t (until the visitor's 24-hour period ends). */
+  messages?: { limit: number; remaining: number; resetsInSeconds: number };
+  /** Request bucket: `limit` = q, `remaining` = r, `nextRequestInSeconds` = t (until one more request is available). */
+  requests?: { limit: number; remaining: number; nextRequestInSeconds: number };
+}
+
+/**
+ * What a publish or a clear/delete returns: ntfy's reply envelope, and the
+ * rate-limit policies the same response reported.
+ */
+export interface NtfyReply<T> {
+  envelope: T;
+  /** Absent when the response carried no policy (ntfy before v2.37.0, an exempt visitor). */
+  quota?: NtfyQuota | undefined;
 }

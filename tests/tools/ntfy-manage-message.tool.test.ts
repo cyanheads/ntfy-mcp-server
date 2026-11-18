@@ -7,8 +7,11 @@
  * the advertised annotations and the
  * no-dedupe guarantee they reflect, default-topic resolution,
  * missing-topic ValidationError,
- * base_url override plus its scheme validation, format() rendering for both
- * operations, and the consent gate across both round trips — the first round's
+ * base_url override plus its scheme validation and its refusal above the
+ * consent gate (credentials, no parse — no prompt, record, or request), an
+ * empty userinfo asked about and sent as the bare host, format() rendering for both
+ * operations, the `quota` enrichment and its `**Quota:**` line in `content[]`,
+ * and the consent gate across both round trips — the first round's
  * `input_required` result, its prompt contents, and the consent record it
  * stores; the round that redeems that record (accepted, refused, cancelled,
  * schema-invalid, wrong response kind); and every round that must ask again
@@ -30,7 +33,9 @@ import {
 import {
   createMockContext,
   expectInputRequired,
+  getEnrichment,
   type MockContextOptions,
+  runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -70,6 +75,9 @@ type ElicitParams = {
 };
 
 type ManageInput = ReturnType<typeof ntfyManageMessage.input.parse>;
+
+/** The context `ntfyManageMessage.handler` takes. */
+type HandlerCtx = Parameters<typeof ntfyManageMessage.handler>[1];
 
 const ACCEPT = { action: 'accept', content: { confirm: true } } as const;
 
@@ -134,11 +142,13 @@ describe('ntfyManageMessage handler', () => {
   it('forwards the operation and echoes the event envelope', async () => {
     const svc = freshService();
     const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
-      id: 'evt_1',
-      time: 1700000000,
-      event: 'message_clear',
-      topic: 'alerts',
-      sequence_id: 'seq_1',
+      envelope: {
+        id: 'evt_1',
+        time: 1700000000,
+        event: 'message_clear',
+        topic: 'alerts',
+        sequence_id: 'seq_1',
+      },
     });
 
     const input = ntfyManageMessage.input.parse({
@@ -237,11 +247,13 @@ describe('ntfyManageMessage handler', () => {
     process.env.NTFY_DEFAULT_TOPIC = 'fallback';
     const svc = freshService();
     const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
-      id: 'evt_1',
-      time: 1,
-      event: 'message_delete',
-      topic: 'fallback',
-      sequence_id: 'seq_1',
+      envelope: {
+        id: 'evt_1',
+        time: 1,
+        event: 'message_delete',
+        topic: 'fallback',
+        sequence_id: 'seq_1',
+      },
     });
     const input = ntfyManageMessage.input.parse({
       sequence_id: 'seq_1',
@@ -270,11 +282,13 @@ describe('ntfyManageMessage handler', () => {
   it('dispatches the `delete` operation distinctly from `clear`', async () => {
     const svc = freshService();
     const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
-      id: 'evt_2',
-      time: 1700000000,
-      event: 'message_delete',
-      topic: 'alerts',
-      sequence_id: 'seq_2',
+      envelope: {
+        id: 'evt_2',
+        time: 1700000000,
+        event: 'message_delete',
+        topic: 'alerts',
+        sequence_id: 'seq_2',
+      },
     });
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
@@ -315,11 +329,13 @@ describe('ntfyManageMessage handler', () => {
   it('renders the topic, sequence, and event ID ntfy echoes as code spans, keeping structuredContent raw', async () => {
     const svc = freshService();
     vi.spyOn(svc, 'manage').mockResolvedValue({
-      id: '<i>e</i>',
-      time: 1700000000,
-      event: 'message_delete',
-      topic: '[x](y)',
-      sequence_id: 'a`b',
+      envelope: {
+        id: '<i>e</i>',
+        time: 1700000000,
+        event: 'message_delete',
+        topic: '[x](y)',
+        sequence_id: 'a`b',
+      },
     });
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
@@ -387,11 +403,13 @@ describe('ntfyManageMessage handler', () => {
   it('forwards `base_url` (trailing-slash-normalized) to the service', async () => {
     const svc = freshService();
     const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
-      id: 'evt_4',
-      time: 1700000000,
-      event: 'message_delete',
-      topic: 'alerts',
-      sequence_id: 'seq_4',
+      envelope: {
+        id: 'evt_4',
+        time: 1700000000,
+        event: 'message_delete',
+        topic: 'alerts',
+        sequence_id: 'seq_4',
+      },
     });
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
@@ -427,11 +445,13 @@ describe('ntfyManageMessage handler', () => {
   it('treats an empty `base_url` from a form client as no override', async () => {
     const svc = freshService();
     const manage = vi.spyOn(svc, 'manage').mockResolvedValue({
-      id: 'evt_5',
-      time: 1700000000,
-      event: 'message_clear',
-      topic: 'alerts',
-      sequence_id: 'seq_5',
+      envelope: {
+        id: 'evt_5',
+        time: 1700000000,
+        event: 'message_clear',
+        topic: 'alerts',
+        sequence_id: 'seq_5',
+      },
     });
     const input = ntfyManageMessage.input.parse({
       topic: 'alerts',
@@ -441,6 +461,71 @@ describe('ntfyManageMessage handler', () => {
     });
     await ntfyManageMessage.handler(input, await approvedCtx(input));
     expect(manage.mock.calls[0]?.[3]).toMatchObject({ baseUrl: undefined });
+  });
+
+  /**
+   * #58: the handler resolves `base_url` above the consent gate, so a value the
+   * guard refuses fails there — no prompt names it, no consent record stores
+   * it, and no request carries it.
+   */
+  describe('a `base_url` the guard refuses (#58)', () => {
+    /** ntfy at every host, answering a delete — what the unfixed handler reached once approved. */
+    const anyNtfy = () =>
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+        Response.json({
+          id: 'evt_58',
+          time: 1700000000,
+          event: 'message_delete',
+          topic: 'alerts',
+          sequence_id: 'seq_1',
+        }),
+      );
+
+    const gated = (base_url: string) =>
+      ntfyManageMessage.input.parse({
+        topic: 'alerts',
+        sequence_id: 'seq_1',
+        operation: 'delete',
+        base_url,
+      });
+
+    it.each([
+      ['credentials', 'https://probeuser:pwSECRET@ntfy.example.com', 'credentials'],
+      ['a host that does not parse', 'http://probeuser:pwSECRET@[::1', 'not an absolute URL'],
+    ])(
+      'refuses one carrying %s without asking first, quoting neither credential',
+      async (_label, base_url, says) => {
+        freshService();
+        const upstream = anyNtfy();
+        const ctx = createMockContext({ errors: ntfyManageMessage.errors });
+        // Asking first would surface as an input request, not as this refusal.
+        const err = (await Promise.resolve(ntfyManageMessage.handler(gated(base_url), ctx)).catch(
+          (e: unknown) => e,
+        )) as McpError;
+        expect(err).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining(says),
+          data: { baseUrlRejected: true },
+        });
+        expect(JSON.stringify({ message: err.message, data: err.data })).not.toMatch(
+          /probeuser|pwSECRET/,
+        );
+        expect((await ctx.state.list('consent/')).items).toEqual([]);
+        expect(upstream).not.toHaveBeenCalled();
+      },
+    );
+
+    it('asks about, stores, and clears an empty-userinfo base as the bare host', async () => {
+      freshService();
+      const upstream = anyNtfy();
+      const input = gated('https://@other.example.com/');
+
+      const { record } = await askFirst(input);
+      expect(JSON.stringify(record)).not.toContain('@');
+
+      await ntfyManageMessage.handler(input, await approvedCtx(input));
+      expect(String(upstream.mock.calls[0]?.[0])).toBe('https://other.example.com/alerts/seq_1');
+    });
   });
 
   it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
@@ -503,6 +588,65 @@ describe('ntfyManageMessage handler', () => {
       code: JsonRpcErrorCode.RateLimited,
       retryable: true,
       recovery: expect.stringContaining('rate-limit window'),
+    });
+  });
+
+  /**
+   * #60: a 429 carrying ntfy's envelope names the limit it hit; one without it
+   * names none. The consent gate keeps `runToolContract` from reaching the
+   * clear, so these read the thrown envelope: `data` is what
+   * `structuredContent.error.data` carries, and the framework mirrors a
+   * `data.recovery.hint` the message does not already hold into `content[]`.
+   */
+  describe('the limit a 429 names (#60)', () => {
+    async function rateLimitedClear(body: string) {
+      freshService();
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        if (new URL(String(url)).hostname !== 'ntfy.test')
+          throw new Error(`Unmocked fetch: ${url}`);
+        return new Response(body, {
+          status: 429,
+          headers: { 'content-type': 'application/json', 'retry-after': '26839' },
+        });
+      });
+      const input = ntfyManageMessage.input.parse({
+        topic: 'alerts',
+        sequence_id: 'seq_x',
+        operation: 'clear',
+      });
+      return (await Promise.resolve(
+        ntfyManageMessage.handler(input, await approvedCtx(input)),
+      ).catch((e: unknown) => e)) as McpError;
+    }
+
+    it("names ntfy's daily message quota (42908), beside the wait, in data and the hint", async () => {
+      const err = await rateLimitedClear(
+        '{"code":42908,"http":429,"error":"limit reached: daily message quota reached","link":"https://ntfy.sh/docs/publish/#limitations"}',
+      );
+      expect(err.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(err.data).toMatchObject({
+        reason: 'rate_limited',
+        retryAfter: '26839',
+        limit: 'messages',
+        recovery: {
+          hint: expect.stringContaining(
+            'daily message quota (limit `messages`) is used up: every publish, update, clear, and delete fails until it resets in 26839 seconds',
+          ),
+        },
+      });
+      const hint = (err.data as { recovery: { hint: string } }).recovery.hint;
+      // Not already in the message, so `content[]` carries it on its `Recovery:` line.
+      expect(err.message).toContain('limit reached: daily message quota reached');
+      expect(err.message).not.toContain(hint);
+      expect(JSON.stringify({ message: err.message, data: err.data })).not.toContain('alerts');
+    });
+
+    it("names no limit for a 429 without ntfy's envelope, leaving the declared recovery", async () => {
+      const err = await rateLimitedClear('Too Many Requests\n');
+      expect(err.data).toMatchObject({ reason: 'rate_limited', retryAfter: '26839' });
+      expect(err.data).not.toHaveProperty('limit');
+      // No hint on the throw: the framework fills the declared recovery in.
+      expect(err.data).not.toHaveProperty('recovery');
     });
   });
 
@@ -1064,5 +1208,104 @@ describe('ntfyManageMessage consent gate', () => {
     );
     await expect(declined).rejects.toMatchObject({ data: { reason: 'consent_declined' } });
     await expect(declined).rejects.not.toMatchObject({ isInputRequiredSignal: true });
+  });
+});
+
+describe("ntfyManageMessage reports ntfy's quota (#60)", () => {
+  beforeEach(() => {
+    resetServerConfig();
+    resetNtfyService();
+    for (const k of ENV_KEYS) delete process.env[k];
+    process.env.NTFY_BASE_URL = 'https://ntfy.test';
+  });
+  afterEach(() => {
+    for (const k of ENV_KEYS) delete process.env[k];
+    resetServerConfig();
+    resetNtfyService();
+    vi.restoreAllMocks();
+  });
+
+  const QUOTA = {
+    messages: { limit: 250, remaining: 245, resetsInSeconds: 50740 },
+    requests: { limit: 60, remaining: 57, nextRequestInSeconds: 4 },
+  };
+
+  it.each([
+    ['a clear whose reply reported both policies', 'clear', 'message_clear', QUOTA],
+    ['a delete whose reply reported both policies', 'delete', 'message_delete', QUOTA],
+    // ntfy before v2.37.0, or an exempt visitor: absent, never zero.
+    ['a delete whose reply reported none', 'delete', 'message_delete', undefined],
+  ] as const)('%s carries exactly the quota reported', async (_label, operation, event, quota) => {
+    const svc = freshService();
+    vi.spyOn(svc, 'manage').mockResolvedValue({
+      envelope: { id: 'evt_1', time: 1700000000, event, topic: 'alerts', sequence_id: 'seq_1' },
+      // A copy, so the assertion below compares against an object the handler never held.
+      ...(quota ? { quota: structuredClone(quota) } : {}),
+    });
+    const input = ntfyManageMessage.input.parse({
+      topic: 'alerts',
+      sequence_id: 'seq_1',
+      operation,
+    });
+    const ctx = await approvedCtx(input);
+
+    await ntfyManageMessage.handler(input, ctx);
+
+    if (quota) expect(getEnrichment(ctx).quota).toEqual(quota);
+    else expect(getEnrichment(ctx)).not.toHaveProperty('quota');
+  });
+
+  it('renders the quota as the `**Quota:**` line of `content[]`, with the numbers `structuredContent` carries', async () => {
+    freshService();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      if (new URL(String(url)).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+      return new Response(
+        JSON.stringify({
+          id: 'evt_1',
+          time: 1700000000,
+          event: 'message_clear',
+          topic: 'alerts',
+          sequence_id: 'seq_1',
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'ratelimit-policy': '"requests";q=60;w=300, "messages";q=250;w=86400',
+            ratelimit: '"requests";r=57;t=4, "messages";r=245;t=50740',
+          },
+        },
+      );
+    });
+    const args = { topic: 'alerts', sequence_id: 'seq_1', operation: 'clear' } as const;
+    const { asked, record } = await askFirst(ntfyManageMessage.input.parse(args));
+
+    /**
+     * `runToolContract` builds a context of its own, whose `ctx.state` starts
+     * empty, so the record round one stored is put there before the real
+     * handler redeems it — as a retried call finds it on a running server.
+     * Everything else is the definition as declared, its trailer included.
+     */
+    const result = await runToolContract(
+      {
+        ...ntfyManageMessage,
+        handler: async (input: ManageInput, ctx: HandlerCtx) => {
+          await ctx.state.set(recordKey(asked.requestState), record);
+          return ntfyManageMessage.handler(input, ctx);
+        },
+      },
+      args,
+      { context: { requestState: asked.requestState, inputResponses: { confirm: ACCEPT } } },
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { quota?: unknown }).quota).toEqual({
+      messages: { limit: 250, remaining: 245, resetsInSeconds: 50740 },
+      requests: { limit: 60, remaining: 57, nextRequestInSeconds: 4 },
+    });
+    const text = result.content.map((block) => (block as { text?: string }).text ?? '').join('');
+    expect(text).toContain(
+      '**Quota:** messages 245 of 250 left, resets in 50740 s · requests 57 of 60 left, one more in 4 s',
+    );
   });
 });

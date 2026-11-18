@@ -68,16 +68,6 @@ export function upstreamErrorDetail(body: string): string | undefined {
 }
 
 /**
- * True for a `base_url` rejection raised locally — a bad scheme, a non-public
- * host, a refused redirect, an unresolvable host. These carry codes the upstream
- * classifiers below also claim, so handlers must let them through untouched
- * rather than relabel them as a complaint about some other argument.
- */
-export function isBaseUrlRejection(err: unknown): boolean {
-  return (err as { data?: { baseUrlRejected?: unknown } })?.data?.baseUrlRejected === true;
-}
-
-/**
  * True for the failure `NtfyService` raises when a `200` body is not what ntfy
  * sends: a poll body that is not its JSON message stream, or a publish or
  * clear/delete reply that is not its message envelope or that failed partway
@@ -190,7 +180,7 @@ export function isRateLimitedCode(code: unknown): boolean {
  * error, so without this the one concrete wait the upstream named never
  * reaches the caller.
  */
-export function retryAfterData(err: unknown): { retryAfter: string | number } | undefined {
+function retryAfterData(err: unknown): { retryAfter: string | number } | undefined {
   const value = (err as { data?: { retryAfter?: unknown } })?.data?.retryAfter;
   return typeof value === 'string' || typeof value === 'number' ? { retryAfter: value } : undefined;
 }
@@ -211,6 +201,93 @@ export function unreachableWaitData(err: unknown, action: string) {
       },
     }
   );
+}
+
+/**
+ * ntfy's 429 codes that name a limit (`server/errors.go`): the name
+ * `rate_limited` reports for each as `data.limit`, and that limit's recovery,
+ * given the wait ntfy named (`in 40 seconds`) or nothing when it sent no
+ * `Retry-After`, as on an error line written into a started replay. Each hint
+ * names the limit as well, since the `content[]` error trailer renders
+ * `retryAfter` but not `limit`. Any other 429 code names none here.
+ */
+const RATE_LIMITS = new Map<number, { limit: string; hint: (wait?: string) => string }>([
+  [
+    42901,
+    {
+      limit: 'requests',
+      hint: (wait = 'in a few seconds') =>
+        `ntfy's request allowance (limit \`requests\`) is used up; it refills one request every few seconds. Retry ${wait}, and space out the calls after it.`,
+    },
+  ],
+  [
+    42902,
+    {
+      limit: 'emails',
+      hint: (wait = 'once it resets, within 24 hours') =>
+        `ntfy's daily e-mail quota (limit \`emails\`) is used up: drop \`email\` and publish without it, or retry ${wait}.`,
+    },
+  ],
+  [
+    42903,
+    {
+      limit: 'subscriptions',
+      hint: () =>
+        "Too many ntfy subscriptions are open from this server's address (limit `subscriptions`); every open stream counts, an `ntfy_fetch_messages` call waiting with `wait_seconds` included. Retry once one has ended.",
+    },
+  ],
+  [
+    42905,
+    {
+      limit: 'bandwidth',
+      hint: (wait = 'once it resets, within 24 hours') =>
+        `ntfy's daily attachment bandwidth (limit \`bandwidth\`) is used up: retry ${wait}.`,
+    },
+  ],
+  [
+    42908,
+    {
+      limit: 'messages',
+      hint: (wait = 'within 24 hours') =>
+        `ntfy's daily message quota (limit \`messages\`) is used up: every publish, update, clear, and delete fails until it resets ${wait}.`,
+    },
+  ],
+  [
+    42910,
+    {
+      limit: 'calls',
+      hint: (wait = 'once it resets, within 24 hours') =>
+        `ntfy's daily phone-call quota (limit \`calls\`) is used up: drop \`call\` and publish without it, or retry ${wait}.`,
+    },
+  ],
+  [
+    42911,
+    {
+      limit: 'topics',
+      hint: (wait = 'in about a minute') =>
+        `ntfy's allowance for new topics (limit \`topics\`) is used up, and this call names a topic that is new to the server: use one that already exists, or retry ${wait}.`,
+    },
+  ],
+]);
+
+/**
+ * `ctx.fail` data for a `rate_limited` failure: the `Retry-After` ntfy sent
+ * (`retryAfterData`), plus — when ntfy's own envelope (see `ntfyErrorCode`)
+ * carries a code in `RATE_LIMITS` — the limit as `limit` and that limit's
+ * recovery hint, which overrides the declared one. A 429 without the envelope,
+ * or with a code that names no limit, gets the wait alone and keeps the
+ * declared recovery. `undefined` when there is neither.
+ */
+export function rateLimitedData(err: unknown) {
+  const wait = retryAfterData(err);
+  const code = ntfyErrorCode(err);
+  const named = code === undefined ? undefined : RATE_LIMITS.get(code);
+  if (!named) return wait;
+  return {
+    ...wait,
+    limit: named.limit,
+    recovery: { hint: named.hint(wait && `in ${wait.retryAfter} seconds`) },
+  };
 }
 
 export function isInvalidParamsCode(code: unknown): boolean {
@@ -267,13 +344,18 @@ export function isUpstreamUnreachable(err: unknown): boolean {
 }
 
 /**
- * The `McpError` message ("ntfy returned HTTP …", or the request URL's host
- * in place of `ntfy` for an answer without ntfy's envelope) and the captured
- * upstream body (`err.data.body`), lowercased — the distinguishing keywords live
- * in the body, not the status-line message.
+ * The `error` string of ntfy's envelope, lowercased, when the answer carried
+ * one (see `hasNtfyEnvelope`); the empty string otherwise. Every phrase below is
+ * matched against this text alone. ntfy sends each rejection those phrases name
+ * in its envelope, so the same words in a status line's reason phrase, in a
+ * page from a host that is not ntfy, or in JSON without ntfy's code on the
+ * status it names are no ntfy rejection. The envelope's docs `link` is never
+ * read.
  */
-function rejectionText(err: unknown): string {
-  return `${getMessage(err)} ${getDataBody(err)}`.toLowerCase();
+function ntfyErrorText(err: unknown): string {
+  if (!hasNtfyEnvelope(err)) return '';
+  const { error } = parseErrorEnvelope(getDataBody(err)) ?? {};
+  return typeof error === 'string' ? error.toLowerCase() : '';
 }
 
 /** ntfy's 40034 and 40052: the `call` number or `email` address is not verified on the account. */
@@ -287,9 +369,10 @@ const ANONYMOUS_SENDER = [
 
 /**
  * Split of a 4xx-classed error into one of the publish contract sub-reasons:
- * `invalid_timezone` by ntfy's envelope code, the rest by phrase, read from
- * both the status-line message and the captured body. Returns `undefined` when
- * no case matches.
+ * `invalid_timezone` by ntfy's envelope code, the rest by phrase in its
+ * envelope's `error` text (`ntfyErrorText`), so an answer without the envelope
+ * — whatever its page or reason phrase says — gets none. Returns `undefined`
+ * when no case matches.
  *
  * `invalid_timezone` is ntfy's 40059, a `timezone` its zone database does not
  * know, read from ntfy's error envelope (see `ntfyErrorCode`) rather than its
@@ -314,8 +397,7 @@ const ANONYMOUS_SENDER = [
  * those phrases match. Every other e-mail or phone rejection — calling disabled
  * on the server (40032), a malformed number (40033), e-mail disabled (40001), a
  * malformed address (40050) — names its own fix and stays unclassified, and
- * the docs link ntfy appends never decides a label: every phrase holds a space,
- * which a URL cannot.
+ * the docs link ntfy appends never decides a label, since it is not read.
  */
 export function classifyInvalidParams(
   err: unknown,
@@ -329,7 +411,7 @@ export function classifyInvalidParams(
   if (ntfyErrorCode(err) === 40059) {
     return 'invalid_timezone';
   }
-  const haystack = rejectionText(err);
+  const haystack = ntfyErrorText(err);
   if (haystack.includes('invalid delay parameter')) {
     return 'invalid_delay';
   }
@@ -348,10 +430,11 @@ export function classifyInvalidParams(
 /**
  * True for the `unverified_contact` refusals whose cause is a missing
  * credential rather than an unverified address or number, which need the
- * credentials hint instead of the verification one.
+ * credentials hint instead of the verification one. Read from ntfy's envelope
+ * alone (`ntfyErrorText`).
  */
 export function isAnonymousSenderRejection(err: unknown): boolean {
-  const haystack = rejectionText(err);
+  const haystack = ntfyErrorText(err);
   return ANONYMOUS_SENDER.some((phrase) => haystack.includes(phrase));
 }
 
@@ -361,14 +444,31 @@ export function isAnonymousSenderRejection(err: unknown): boolean {
  * (`invalid request: tags are too large`), `attachment` for the 413 41301
  * (`attachment too large, or bandwidth limit reached` — ntfy stored the message
  * as a file and the file, or the client's attachment quota, was over its
- * limit), `undefined` for anything else. The full phrase is matched, so 40041
+ * limit), `request` for the 413 41303 (`JSON body too large` — the JSON publish
+ * as a whole, every field together, is over twice ntfy's message size limit,
+ * whatever the message's own size), `undefined` for anything else, an answer
+ * without ntfy's envelope included (`ntfyErrorText`): a 413 page or reason
+ * phrase that quotes ntfy names no field. The full phrase is matched, so 40041
  * ("message or title is too large after replacing template") is not read as a
  * title overflow.
  */
-export function oversizedPublishField(err: unknown): 'title' | 'tags' | 'attachment' | undefined {
-  const haystack = rejectionText(err);
+export function oversizedPublishField(
+  err: unknown,
+): 'title' | 'tags' | 'attachment' | 'request' | undefined {
+  const haystack = ntfyErrorText(err);
   if (haystack.includes('invalid request: title is too large')) return 'title';
   if (haystack.includes('invalid request: tags are too large')) return 'tags';
   if (haystack.includes('attachment too large, or bandwidth limit reached')) return 'attachment';
+  if (haystack.includes('json body too large')) return 'request';
   return;
+}
+
+/**
+ * True when ntfy rejected a poll's `since` — its 40008, `invalid since
+ * parameter` (a malformed duration or timestamp, or a duration unit other than
+ * `s`, `m`, `h`) — read from its envelope alone (`ntfyErrorText`), so a 400
+ * whose reason phrase or page uses those words is not one.
+ */
+export function isInvalidSinceRejection(err: unknown): boolean {
+  return ntfyErrorText(err).includes('invalid since parameter');
 }

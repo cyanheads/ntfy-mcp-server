@@ -612,10 +612,11 @@ describe('ntfyTopicResource handler', () => {
         ntfyError(403, 'forbidden'),
         'NTFY_AUTH_TOKEN',
       ],
+      // A 429 without ntfy's envelope names no limit (#60), so it keeps the declared hint.
       [
         'rate_limited',
         JsonRpcErrorCode.RateLimited,
-        ntfyError(429, 'limit reached: too many requests'),
+        () => new Response('Too Many Requests\n', { status: 429 }),
         'rate-limit window',
       ],
       ['upstream_unreachable', JsonRpcErrorCode.ServiceUnavailable, refused, 'NTFY_BASE_URL'],
@@ -649,6 +650,37 @@ describe('ntfyTopicResource handler', () => {
         expect(error?.data?.recovery?.hint).not.toContain('base_url');
       },
     );
+
+    it("hands a reader the limit ntfy's 429 named, in `data` and its hint (#60)", async () => {
+      freshService();
+      vi.stubEnv('MCP_LOG_LEVEL', 'error');
+      stubUpstream(
+        () =>
+          new Response('{"code":42901,"http":429,"error":"limit reached: too many requests"}', {
+            status: 429,
+            headers: { 'content-type': 'application/json', 'retry-after': '20' },
+          }),
+      );
+      const error = (await readThroughServer()) as
+        | { code: number; message: string; data?: Record<string, unknown> }
+        | undefined;
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        message: expect.stringContaining('limit reached: too many requests'),
+        data: {
+          reason: 'rate_limited',
+          retryAfter: '20',
+          limit: 'requests',
+          recovery: {
+            hint: expect.stringContaining(
+              'request allowance (limit `requests`) is used up; it refills one request every few seconds. Retry in 20 seconds',
+            ),
+          },
+        },
+      });
+      const hint = (error?.data?.recovery as { hint?: string } | undefined)?.hint;
+      expect(`${error?.message} ${hint}`).not.toContain('alerts');
+    });
 
     it('points the operator at `NTFY_BASE_URL` and the reader at the reserved `docs`, `static`, and `file` (#55)', () => {
       const entry = ntfyTopicResource.errors?.find((e) => e.reason === 'not_ntfy_endpoint');
@@ -812,6 +844,22 @@ describe('ntfyTopicResource handler', () => {
       expect(messages).toHaveLength(1);
       expect(messages[0]).toMatchObject({ id: 'ahead', time: '2100-01-01T00:00:00.000Z' });
       expect(messages[0]).not.toHaveProperty('scheduled');
+    });
+
+    it('never waits: an empty snapshot makes one request, a poll, and no wait (#61)', async () => {
+      const svc = freshService();
+      const upstream = stubUpstream(poll(''));
+      const wait = vi.spyOn(svc, 'waitForMessage');
+      const ctx = createMockContext({
+        errors: ntfyTopicResource.errors,
+        uri: new URL('ntfy://alerts'),
+      });
+      const result = await ntfyTopicResource.handler({ topic: 'alerts' }, ctx);
+      expect(result).toMatchObject({ count: 0, messages: [] });
+      expect(upstream).toHaveBeenCalledTimes(1);
+      const [requested] = upstream.mock.calls[0] ?? [];
+      expect(new URL(String(requested)).searchParams.get('poll')).toBe('1');
+      expect(wait).not.toHaveBeenCalled();
     });
   });
 

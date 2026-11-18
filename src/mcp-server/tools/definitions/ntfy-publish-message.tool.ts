@@ -6,7 +6,8 @@
  * through a user-confirmation gate: the first such call returns an input
  * request, and the publish only fires on the retried call whose approval
  * redeems the consent record that request stored for this exact publish.
- * `format()` renders every value ntfy echoes as a code span or fence, so it
+ * A publish reports the rate limits ntfy's reply carried as the `quota`
+ * enrichment. `format()` renders every value ntfy echoes as a code span or fence, so it
  * reads as literal text; a body ntfy accepted as `text/markdown` is flagged
  * `markdown: true` and fenced as `markdown`. Failure messages quote a value in
  * double quotes as plain text, since the framework escapes Markdown in them,
@@ -19,7 +20,13 @@ import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors
 
 import { getServerConfig, isEmojiTagsEnabled } from '@/config/server-config.js';
 import { confirmAction } from '@/mcp-server/tools/utils/confirm-action.js';
-import { literal, literalBlock } from '@/mcp-server/tools/utils/markdown-literal.js';
+import {
+  literal,
+  literalBlock,
+  promptLiteral,
+  promptTarget,
+} from '@/mcp-server/tools/utils/markdown-literal.js';
+import { quotaEnrichment, renderQuota } from '@/mcp-server/tools/utils/quota-enrichment.js';
 import {
   BASE_URL_HINT,
   BASE_URL_PATTERN,
@@ -32,14 +39,13 @@ import {
   getMessage,
   isAnonymousSenderRejection,
   isAuthRejection,
-  isBaseUrlRejection,
   isFileStoreFailure,
   isInvalidParamsCode,
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
   oversizedPublishField,
-  retryAfterData,
+  rateLimitedData,
   unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
@@ -47,6 +53,7 @@ import type {
   NtfyAction,
   NtfyPublishRequest,
   NtfyPublishResponse,
+  NtfyReply,
   Priority,
 } from '@/services/ntfy/types.js';
 
@@ -62,7 +69,7 @@ const TopicSchema = z.string().min(1).max(64).regex(TOPIC_REGEX);
 const ViewActionSchema = z
   .object({
     action: z.literal('view').describe('Discriminator — must be `view`.'),
-    label: z.string().min(1).max(64).describe('Button label shown in the notification.'),
+    label: z.string().min(1).describe('Button label shown in the notification.'),
     url: z
       .string()
       .min(1)
@@ -76,7 +83,7 @@ const ViewActionSchema = z
 const BroadcastActionSchema = z
   .object({
     action: z.literal('broadcast').describe('Discriminator — must be `broadcast`.'),
-    label: z.string().min(1).max(64).describe('Button label shown in the notification.'),
+    label: z.string().min(1).describe('Button label shown in the notification.'),
     intent: z
       .string()
       .optional()
@@ -92,7 +99,7 @@ const BroadcastActionSchema = z
 const HttpActionSchema = z
   .object({
     action: z.literal('http').describe('Discriminator — must be `http`.'),
-    label: z.string().min(1).max(64).describe('Button label shown in the notification.'),
+    label: z.string().min(1).describe('Button label shown in the notification.'),
     url: z.string().describe('Absolute URL the HTTP request is sent to.'),
     method: z.string().optional().describe('HTTP method — defaults to POST when omitted.'),
     headers: z
@@ -110,7 +117,7 @@ const HttpActionSchema = z
 const CopyActionSchema = z
   .object({
     action: z.literal('copy').describe('Discriminator — must be `copy`.'),
-    label: z.string().min(1).max(64).describe('Button label shown in the notification.'),
+    label: z.string().min(1).describe('Button label shown in the notification.'),
     value: z.string().min(1).describe('Text copied to the device clipboard on tap.'),
     clear: z.boolean().optional().describe('Dismiss the notification after the button is tapped.'),
   })
@@ -181,15 +188,13 @@ const InputSchema = z.object({
     .describe('Notification title. Defaults to the topic URL on the recipient device.'),
   priority: PrioritySchema.optional(),
   tags: z
-    .array(z.string().min(1))
-    .max(10)
+    .array(z.string())
     .optional()
     .describe(
-      `Up to 10 tags. Strings matching ntfy emoji short codes render as emojis prepended to the title; others render as a tag list.${EMOJI_TAGS_ENABLED ? ' Use `ntfy_search_emoji_tags` to discover short codes.' : ''}`,
+      `Strings matching ntfy emoji short codes render as emojis prepended to the title; others render as a tag list. ntfy accepts 512 bytes of tags in total, counted after it splits each tag at commas and trims the spaces around it, so a comma inside a tag splits it in two.${EMOJI_TAGS_ENABLED ? ' Use `ntfy_search_emoji_tags` to discover short codes.' : ''}`,
     ),
   click: z
     .string()
-    .min(1)
     .optional()
     .describe('URL opened when the notification is tapped — http(s), mailto:, geo:, ntfy://, etc.'),
   attach: z
@@ -357,36 +362,69 @@ function priorityLabel(p?: number): string {
  * form client sends for a field it left untouched. `NtfyService.publish` reads
  * `filename` and `attach` by presence to tell a publish ntfy stores as a file,
  * so neither goes out blank; a blank `timezone` or `delay` stays unsent the
- * same way, and ntfy delivers a publish without `delay` at once.
+ * same way, and ntfy delivers a publish without `delay` at once. ntfy reads a
+ * blank `click` or tag as unset, except a whitespace-only tag between others,
+ * which it stores as an empty tag; neither goes out, so what is sent is what
+ * ntfy stores.
  */
 function present(value: string | undefined): string | undefined {
   return value?.trim() ? value : undefined;
 }
 
+/** How many header names or broadcast extras a prompt line lists before counting the rest. */
+const PROMPT_LIST_MAX = 10;
+
+/** The first `PROMPT_LIST_MAX` of `items`, each through `render`, then a count of the rest. */
+function promptList<T>(items: readonly T[], render: (item: T) => string): string {
+  const shown = items.slice(0, PROMPT_LIST_MAX).map(render).join(', ');
+  const rest = items.length - PROMPT_LIST_MAX;
+  return rest > 0 ? `${shown}, and ${rest} more` : shown;
+}
+
 /**
- * Describe the parts of a publish that escape the notification drawer: an email
- * forward, a voice call, an Android broadcast intent, or a button that fires an
- * HTTP request from the recipient's device. Each phrase names its target so the
- * confirmation prompt is specific to what will happen, not a generic
- * "proceed?". Each caller-supplied target renders through `literal()`, so a
- * value such as `[safe](https://evil)` reads in the prompt as the string it is,
- * never as a link. A plain notification — or a `view` / `copy` button, which
- * does nothing until the recipient taps it — returns an empty list and never
- * prompts.
+ * Describe the parts of a publish that escape the notification drawer, one
+ * phrase per prompt line: an email forward, a voice call, or a button that
+ * sends an Android broadcast or fires an HTTP request from the recipient's
+ * device. Each names what it will do, so the confirmation prompt is specific
+ * rather than a generic "proceed?": a button's label, and for `http` its
+ * method, URL, body, and header names — never header values, which can hold
+ * credentials — and for `broadcast` its intent and extras. Every
+ * caller-supplied value renders as one code span with its invisible characters
+ * escaped, so `[safe](https://evil)` reads as the string it is, never as a
+ * link, and no value can add a line or reorder the text around it. A
+ * destination — the email address, the call's number, a broadcast's intent, an
+ * `http` button's URL — is shown whole through `promptTarget()`, so the host a
+ * request reaches is always in the prompt; every other value is an excerpt
+ * through `promptLiteral()`. A plain notification — or a `view` / `copy`
+ * button, which does nothing until the recipient taps it — returns an empty
+ * list and never prompts.
  */
 function outOfBandSideEffects(input: Input): string[] {
   const effects: string[] = [];
-  if (input.email) effects.push(`an email forward to ${literal(input.email)}`);
-  if (input.call) effects.push(`a voice call to ${literal(input.call)}`);
+  if (input.email) effects.push(`an email forward to ${promptTarget(input.email)}`);
+  if (input.call) effects.push(`a voice call to ${promptTarget(input.call)}`);
   for (const action of input.actions ?? []) {
     if (action.action === 'broadcast') {
-      const intent = action.intent ? literal(action.intent) : 'default intent';
-      effects.push(`an Android broadcast intent (${intent})`);
+      const intent = action.intent ? `intent ${promptTarget(action.intent)}` : 'the default intent';
+      const parts = [`an Android broadcast button ${promptLiteral(action.label)} with ${intent}`];
+      const extras = Object.entries(action.extras ?? {});
+      if (extras.length > 0) {
+        parts.push(
+          `extras ${promptList(extras, ([key, value]) => `${promptLiteral(key)} = ${promptLiteral(value)}`)}`,
+        );
+      }
+      effects.push(parts.join(', '));
     }
     if (action.action === 'http') {
-      effects.push(
-        `an HTTP ${literal(action.method ?? 'POST')} button targeting ${literal(action.url)}`,
-      );
+      // ntfy stores a blank method as none, which the app sends as POST.
+      const method = promptLiteral(action.method || 'POST');
+      const parts = [
+        `an HTTP ${method} button ${promptLiteral(action.label)} targeting ${promptTarget(action.url)}`,
+      ];
+      if (action.body) parts.push(`body ${promptLiteral(action.body)}`);
+      const headers = Object.keys(action.headers ?? {});
+      if (headers.length > 0) parts.push(`headers ${promptList(headers, promptLiteral)}`);
+      effects.push(parts.join(', '));
     }
   }
   return effects;
@@ -397,6 +435,8 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
   annotations: { openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
+  enrichment: { quota: quotaEnrichment },
+  enrichmentTrailer: { quota: { render: renderQuota } },
 
   /**
    * Every reason after `consent_declined` is raised by `classifyPublishError`,
@@ -433,9 +473,9 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
     {
       reason: 'payload_too_large',
       code: JsonRpcErrorCode.ValidationError,
-      when: "Upstream returned 413, or rejected a field as too large — the message body or attachment exceeds server limits (an attachment also fails once the client's attachment storage or daily bandwidth quota is used up), or the `title` or the combined `tags` are longer than ntfy accepts.",
+      when: "Upstream returned 413, or rejected a field as too large — the message body or attachment exceeds server limits (an attachment also fails once the client's attachment storage or daily bandwidth quota is used up), or the `title`, the combined `tags`, or the request as a whole is larger than ntfy accepts.",
       recovery:
-        'Shorten the field ntfy rejected: the message (≤4096 bytes plain, or host the long content as an external URL via `attach`), the `title`, or the `tags` (ntfy limits their combined length). When ntfy refused an attachment, drop `filename` or host the file and pass its URL as `attach`; a used-up bandwidth quota resets within 24 hours.',
+        'Shorten the field ntfy rejected: the message (≤4096 bytes plain, or host the long content as an external URL via `attach`), the `title`, or the `tags` (ntfy limits their combined length); when ntfy refused the request as a whole, shorten the longest field in it. When ntfy refused an attachment, drop `filename` or host the file and pass its URL as `attach`; a used-up bandwidth quota resets within 24 hours.',
       thrownBy: 'service',
     },
     {
@@ -510,14 +550,15 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       });
     }
 
+    const tags = input.tags?.filter((tag) => present(tag) !== undefined);
     const requestBody: NtfyPublishRequest = {
       topic,
       message: input.message,
       title: input.title,
       // Schema-validated to the 1–5 domain above.
       priority: input.priority as Priority | undefined,
-      tags: input.tags?.length ? input.tags : undefined,
-      click: input.click,
+      tags: tags?.length ? tags : undefined,
+      click: present(input.click),
       attach: present(input.attach),
       icon: input.icon,
       filename: present(input.filename),
@@ -541,7 +582,7 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
         operation: 'ntfy_publish_message',
         target: `${baseUrl}/${topic}`,
         request: { url: `${baseUrl}/`, body: requestBody },
-        message: `Publish to ntfy topic ${literal(topic)} with ${sideEffects.join(' and ')}?`,
+        message: `Publish to ntfy topic ${promptLiteral(topic)} with:\n${sideEffects.map((effect) => `- ${effect}`).join('\n')}`,
       });
       if (consent === 'declined') {
         throw ctx.fail(
@@ -551,15 +592,18 @@ export const ntfyPublishMessage = tool('ntfy_publish_message', {
       }
     }
 
-    let response: NtfyPublishResponse;
+    let reply: NtfyReply<NtfyPublishResponse>;
     try {
-      response = await getNtfyService().publish(requestBody, {
+      reply = await getNtfyService().publish(requestBody, {
         baseUrl: overrideBase,
         signal: ctx.signal,
       });
     } catch (err) {
       throw classifyPublishError(err, ctx);
     }
+    const { envelope: response, quota } = reply;
+    // An unreported quota stays absent: `ctx.enrich({ quota: undefined })` would render.
+    if (quota) ctx.enrich({ quota });
 
     // ntfy's reply carries no scheduled flag, so it comes from the request: a
     // successful publish that sent `delay` was queued for later delivery.
@@ -651,9 +695,11 @@ const OVERSIZE_HINTS = {
   body: `Shorten the message (≤${MESSAGE_MAX_BYTES} bytes plain) or host the long content as an external URL via \`attach\`.`,
   title:
     'Shorten `title` and resend — ntfy rejected the title as too long, so shortening the message body will not help.',
-  tags: 'Send fewer or shorter `tags` — ntfy limits their combined length, so shortening the message body will not help.',
+  tags: 'Send fewer or shorter `tags` — ntfy accepts 512 bytes of tags in total, counted after it splits each tag at commas and trims the spaces around it, so shortening the message body will not help.',
   attachment:
     "ntfy stored the message as a file attachment (it does when `filename` is set without `attach`, or when the message is over the server's message limit) and refused the file: it exceeds the server's attachment size limit, or this client's attachment storage or daily bandwidth quota is used up. Drop `filename` to send the text as a plain message, or host the file elsewhere and pass its URL as `attach`; a used-up bandwidth quota resets within 24 hours.",
+  request:
+    'ntfy refused the publish as a whole: the JSON request holding every field together — message, title, tags, URLs, and action buttons with everything in them — must stay under 8,192 bytes on a default ntfy server (twice its message size limit). Shorten the longest of those fields; trimming a short message will not help.',
 } as const;
 
 /**
@@ -676,17 +722,16 @@ const ANONYMOUS_SENDER_HINT =
 
 /**
  * Translate a thrown error from `NtfyService.publish` into a typed contract
- * failure when the message/code matches a documented mode. Anything else
- * bubbles unchanged so the framework auto-classifier picks the right code.
+ * failure. A sub-reason, and the limit or field a failure names, is read from
+ * ntfy's error envelope alone (its code, or the phrase in its `error` text);
+ * the rest from a label the service set, the HTTP status or the JSON-RPC code
+ * it maps to, or the retry boundary having given up. Anything else bubbles
+ * unchanged so the framework auto-classifier picks the right code.
  */
 function classifyPublishError(
   err: unknown,
   ctx: Parameters<typeof ntfyPublishMessage.handler>[1],
 ): unknown {
-  // A locally-rejected `base_url` already carries its own message and hint; the
-  // branches below speak for ntfy, not for this server, and one of them matches
-  // on keywords that a rejected URL could contain.
-  if (isBaseUrlRejection(err)) return err;
   // Already carries its declared reason; the unreachable branch below would
   // claim it once the call deadline has marked it `(failed after N attempts)`.
   if (isUpstreamMalformed(err)) return err;
@@ -705,7 +750,7 @@ function classifyPublishError(
     return ctx.fail(
       'rate_limited',
       message || 'ntfy returned 429 after retries.',
-      retryAfterData(err),
+      rateLimitedData(err),
     );
   }
   // 413 maps to `InvalidRequest`, which `isInvalidParamsCode` deliberately

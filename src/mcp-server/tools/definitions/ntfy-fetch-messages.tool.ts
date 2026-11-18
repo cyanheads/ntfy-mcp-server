@@ -1,8 +1,13 @@
 /**
  * @fileoverview `ntfy_fetch_messages` — polls cached messages from one or more
- * ntfy topics with optional filters. Single round-trip via the upstream
+ * ntfy topics with optional filters. One poll of the upstream
  * `<topic>/json?poll=1` endpoint; the response is parsed line-by-line and
- * filtered to drop transport frames (`open`, `keepalive`). Blank and
+ * filtered to drop transport frames (`open`, `keepalive`). With
+ * `wait_seconds`, a poll that matched nothing (no `id`, no `cursor`) is
+ * followed by ntfy's JSON stream with the same query, held until the first
+ * row arrives, the wait runs out, or the stream fails — each outcome a
+ * result with its own notice and `waitedSeconds`, and only the caller's
+ * cancellation an error. Blank and
  * whitespace-only `since` and filter values are resolved as unset before the
  * query is built. Over-limit windows keep the newest `limit` messages, and a
  * message-ID `cursor`, resolved inside the fetched window, pages through the
@@ -37,17 +42,21 @@ import {
   getCode,
   getMessage,
   isAuthRejection,
-  isBaseUrlRejection,
-  isInvalidParamsCode,
+  isInvalidSinceRejection,
   isRateLimitedCode,
   isUpstreamMalformed,
   isUpstreamUnreachable,
-  retryAfterData,
+  rateLimitedData,
   unreachableWaitData,
 } from '@/services/ntfy/error-classifier.js';
 import { MESSAGE_TRUNCATE_AT, shapeMessage } from '@/services/ntfy/message-shape.js';
-import { getNtfyService } from '@/services/ntfy/ntfy-service.js';
-import type { NtfyFetchResult, Priority } from '@/services/ntfy/types.js';
+import { CALL_DEADLINE_MS, getNtfyService, MAX_OPEN_WAITS } from '@/services/ntfy/ntfy-service.js';
+import type {
+  NtfyFetchParams,
+  NtfyFetchResult,
+  NtfyWaitResult,
+  Priority,
+} from '@/services/ntfy/types.js';
 
 /**
  * Comma-separated topics, each 1–64 characters — ntfy's own per-topic limit,
@@ -59,8 +68,6 @@ import type { NtfyFetchResult, Priority } from '@/services/ntfy/types.js';
 const TOPIC_LIST_REGEX = /^[a-zA-Z0-9_-]{1,64}(?:,[a-zA-Z0-9_-]{1,64})*$/;
 const TOPIC_LIST_ERROR =
   'Each comma-separated topic must be 1 to 64 characters of letters, digits, underscore, or hyphen.';
-/** ntfy's error text for 40008, which the service folds into the error message. */
-const INVALID_SINCE_TEXT = 'invalid since parameter';
 const DEFAULT_SINCE = '10m';
 const TOOL_NAME = 'ntfy_fetch_messages';
 const DEFAULT_LIMIT = 20;
@@ -70,6 +77,12 @@ const DEFAULT_LIMIT = 20;
  * values; with it off, the schema rejects a larger value.
  */
 const MAX_LIMIT = 100;
+/**
+ * Seconds one call waits. Under `NTFY_CLAMP_LIMITS` a larger `wait_seconds` is
+ * served as this, with a notice; with it off, the schema rejects a larger
+ * value. The call's 50 s deadline can shorten the wait further.
+ */
+const WAIT_CAP_SECONDS = 40;
 
 /**
  * ntfy reads `since` in this order: keyword, 12-character message ID, Unix
@@ -106,6 +119,11 @@ const DIGIT_MESSAGE_ID = /^\d{12}$/;
 const SINCE_SECONDS_CEILING = 1e12;
 /** 2001-09-09T01:46:40Z: an all-digit `since` below it predates ntfy, and is usually a duration missing its unit. */
 const SINCE_SECONDS_FLOOR = 1e9;
+
+/** Milliseconds as seconds to one decimal place, as `waitedSeconds` reports them. */
+function seconds(ms: number): number {
+  return Math.round(ms / 100) / 10;
+}
 
 /** The ISO instant of Unix `seconds`, or `undefined` past the range a `Date` holds. */
 function unixInstant(seconds: number): string | undefined {
@@ -236,7 +254,7 @@ const InputSchema = z.object({
     .string()
     .default(DEFAULT_SINCE)
     .describe(
-      "Lower bound of the window. Default `10m`, tighter than ntfy's default to keep the common 'did my recent notification land?' lookup cheap. Accepts a duration in seconds, minutes, or hours (`30s`, `10m`, `2h`, `24h`), a Unix timestamp in seconds (`1794577386`; a millisecond value is rejected, and a bare `10` means 1970, not ten minutes), the keywords `all` (every cached message — up to ~12h on ntfy.sh) or `latest` (most recent only), or a message ID, which returns only the messages after that one — an ID ntfy no longer holds returns the whole cache rather than an error. To page through a window larger than one call returns, use `cursor`, not `since`; keep `since` the same on every page, even a duration — the cursor holds the window where the walk began.",
+      "Lower bound of the window. Default `10m`, tighter than ntfy's default to keep the common 'did my recent notification land?' lookup cheap. Accepts a duration in seconds, minutes, or hours (`30s`, `10m`, `2h`, `24h`), a Unix timestamp in seconds (`1794577386`; a millisecond value is rejected, and a bare `10` means 1970, not ten minutes), the keywords `all` (every cached message — up to ~12h on ntfy.sh) or `latest` (most recent only), or a message ID, which returns the messages after that one and any published earlier in the same second (ntfy keeps time in whole seconds) — an ID ntfy no longer holds returns the whole cache rather than an error. To page through a window larger than one call returns, use `cursor`, not `since`; keep `since` the same on every page, even a duration — the cursor holds the window where the walk began.",
     ),
   scheduled: z
     .boolean()
@@ -274,6 +292,18 @@ const InputSchema = z.object({
     .describe(
       "Continue a paged read: pass the previous response's `nextCursor` verbatim, with the same `topic`, `since`, and filters. Returns up to `limit` messages starting at that message (inclusive), oldest-first, and a new `nextCursor` while more remain. Under a duration `since` (`10m`, `2h`), the cursor also holds the window where the walk began, so later pages stay reachable after the duration's lower bound has moved past the first messages. Omit it to get the newest messages of the window.",
     ),
+  // No schema maximum by default: a larger value is served as the cap (NTFY_CLAMP_LIMITS).
+  wait_seconds: limitSchema({
+    cap: WAIT_CAP_SECONDS,
+    defaultLimit: 0,
+    min: 0,
+    capRules: {
+      clamping: `One call waits at most ${WAIT_CAP_SECONDS} s; a larger value is served as ${WAIT_CAP_SECONDS}, with a notice.`,
+      strict: `At most ${WAIT_CAP_SECONDS}.`,
+    },
+    describe: (capRule) =>
+      `Seconds to wait when the poll matches nothing: the call holds ntfy's stream open and returns the first matching message to arrive, or an empty result once the time is up. Default 0, no wait. ${capRule} Keep it under your client's tool-call timeout (60 s by default in MCP SDK clients). The poll runs first, so to wait for something newer than a message already in the window, your own question included, pass that message's \`id\` as \`since\`; a row whose \`time\` equals that message's may have been published just before it. Each wait holds one of ntfy's per-visitor open-subscription slots (30 by default), which every client behind this server's address shares. Ignored when \`id\` is set.`,
+  }),
   base_url: z
     .string()
     .regex(BASE_URL_PATTERN, BASE_URL_HINT)
@@ -288,7 +318,7 @@ const MessageSchema = z
     id: z
       .string()
       .describe(
-        "Message ID — pass back as `id` to fetch this message with its whole body. To update, clear, or delete the notification it belongs to, pass this row's `sequence_id` when it has one (update, clear, and delete rows do), otherwise this `id`. To page through a window, pass the `nextCursor` enrichment value as `cursor`.",
+        "Message ID — pass back as `id` to fetch this message with its whole body. To update, clear, or delete the notification it belongs to, pass this row's `sequence_id` when it has one (update, clear, and delete rows do, and so does a first publish that chose its own), otherwise this `id`. To page through a window, pass the `nextCursor` enrichment value as `cursor`.",
       ),
     time: z
       .string()
@@ -299,7 +329,7 @@ const MessageSchema = z
       .boolean()
       .optional()
       .describe(
-        "True when the call set `scheduled: true` and this row's `time` is later than ntfy's clock at this response (the poll's `Date` header, or this server's clock when that header is missing or unparseable): the message is still queued for later delivery. Absent otherwise. It compares `time`, not ntfy's delivery state, so a message whose time passed seconds ago can still be queued until ntfy's next scheduler run (every 10 s by default) and carries no flag.",
+        "True when the call set `scheduled: true` and this row's `time` is later than ntfy's clock at this response (the poll's `Date` header — after a wait, the stream's `open` line — or this server's clock when that is missing or unparseable): the message is still queued for later delivery. Absent otherwise. It compares `time`, not ntfy's delivery state, so a message whose time passed seconds ago can still be queued until ntfy's next scheduler run (every 10 s by default) and carries no flag.",
       ),
     event: z
       .enum(['message', 'message_clear', 'message_delete', 'poll_request'])
@@ -313,7 +343,7 @@ const MessageSchema = z
       .string()
       .optional()
       .describe(
-        'Present on update/clear/delete events pointing back to the original message; absent on initial publishes.',
+        "The notification's sequence ID: set whenever the publish carried a `sequence_id` — every update, and a first publish that chose one — and on clear/delete events, naming the notification they act on. Absent on a first publish that chose none, whose sequence ID is its own `id`.",
       ),
     title: z.string().optional().describe('Notification title; absent when no title was set.'),
     message: z
@@ -422,8 +452,7 @@ function filterSummary(f: FilterEcho | undefined): string {
 }
 
 export const ntfyFetchMessages = tool(TOOL_NAME, {
-  description:
-    'Poll cached messages from one or more ntfy topics with optional filters. Returns a snapshot, not a live stream — use it to confirm delivery, replay missed alerts, or audit topic activity. Multiple topics are passed as a comma-separated list. One call returns the newest messages of the window; when more match, page through the whole window oldest-first by passing `nextCursor` back as `cursor`. Long bodies are truncated client-side to keep list responses bounded; refetch with that message `id` to read one in full.',
+  description: `Poll cached messages from one or more ntfy topics with optional filters. Returns a snapshot of cached messages — use it to confirm delivery, replay missed alerts, or audit topic activity — and with \`wait_seconds\` waits up to ${WAIT_CAP_SECONDS} s for the first matching message when none is cached yet. Multiple topics are passed as a comma-separated list. One call returns the newest messages of the window; when more match, page through the whole window oldest-first by passing \`nextCursor\` back as \`cursor\`. Long bodies are truncated client-side to keep list responses bounded; refetch with that message \`id\` to read one in full.`,
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: InputSchema,
   output: OutputSchema,
@@ -468,11 +497,17 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
     appliedFilters: FilterEchoSchema.optional().describe(
       'Active filter inputs the server applied; absent when no filters were set.',
     ),
+    waitedSeconds: z
+      .number()
+      .optional()
+      .describe(
+        'Seconds the call waited after the poll matched nothing; 0 when the wait could not start. Absent when no wait ran.',
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when the result is empty or truncated, here or by ntfy — echoes the criteria and suggests how to broaden or paginate.',
+        'Guidance when the result is empty or truncated, here or by ntfy, or when the call waited — echoes the criteria and suggests how to broaden, paginate, or keep waiting.',
       ),
   },
 
@@ -539,6 +574,8 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
   ],
 
   async handler(input: Input, ctx): Promise<Output> {
+    // The poll and any wait after it share one deadline, measured from here.
+    const callStartedAt = Date.now();
     const cfg = getServerConfig();
     const topic = input.topic ?? cfg.defaultTopic;
     if (!topic) {
@@ -559,12 +596,16 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
      */
     const requestedSince = input.since.trim() || DEFAULT_SINCE;
     /**
-     * Read off the caller's own `since`, never the window start a cursor
+     * How ntfy reads the caller's own `since` — a message ID first, twelve
+     * digits included, then Unix seconds — never the window start a cursor
      * carries: that is a current 10-digit time, sent only under a duration.
      */
-    const digitMessageId = DIGIT_MESSAGE_ID.test(requestedSince);
+    const sinceId = MESSAGE_ID.test(requestedSince) ? requestedSince : undefined;
+    const digitMessageId = sinceId !== undefined && DIGIT_MESSAGE_ID.test(sinceId);
     const sinceSeconds =
-      !digitMessageId && UNIX_SECONDS.test(requestedSince) ? Number(requestedSince) : undefined;
+      sinceId === undefined && UNIX_SECONDS.test(requestedSince)
+        ? Number(requestedSince)
+        : undefined;
     if (sinceSeconds !== undefined && sinceSeconds >= SINCE_SECONDS_CEILING) {
       throw ctx.fail(
         'invalid_since',
@@ -596,27 +637,23 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
     const moving = isDuration(requestedSince);
     const pinned = moving ? cursor?.start : undefined;
     const since = pinned === undefined ? requestedSince : String(pinned);
+    /** The poll's query; a wait's stream reuses it whole, so both read one window. */
+    const query: NtfyFetchParams = {
+      topic,
+      since,
+      scheduled: input.scheduled,
+      // Schema-validated to the 1–5 domain above.
+      priority: filters.priority as Priority[] | undefined,
+      tags: filters.tags,
+      id: filters.id,
+      title: filters.title,
+      message: filters.message,
+    };
 
     let polled: NtfyFetchResult;
     try {
-      polled = await getNtfyService().fetch(
-        {
-          topic,
-          since,
-          scheduled: input.scheduled,
-          // Schema-validated to the 1–5 domain above.
-          priority: filters.priority as Priority[] | undefined,
-          tags: filters.tags,
-          id: filters.id,
-          title: filters.title,
-          message: filters.message,
-        },
-        { baseUrl: overrideBase, signal: ctx.signal },
-      );
+      polled = await getNtfyService().fetch(query, { baseUrl: overrideBase, signal: ctx.signal });
     } catch (err) {
-      // A locally-rejected `base_url` already carries its own message and hint;
-      // the branches below speak for ntfy, not for this server.
-      if (isBaseUrlRejection(err)) throw err;
       // Already carries its declared reason; the unreachable branch below would
       // otherwise claim it, since it too is a retry-exhausted ServiceUnavailable.
       if (isUpstreamMalformed(err)) throw err;
@@ -629,12 +666,12 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
         throw ctx.fail(
           'rate_limited',
           msg || 'ntfy returned 429 after retries.',
-          retryAfterData(err),
+          rateLimitedData(err),
         );
       }
       // ntfy's 40008 is the one poll 400 about `since`; any other (a disallowed
       // topic, too many topics) keeps ntfy's own text and no `since` advice.
-      if (isInvalidParamsCode(code) && msg.includes(INVALID_SINCE_TEXT)) {
+      if (isInvalidSinceRejection(err)) {
         throw ctx.fail('invalid_since', msg, undefined, { cause: err });
       }
       if (isUpstreamUnreachable(err)) {
@@ -656,7 +693,7 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
      */
     const seenIds = new Set<string>();
     let repeatedIds = 0;
-    const notifications = polled.messages.filter((m) => {
+    let notifications = polled.messages.filter((m) => {
       if (m.event === 'open' || m.event === 'keepalive') return false;
       if (seenIds.has(m.id)) {
         repeatedIds += 1;
@@ -669,12 +706,57 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
       ctx.log.warning('Dropped poll messages that repeat an earlier message ID', { repeatedIds });
     }
     const { upstreamTruncated } = polled;
-    const totalCount = notifications.length;
     const { applied: limit, clamped } = clampLimit(
       input.limit,
       { cap: MAX_LIMIT, tool: TOOL_NAME },
       ctx,
     );
+    const { applied: waitSeconds, clamped: waitClamped } = clampLimit(
+      input.wait_seconds,
+      { cap: WAIT_CAP_SECONDS, tool: TOOL_NAME, input: 'wait_seconds' },
+      ctx,
+    );
+
+    /**
+     * A poll that matched nothing waits for the next message when asked to and
+     * when one could still match: never under `id`, since no new message carries
+     * an existing ID, nor under `cursor`, whose window holds the cursor's
+     * message. The wait ends inside the deadline the poll started, and skips a
+     * row ntfy re-sends from before the window the poll's `since` opened.
+     */
+    const waited: NtfyWaitResult | undefined =
+      notifications.length === 0 &&
+      waitSeconds > 0 &&
+      filters.id === undefined &&
+      cursor === undefined
+        ? await getNtfyService().waitForMessage(query, {
+            baseUrl: overrideBase,
+            signal: ctx.signal,
+            holdMs: Math.max(
+              0,
+              Math.min(waitSeconds * 1000, callStartedAt + CALL_DEADLINE_MS - Date.now()),
+            ),
+            windowStart:
+              sinceId !== undefined
+                ? { kind: 'id', id: sinceId }
+                : sinceSeconds !== undefined
+                  ? { kind: 'time', seconds: sinceSeconds }
+                  : undefined,
+          })
+        : undefined;
+    const waitedSeconds =
+      waited === undefined ? undefined : waited.outcome === 'busy' ? 0 : seconds(waited.waitedMs);
+    if (waited !== undefined) {
+      // Never the message itself: its envelope names the topic.
+      ctx.log.info('Waited for an ntfy message', {
+        outcome: waited.outcome,
+        waitedSeconds,
+        ...(waited.outcome === 'failed' ? { cause: waited.cause } : {}),
+      });
+    }
+    // The message that ended a wait is the window: one row, nothing left out.
+    if (waited?.outcome === 'arrived') notifications = [waited.message];
+    const totalCount = notifications.length;
 
     /**
      * ntfy returns the window oldest-first. Without a cursor the page is the
@@ -729,6 +811,7 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
 
     const hasFilters = Object.values(filters).some((v) => v !== undefined);
     if (hasFilters) ctx.enrich({ appliedFilters: filters });
+    if (waitedSeconds !== undefined) ctx.enrich({ waitedSeconds });
 
     // `notice` is last-wins, so every condition contributes a sentence here and
     // the joined text is set once.
@@ -757,10 +840,15 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
       const queued = input.scheduled
         ? ''
         : ' A delayed message ntfy has not delivered yet is returned only with `scheduled: true`.';
+      // A wait that ran its course covered the seconds a just-published message can take to show.
+      const recent =
+        waited?.outcome === 'timedOut'
+          ? `None arrived during the ${waitedSeconds}-second wait; call again with the same arguments to keep waiting.`
+          : 'A message published in the last few seconds may not be returned yet, so retry shortly before concluding it is missing.';
       notices.push(
         `No messages on topic ${literal(topic)} (since ${literal(since)})${
           hasFilters ? ` with filters ${filterSummary(filters)}` : ''
-        }. ${advice}${queued} A message published in the last few seconds may not be returned yet, so retry shortly before concluding it is missing.`,
+        }. ${advice}${queued} ${recent}`,
       );
     } else if (nextCursor !== undefined) {
       const continuation = `call again with \`cursor\` set to ${literal(nextCursor)} and the same \`topic\`, \`since\`, and filters`;
@@ -789,6 +877,33 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
         `Last page: ${page.length === 1 ? 'this message ends' : `these ${page.length} messages end`} the window (\`totalCount\` ${totalCount}); the earlier pages hold the rest.`,
       );
     }
+    if (waited === undefined) {
+      if (waitSeconds > 0 && filters.id !== undefined && page.length === 0) {
+        notices.push(
+          '`wait_seconds` is ignored when `id` is set: no new message carries an existing ID.',
+        );
+      }
+    } else {
+      // A timed-out wait already spoke, in the empty-result sentence above.
+      if (waited.outcome === 'arrived') {
+        notices.push(
+          `Arrived after ${waitedSeconds} s of waiting. To wait for the next message, call again with \`since\` set to this message's \`id\`; a row that shares its \`time\` may have been published before it.`,
+        );
+      } else if (waited.outcome === 'failed') {
+        notices.push(
+          `${waited.waitedMs === 0 ? 'The wait could not start' : `The wait ended after ${waitedSeconds} s`}: ${literal(waited.cause)}. Poll again later instead of waiting.`,
+        );
+      } else if (waited.outcome === 'busy') {
+        notices.push(
+          `This server already has ${MAX_OPEN_WAITS} waits open, the most it runs at once, so this call returned without waiting.`,
+        );
+      }
+      if (waitClamped && waited.outcome !== 'busy') {
+        notices.push(
+          `\`wait_seconds\` ${input.wait_seconds} was served as ${WAIT_CAP_SECONDS}, the most one call waits.`,
+        );
+      }
+    }
     if (upstreamTruncated) {
       notices.push(
         `ntfy capped this replay at its per-topic size limit and dropped the oldest messages in the window before responding; they are not reachable through this server${
@@ -806,10 +921,13 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
     // capped list.
     const truncateBody = filters.id === undefined;
     // Only a `scheduled` poll can return a row ntfy still holds. ntfy schedules
-    // by its own clock, so its `Date` decides; this server's clock stands in
-    // only when that header is missing or unparseable.
+    // by its own clock, so its `Date` decides — or, for the row that ended a
+    // wait, the stream's `open` line; this server's clock stands in only when
+    // that header is missing or unparseable.
     const scheduledAsOfSeconds = input.scheduled
-      ? (polled.ntfyClockSeconds ?? Date.now() / 1000)
+      ? waited?.outcome === 'arrived'
+        ? waited.ntfyClockSeconds
+        : (polled.ntfyClockSeconds ?? Date.now() / 1000)
       : undefined;
     return {
       messages: page.map((m) => shapeMessage(m, { truncateBody, scheduledAsOfSeconds })),
@@ -828,7 +946,7 @@ export const ntfyFetchMessages = tool(TOOL_NAME, {
         m.scheduled ? `Delivers: ${m.time} (scheduled)` : `Time: ${m.time}`,
       ];
       if (m.expires) lines.push(`Cache expires: ${m.expires}`);
-      if (m.sequence_id) lines.push(`References sequence: ${literal(m.sequence_id)}`);
+      if (m.sequence_id) lines.push(`Sequence ID: ${literal(m.sequence_id)}`);
       if (m.title) lines.push(`Title: ${literal(m.title)}`);
       if (m.priority !== undefined) {
         lines.push(`Priority: ${m.priority} (${priorityLabel(m.priority)})`);

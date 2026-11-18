@@ -2,6 +2,8 @@
  * @fileoverview Tests for server-config — covers both env-var shapes:
  * (1) NTFY_SERVERS JSON registry, (2) single-server shorthand. Validates
  * mutual exclusion of token vs basic auth, trailing-slash stripping, the
+ * startup refusal of credentials in a base URL (and the duplicate-base check)
+ * with no credential in the banner, an empty userinfo read as none, the
  * precedence of NTFY_SERVERS over the shorthand vars when both are set, the
  * deprecated NTFY_API_KEY alias, defaultTopic / numeric-coercion validation,
  * the NTFY_BLOCK_PRIVATE_HOSTS and NTFY_CLAMP_LIMITS boolean flags, blank / whitespace / whole-value
@@ -11,10 +13,26 @@
  * @module tests/config/server-config
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, type McpError } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getServerConfig, isEmojiTagsEnabled, resetServerConfig } from '@/config/server-config.js';
+
+/** A probe credential: no startup banner may carry either half. */
+const USER = 'probeuser';
+const PASSWORD = 'pwSECRET';
+const SECRET_PATTERN = new RegExp(`${USER}|${PASSWORD}`);
+
+/** The `ConfigurationError` the next `getServerConfig()` fails with. */
+function configError(): McpError {
+  try {
+    getServerConfig();
+  } catch (err) {
+    expect(err).toMatchObject({ code: JsonRpcErrorCode.ConfigurationError });
+    return err as McpError;
+  }
+  throw new Error('Expected getServerConfig() to fail.');
+}
 
 const KEYS = [
   'NTFY_SERVERS',
@@ -83,6 +101,39 @@ describe('getServerConfig', () => {
       expect(cfg.servers[0]?.authUsername).toBe('user');
       expect(cfg.servers[0]?.authPassword).toBe('pass');
     });
+
+    /** #58: credentials belong in the auth variables, never in the URL. */
+    it.each([
+      ['a user and a password', `https://${USER}:${PASSWORD}@ntfy.example.com`],
+      ['a user alone', `https://${USER}@ntfy.example.com/`],
+      ['a password alone', `https://:${PASSWORD}@ntfy.example.com`],
+      ['percent-encoded userinfo', `HTTPS://${USER}%40corp:${PASSWORD}@ntfy.example.com`],
+    ])(
+      'fails startup on NTFY_BASE_URL with %s, naming the auth variables and no credential',
+      (_label, value) => {
+        process.env.NTFY_BASE_URL = value;
+        const err = configError();
+        expect(err.message).toContain('NTFY_BASE_URL (servers.0.baseUrl)');
+        for (const name of ['NTFY_AUTH_USERNAME', 'NTFY_AUTH_PASSWORD', 'NTFY_AUTH_TOKEN']) {
+          expect(err.message).toContain(name);
+        }
+        expect(JSON.stringify({ message: err.message, data: err.data })).not.toMatch(
+          SECRET_PATTERN,
+        );
+      },
+    );
+
+    it('fails startup on an NTFY_BASE_URL that does not parse, quoting none of it', () => {
+      process.env.NTFY_BASE_URL = `http://${USER}:${PASSWORD}@[::1`;
+      const err = configError();
+      expect(err.message).toContain('NTFY_BASE_URL (servers.0.baseUrl)');
+      expect(err.message).not.toMatch(SECRET_PATTERN);
+    });
+
+    it('reads an empty userinfo as none, so the stored base carries no `@`', () => {
+      process.env.NTFY_BASE_URL = 'https://@ntfy.example.com/';
+      expect(getServerConfig().servers[0]?.baseUrl).toBe('https://ntfy.example.com');
+    });
   });
 
   describe('NTFY_SERVERS registry', () => {
@@ -115,6 +166,31 @@ describe('getServerConfig', () => {
       expect(() => getServerConfig()).toThrow(/not valid JSON/i);
     });
 
+    it.each([
+      [
+        'an unquoted token',
+        '[{"baseUrl":"https://ntfy.internal.test","authToken":tk_SECRETVALUE}]',
+      ],
+      [
+        'a trailing comma after a password',
+        '[{"baseUrl":"https://ntfy.internal.test","authUsername":"u","authPassword":"hunter2SECRET"},]',
+      ],
+      ['a bare URL', 'http://u:SECRET@h.io'],
+    ])('quotes no part of a value that is not valid JSON: %s', (_case, raw) => {
+      process.env.NTFY_SERVERS = raw;
+      let failure: unknown;
+      try {
+        getServerConfig();
+      } catch (err) {
+        failure = err;
+      }
+      expect(failure).toBeInstanceOf(Error);
+      const { message, cause } = failure as Error;
+      expect(message).toMatch(/not valid JSON/i);
+      expect(message).not.toMatch(/SECRET|hunter2|tk_|internal\.test|h\.io/);
+      expect(cause).toBeUndefined();
+    });
+
     it('rejects a non-array value', () => {
       process.env.NTFY_SERVERS = JSON.stringify({ baseUrl: 'https://ntfy.sh' });
       expect(() => getServerConfig()).toThrow(/JSON array/i);
@@ -131,6 +207,43 @@ describe('getServerConfig', () => {
         { baseUrl: 'https://ntfy.sh/' },
       ]);
       expect(() => getServerConfig()).toThrow(/Duplicate server baseUrl/i);
+    });
+
+    it('names the earlier entry of a duplicate, never the URL', () => {
+      process.env.NTFY_SERVERS = JSON.stringify([
+        { baseUrl: 'https://ntfy.example.com/team' },
+        { baseUrl: 'https://ntfy.example.com/team/' },
+      ]);
+      const err = configError();
+      expect(err.message).toContain('NTFY_SERVERS[1].baseUrl (servers.1.baseUrl)');
+      expect(err.message).toContain('NTFY_SERVERS[0]');
+      expect(err.message).not.toContain('ntfy.example.com');
+    });
+
+    it("fails startup on an entry whose baseUrl carries credentials, naming the entry's own auth fields", () => {
+      process.env.NTFY_SERVERS = JSON.stringify([
+        { baseUrl: 'https://ntfy.sh' },
+        { baseUrl: `https://${USER}:${PASSWORD}@ntfy.example.com`, authToken: 'tk_other' },
+      ]);
+      const err = configError();
+      expect(err.message).toContain('NTFY_SERVERS[1].baseUrl (servers.1.baseUrl)');
+      for (const field of ['`authUsername`', '`authPassword`', '`authToken`']) {
+        expect(err.message).toContain(field);
+      }
+      expect(err.message).not.toContain('NTFY_AUTH_');
+      expect(err.message).not.toContain('NTFY_SERVERS[0]');
+      expect(JSON.stringify({ message: err.message, data: err.data })).not.toMatch(SECRET_PATTERN);
+    });
+
+    it('quotes no credential when two entries carrying it differ only by a trailing slash', () => {
+      process.env.NTFY_SERVERS = JSON.stringify([
+        { baseUrl: `https://${USER}:${PASSWORD}@ntfy.example.com` },
+        { baseUrl: `https://${USER}:${PASSWORD}@ntfy.example.com/` },
+      ]);
+      const err = configError();
+      expect(err.message).toContain('NTFY_SERVERS[0].baseUrl (servers.0.baseUrl)');
+      expect(err.message).toContain('NTFY_SERVERS[1].baseUrl (servers.1.baseUrl)');
+      expect(JSON.stringify({ message: err.message, data: err.data })).not.toMatch(SECRET_PATTERN);
     });
 
     it('rejects mixing bearer and basic auth on a single entry', () => {

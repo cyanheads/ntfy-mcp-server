@@ -3,10 +3,13 @@
  * deliberately split:
  *
  *  - **Always on** — `assertAbsoluteHttpUrl` parses the override and rejects
- *    anything that is not an absolute `http:`/`https:` URL. The advertised
- *    contract is "absolute URL", so a malformed value fails at the boundary
- *    with an actionable message instead of surfacing as an opaque `fetch`
- *    error several layers down.
+ *    anything that is not an absolute `http:`/`https:` URL, and any URL that
+ *    carries credentials (`user:password@`): credentials reach ntfy only from
+ *    a registered server's auth fields. The advertised contract is "absolute
+ *    URL", so a malformed value fails at the boundary with an actionable
+ *    message instead of surfacing as an opaque `fetch` error several layers
+ *    down. Every tool runs it through `normalizeBaseOverride`, above its consent
+ *    gate. No rejection quotes the raw value, which can hold a password.
  *  - **Opt-in (`NTFY_BLOCK_PRIVATE_HOSTS`)** — `assertPublicHost` resolves the
  *    host and rejects loopback, private, link-local, and unspecified
  *    addresses. Off by default so stdio and homelab deployments that point at
@@ -31,11 +34,25 @@ import { serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/erro
  */
 export const BASE_URL_PATTERN = /^$|^https?:\/\/\S+$/i;
 
-/** Recovery hint shared by every `base_url` rejection. */
+/** Recovery hint for a `base_url` that is not an absolute `http(s)` URL — at the schema and in the guard. */
 export const BASE_URL_HINT =
   'Pass an absolute `http://` or `https://` URL (e.g. `https://ntfy.example.com`), or omit `base_url` to use the configured server.';
 
 const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
+
+/** The char code of `/`. */
+const SLASH = 0x2f;
+
+/**
+ * `url` with any run of trailing `/` removed, in time linear in the length of
+ * the URL. The config loader, `normalizeBaseOverride`, and `NtfyService` all
+ * trim with this.
+ */
+export function withoutTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === SLASH) end--;
+  return end === url.length ? url : url.slice(0, end);
+}
 
 /**
  * Turn a tool's raw `base_url` argument into the override `NtfyService`
@@ -43,17 +60,40 @@ const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
  * optional field means "no override", not a base URL of `""`. Trailing slashes
  * come off here as well as in the service, because a handler renders the
  * override into the canonical topic URL it returns.
+ *
+ * Also runs the synchronous guard, `assertAbsoluteHttpUrl`. Every tool calls
+ * this above `confirmAction`, so a value it refuses — credentials in it, a
+ * non-HTTP scheme, no parse at all — fails before a consent prompt, a consent
+ * record, or a request can carry it. The DNS-based `assertPublicHost` stays in
+ * `NtfyService`, past the gate: the stretch above it runs twice and does no I/O.
  */
 export function normalizeBaseOverride(raw: string | undefined): string | undefined {
-  return raw ? raw.replace(/\/+$/, '') : undefined;
+  if (!raw) return;
+  const base = withoutTrailingSlashes(raw);
+  assertAbsoluteHttpUrl(base);
+  return withoutEmptyUserinfo(base);
+}
+
+/** The `@` or `:@` an empty userinfo puts before the host, after any run of slashes. */
+const EMPTY_USERINFO = /^(https?:)[/\\]*:?@/i;
+
+/**
+ * `base` with an empty userinfo dropped: `https://@host` and `https://:@host`
+ * parse to no credential at all, so they are accepted, and this writes them as
+ * `https://host` — the base a tool sends, renders into the topic URL it
+ * returns, and names in a consent record then holds no `@`. Run it on a base
+ * `assertAbsoluteHttpUrl` accepted, whose userinfo is empty if present; the
+ * config loader runs it on every registered base too, so a registered base and
+ * an override naming the same host compare equal.
+ */
+export function withoutEmptyUserinfo(base: string): string {
+  return base.replace(EMPTY_USERINFO, '$1//');
 }
 
 /**
- * Marks a `base_url` rejection as locally raised rather than reported by ntfy.
- * Tool handlers classify upstream failures by code, and a local
- * `ValidationError` would otherwise be read as an upstream complaint about some
- * other argument — `isBaseUrlRejection` in `error-classifier.ts` is how they
- * tell the two apart. `NtfyService` stamps its redirect refusal with it too.
+ * Marks a `base_url` rejection as locally raised rather than reported by ntfy,
+ * as `data.baseUrlRejected` on the error a caller receives. `NtfyService` stamps
+ * its redirect refusal with it too.
  */
 export const REJECTION_MARKER = { baseUrlRejected: true } as const;
 
@@ -97,26 +137,45 @@ export function isReservedAddress(address: string): boolean {
   return RESERVED_RANGES.check(address, isIPv4(address) ? 'ipv4' : 'ipv6');
 }
 
+/** Recovery hint for a `base_url` that carries credentials. */
+const USERINFO_HINT =
+  'Remove the `user:password@` part of `base_url`: credentials never travel in the URL. To reach a server that needs them, ask the operator to register it in `NTFY_SERVERS` with `authToken`, or `authUsername` + `authPassword`, and pass its registered URL as `base_url`.';
+
 /**
- * Parse a `base_url` override and enforce the `http:`/`https:` scheme.
- * Unconditional — a relative or non-HTTP value can never reach a working ntfy
- * server, so it is a caller mistake worth naming precisely.
+ * Parse a `base_url` override, enforce the `http:`/`https:` scheme, and refuse
+ * credentials in it. Unconditional — a relative or non-HTTP value can never
+ * reach a working ntfy server, so it is a caller mistake worth naming
+ * precisely.
+ *
+ * Credentials (a non-empty username or password, however spelled or encoded)
+ * are refused: they reach ntfy only from this server's own configuration, which
+ * scopes them to the registered base they belong to, never from a URL. An empty
+ * userinfo (`https://@host`) carries none and passes. The messages quote no raw
+ * value: a value that does not parse
+ * cannot be split into credential and host, so none of it is quoted, and the
+ * other two name only the scheme or the host.
  */
 export function assertAbsoluteHttpUrl(raw: string): URL {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw validationError(`base_url is not an absolute URL: "${raw}"`, {
+    throw validationError('base_url is not an absolute URL.', {
       ...REJECTION_MARKER,
       recovery: { hint: BASE_URL_HINT },
     });
   }
   if (!ALLOWED_PROTOCOLS.has(url.protocol)) {
-    throw validationError(`base_url uses an unsupported scheme (${url.protocol}): "${raw}"`, {
+    throw validationError(`base_url uses an unsupported scheme (${url.protocol}).`, {
       ...REJECTION_MARKER,
       recovery: { hint: BASE_URL_HINT },
     });
+  }
+  if (url.username || url.password) {
+    throw validationError(
+      `base_url carries credentials (user:password@) for host "${url.host}"; a base URL may not carry them.`,
+      { ...REJECTION_MARKER, recovery: { hint: USERINFO_HINT } },
+    );
   }
   return url;
 }

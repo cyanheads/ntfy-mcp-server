@@ -18,7 +18,13 @@
  * cursors (`cursor_not_found`), boundaries, and the `totalCount` / `nextCursor`
  * enrichment and notice on both surfaces. Message rows on both surfaces: the
  * body cut before a surrogate pair, `icon`, body `encoding`, action ids, and
- * queued rows marked `scheduled` against ntfy's `Date` or a faked local clock.
+ * queued rows marked `scheduled` against ntfy's `Date` or a faked local clock,
+ * and `sequence_id` under its `Sequence ID:` label. `wait_seconds` against a
+ * stream the test feeds, on a fake clock: arrival, clear/delete events, the
+ * stream on a `base_url` host, the calls that never wait, ntfy's filters,
+ * timeout, failure before and after the stream opened, the per-process cap,
+ * the clamp in both modes, the call deadline, cancellation, and `scheduled` on
+ * a waited row.
  * @module tests/tools/ntfy-fetch-messages.tool
  */
 
@@ -46,7 +52,9 @@ import {
 import {
   CALL_DEADLINE_MS,
   initNtfyService,
+  MAX_OPEN_WAITS,
   type NtfyService,
+  openWaitCount,
   resetNtfyService,
 } from '@/services/ntfy/ntfy-service.js';
 import type { NtfyMessage } from '@/services/ntfy/types.js';
@@ -481,7 +489,9 @@ describe('ntfyFetchMessages handler', () => {
     expect(text).toContain('warning');
     expect(text).toContain('_(200 more UTF-16 code units)_');
     expect(text).toContain('log.txt');
-    expect(text).toContain('seq_1');
+    // The label the publish result uses: the row carries its notification's sequence ID.
+    expect(text).toContain('\nSequence ID: `seq_1`\n');
+    expect(text).not.toContain('References sequence');
   });
 
   it('enriches resolved topic/since/active filters and a notice on an empty result', async () => {
@@ -584,6 +594,28 @@ describe('ntfyFetchMessages handler', () => {
     );
     expect(err).toMatchObject({ message: expect.stringContaining('non-public address') });
     expect((err as { data?: { reason?: string } }).data?.reason).toBeUndefined();
+  });
+
+  it('refuses a `base_url` carrying credentials before any request, naming the host and neither credential (#58)', async () => {
+    freshService();
+    // ntfy at every host, with an empty window — what the unfixed handler reached.
+    const upstream = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => new Response('', { status: 200 }));
+    const result = await runToolContract(ntfyFetchMessages, {
+      topic: 'alerts',
+      base_url: 'https://probeuser:pwSECRET@ntfy.example.com',
+    });
+    expect(upstream).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining('"ntfy.example.com"'),
+        data: { baseUrlRejected: true },
+      },
+    });
+    expect(JSON.stringify(result)).not.toMatch(/probeuser|pwSECRET/);
   });
 
   it('maps a retry-exhausted network error to `upstream_unreachable`', async () => {
@@ -741,13 +773,17 @@ describe('ntfyFetchMessages against a stubbed ntfy upstream', () => {
     expect(error.message).toContain('limit reached: daily bandwidth');
     expect(error.data.reason).toBe('rate_limited');
     expect(error.data.retryable).toBe(true);
-    expect(error.data.recovery).toMatchObject({
-      hint: expect.stringContaining('rate-limit window'),
-    });
+    // #60: ntfy's 42905 names the limit; an error line carries no `Retry-After`.
+    expect(error.data.limit).toBe('bandwidth');
+    expect(error.data).not.toHaveProperty('retryAfter');
+    const hint = (error.data.recovery as { hint: string }).hint;
+    expect(hint).toContain(
+      'daily attachment bandwidth (limit `bandwidth`) is used up: retry once it resets, within 24 hours',
+    );
     const text = textOf(result);
     expect(text).not.toContain('Invalid Date');
     expect(text).toContain('reason rate_limited');
-    expect(text).toContain('rate-limit window');
+    expect(readCommonMark(text)).toContain(`Recovery: ${hint}`);
   });
 
   it('maps a 429 status line that outlasts the retries to `rate_limited` on both surfaces', async () => {
@@ -773,8 +809,10 @@ describe('ntfyFetchMessages against a stubbed ntfy upstream', () => {
     expect(error.data.retryable).toBe(true);
     expect(error.message).toContain('limit reached: too many requests');
     expect(error.message).toContain('(failed after 2 attempts)');
+    // #60: the exhausted error keeps ntfy's envelope, so the limit is still named.
+    expect(error.data.limit).toBe('requests');
     expect(error.data.recovery).toMatchObject({
-      hint: expect.stringContaining('rate-limit window'),
+      hint: expect.stringContaining('request allowance (limit `requests`)'),
     });
     const text = textOf(result);
     expect(text).toContain('reason rate_limited');
@@ -804,12 +842,38 @@ describe('ntfyFetchMessages against a stubbed ntfy upstream', () => {
     expect(error.data).not.toHaveProperty('retryAttempts');
     expect(error.message).toContain('limit reached: too many requests');
     expect(error.message).not.toMatch(/failed after/);
-    expect(error.data.recovery).toMatchObject({ hint: expect.stringContaining('retryAfter') });
+    expect(error.data.limit).toBe('requests');
+    expect(error.data.recovery).toMatchObject({
+      hint: expect.stringContaining('Retry in 40 seconds'),
+    });
     expect(textOf(result)).not.toMatch(/failed after/);
     // The closing trailer names the wait: the header's string, as a code span.
     expect(readCommonMark(textOf(result))).toContain(
       '(reason rate_limited · retryable · retry after ⟨code_inline:40⟩',
     );
+  });
+
+  it("names no limit for a 429 without ntfy's envelope, keeping the declared recovery (#60)", async () => {
+    stubUpstream(
+      () =>
+        new Response('Too Many Requests\n', {
+          status: 429,
+          headers: { 'content-type': 'text/plain', 'retry-after': '40' },
+        }),
+    );
+    const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts' });
+    const error = errorOf(result);
+    const declared = ntfyFetchMessages.errors?.find((e) => e.reason === 'rate_limited')
+      ?.recovery as string;
+    expect(error.data).toMatchObject({
+      reason: 'rate_limited',
+      retryAfter: '40',
+      recovery: { hint: declared },
+    });
+    expect(error.data).not.toHaveProperty('limit');
+    const text = readCommonMark(textOf(result));
+    expect(text).toContain("Recovery: Wait for ntfy's rate-limit window to pass");
+    expect(text).not.toContain('(limit');
   });
 
   describe('a 5xx carrying Retry-After (#42)', () => {
@@ -1067,6 +1131,28 @@ describe('ntfyFetchMessages against a stubbed ntfy upstream', () => {
         expect(rendered).not.toContain('Unix timestamp');
       },
     );
+
+    it('fails a 400 whose reason phrase is `invalid since parameter`, with no envelope, as `not_ntfy_endpoint` (#57)', async () => {
+      const upstream = stubUpstream(
+        () => new Response(null, { status: 400, statusText: 'invalid since parameter' }),
+      );
+      const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts', since: '1d' });
+      expect(upstream).toHaveBeenCalledTimes(1);
+      const error = errorOf(result);
+      const message = 'ntfy.test returned HTTP 400 invalid since parameter.';
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.message).toBe(message);
+      expect(error.data).toMatchObject({
+        reason: 'not_ntfy_endpoint',
+        retryable: false,
+        recovery: { hint: NOT_NTFY_HINT },
+      });
+      const rendered = readCommonMark(textOf(result));
+      expect(rendered).toContain(`Error: ${message}`);
+      expect(rendered).toContain('(reason not_ntfy_endpoint · not retryable)');
+      expect(rendered).not.toContain('invalid_since');
+      expect(rendered).not.toContain('Unix timestamp');
+    });
   });
 
   describe("forbidden_topic only on ntfy's own auth envelope (#45)", () => {
@@ -2203,7 +2289,7 @@ describe('ntfyFetchMessages `limit` clamp wiring', () => {
       {
         level: 'info',
         msg: 'Clamped limit',
-        data: { tool: 'ntfy_fetch_messages', requested: 101, applied: 100 },
+        data: { tool: 'ntfy_fetch_messages', input: 'limit', requested: 101, applied: 100 },
       },
     ]);
   });
@@ -2718,5 +2804,1014 @@ describe('ntfyFetchMessages message rows', () => {
       const { rows } = await call({ topic: 'alerts', since: 'all', scheduled: true });
       expect(rows.map((r) => r.scheduled)).toEqual([undefined, true, true]);
     });
+  });
+});
+
+describe('ntfyFetchMessages without `wait_seconds` (#61)', () => {
+  beforeEach(() => {
+    resetServerConfig();
+    resetNtfyService();
+    for (const k of ENV_KEYS) delete process.env[k];
+    process.env.NTFY_BASE_URL = 'https://ntfy.test';
+    freshService();
+  });
+  afterEach(() => {
+    for (const k of ENV_KEYS) delete process.env[k];
+    resetServerConfig();
+    resetNtfyService();
+    vi.restoreAllMocks();
+  });
+
+  /** Answers every request to `ntfy.test` with `envelopes` as one NDJSON poll body. */
+  function answer(envelopes: object[]) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+      return new Response(envelopes.map((e) => JSON.stringify(e)).join('\n'), {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
+      });
+    });
+  }
+
+  it('returns an empty window exactly as before, both surfaces whole, after one poll', async () => {
+    const upstream = answer([]);
+    const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts' });
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      structuredContent: {
+        messages: [],
+        topic: 'alerts',
+        since: '10m',
+        count: 0,
+        totalCount: 0,
+        truncated: false,
+        notice: `No messages on topic \`alerts\` (since \`10m\`). Try a wider \`since\` window or verify the topic name. A delayed message ntfy has not delivered yet is returned only with \`scheduled: true\`. ${JUST_PUBLISHED}`,
+      },
+      content: [
+        { type: 'text', text: 'No messages matched the query.' },
+        {
+          type: 'text',
+          text: `\n\n**topic:** \`alerts\`\n**since:** \`10m\`\n**count:** 0\n**totalCount:** 0\n**truncated:** false\n> No messages on topic \`alerts\` (since \`10m\`). Try a wider \`since\` window or verify the topic name. A delayed message ntfy has not delivered yet is returned only with \`scheduled: true\`. ${JUST_PUBLISHED}`,
+        },
+      ],
+    });
+  });
+
+  it('returns a window with rows exactly as before, both surfaces whole', async () => {
+    answer([
+      { id: 'a', time: 1_700_000_000, event: 'open', topic: 'alerts' },
+      { id: 'm1', time: 1_700_000_001, event: 'message', topic: 'alerts', message: 'one' },
+      { id: 'm2', time: 1_700_000_002, event: 'message', topic: 'alerts', message: 'two' },
+    ]);
+    const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts', since: 'all' });
+    expect(result).toEqual({
+      structuredContent: {
+        messages: [
+          {
+            id: 'm1',
+            time: '2023-11-14T22:13:21.000Z',
+            event: 'message',
+            topic: 'alerts',
+            message: 'one',
+          },
+          {
+            id: 'm2',
+            time: '2023-11-14T22:13:22.000Z',
+            event: 'message',
+            topic: 'alerts',
+            message: 'two',
+          },
+        ],
+        topic: 'alerts',
+        since: 'all',
+        count: 2,
+        totalCount: 2,
+        truncated: false,
+      },
+      content: [
+        {
+          type: 'text',
+          text: '### `m1` — `message` on `alerts`\nTime: 2023-11-14T22:13:21.000Z\n\n```text\none\n```\n\n### `m2` — `message` on `alerts`\nTime: 2023-11-14T22:13:22.000Z\n\n```text\ntwo\n```',
+        },
+        {
+          type: 'text',
+          text: '\n\n**topic:** `alerts`\n**since:** `all`\n**count:** 2\n**totalCount:** 2\n**truncated:** false',
+        },
+      ],
+    });
+  });
+});
+
+describe('ntfyFetchMessages `wait_seconds` (#61)', () => {
+  const NDJSON = { 'content-type': 'application/x-ndjson; charset=utf-8' };
+  const TOPIC = 'alerts';
+  /** ntfy's clock when a test's stream opens: 2026-11-14T06:08:20Z. */
+  const NTFY_NOW = 1_794_636_500;
+  /** ntfy's `open` line for a stream, at ntfy's Unix second `time`. */
+  const openLine = (time: number) =>
+    JSON.stringify({ id: 'opn0000000ab', time, event: 'open', topic: TOPIC });
+  /** A message envelope as ntfy writes it, 2 s after {@link NTFY_NOW} unless `extra` says otherwise. */
+  const row = (id: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    time: NTFY_NOW + 2,
+    event: 'message',
+    topic: TOPIC,
+    message: `body ${id}`,
+    ...extra,
+  });
+  /** The empty-result notice's opening sentences for `topic` under the default `since`. */
+  const empty = (topic: string) =>
+    `No messages on topic \`${topic}\` (since \`10m\`). Try a wider \`since\` window or verify the topic name. A delayed message ntfy has not delivered yet is returned only with \`scheduled: true\`.`;
+  const SUBSCRIPTION_LIMIT =
+    '{"code":42903,"http":429,"error":"limit reached: too many active subscriptions","link":"https://ntfy.sh/docs/publish/#limitations"}';
+
+  /**
+   * An ntfy JSON stream the test writes to as the wait reads it: `send()`
+   * writes whole lines, `close()` ends it as a dropped connection would. Once
+   * the request signal aborts, the body errors with its reason — what Bun's and
+   * Node's `fetch` both do to a body still being read — and `aborted` records it.
+   */
+  interface FakeStream {
+    aborted: boolean;
+    close: () => void;
+    send: (...lines: string[]) => void;
+  }
+
+  function fakeStream(signal: AbortSignal | undefined): { response: Response; stream: FakeStream } {
+    const encoder = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream: FakeStream = {
+      aborted: false,
+      send: (...lines) => controller.enqueue(encoder.encode(lines.map((l) => `${l}\n`).join(''))),
+      close: () => controller.close(),
+    };
+    const body = new ReadableStream<Uint8Array>(
+      {
+        start(c) {
+          controller = c;
+          signal?.addEventListener(
+            'abort',
+            () => {
+              stream.aborted = true;
+              c.error(signal.reason);
+            },
+            { once: true },
+          );
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return { response: new Response(body, { status: 200, headers: NDJSON }), stream };
+  }
+
+  /**
+   * Stubs `globalThis.fetch` for `hosts` (by default `ntfy.test` alone). A poll
+   * gets `poll` as one NDJSON body — after `pollDelayMs` of fake time, with
+   * `date` as ntfy's `Date` when set — and every other request, a wait's
+   * stream, gets `stream(signal)` or by default a fresh {@link fakeStream},
+   * collected in `streams`.
+   */
+  function upstream(
+    opts: {
+      date?: string;
+      hosts?: string[];
+      poll?: object[];
+      pollDelayMs?: number;
+      stream?: (signal: AbortSignal | undefined) => Response;
+    } = {},
+  ) {
+    const calls: Array<{ signal: AbortSignal | undefined; url: URL }> = [];
+    const streams: FakeStream[] = [];
+    const hosts = opts.hosts ?? ['ntfy.test'];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (!hosts.includes(url.hostname)) throw new Error(`Unmocked fetch: ${url.href}`);
+      const signal = init?.signal ?? undefined;
+      calls.push({ url, signal });
+      if (url.searchParams.has('poll')) {
+        if (opts.pollDelayMs) await new Promise((r) => setTimeout(r, opts.pollDelayMs));
+        return new Response((opts.poll ?? []).map((e) => JSON.stringify(e)).join('\n'), {
+          status: 200,
+          headers: { ...NDJSON, ...(opts.date ? { date: opts.date } : {}) },
+        });
+      }
+      if (opts.stream) return opts.stream(signal);
+      const { response, stream } = fakeStream(signal);
+      streams.push(stream);
+      return response;
+    });
+    return { calls, streams };
+  }
+
+  /** Records when, in fake ms, `promise` settled and with what, without awaiting it. */
+  function track<T>(promise: T | Promise<T>) {
+    const startedAt = Date.now();
+    const state: { error?: unknown; settledAfterMs?: number; value?: T } = {};
+    Promise.resolve(promise).then(
+      (value) => {
+        state.settledAfterMs = Date.now() - startedAt;
+        state.value = value;
+      },
+      (error: unknown) => {
+        state.settledAfterMs = Date.now() - startedAt;
+        state.error = error;
+      },
+    );
+    return state;
+  }
+
+  /** Starts a call through the contract runner and runs it until it settles or holds the stream open. */
+  async function start(input: z.input<typeof ntfyFetchMessages.input>, signal?: AbortSignal) {
+    const call = track(
+      runToolContract(ntfyFetchMessages, input, signal ? { context: { signal } } : undefined),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    return call;
+  }
+
+  /** A settled call's `structuredContent` as the wire carries it: absent keys dropped. */
+  function structured(call: { value?: Awaited<ReturnType<typeof runToolContract>> }) {
+    return JSON.parse(JSON.stringify(call.value?.structuredContent ?? null)) as Record<
+      string,
+      unknown
+    >;
+  }
+
+  /** A settled call's `content[]` text. */
+  function text(call: { value?: Awaited<ReturnType<typeof runToolContract>> }) {
+    return call.value ? textOf(call.value) : '';
+  }
+
+  function waitService(requestTimeoutMs = 15_000) {
+    return initNtfyService({
+      servers: [{ baseUrl: 'https://ntfy.test' }],
+      requestTimeoutMs,
+      maxRetries: 0,
+    } as never);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetServerConfig();
+    resetNtfyService();
+    for (const k of ENV_KEYS) delete process.env[k];
+    delete process.env.NTFY_CLAMP_LIMITS;
+    process.env.NTFY_BASE_URL = 'https://ntfy.test';
+    waitService();
+  });
+  afterEach(() => {
+    // Every path ends with its timers cleared and its wait slot given back.
+    expect(vi.getTimerCount()).toBe(0);
+    expect(openWaitCount()).toBe(0);
+    vi.useRealTimers();
+    for (const k of ENV_KEYS) delete process.env[k];
+    delete process.env.NTFY_CLAMP_LIMITS;
+    resetServerConfig();
+    resetNtfyService();
+    vi.restoreAllMocks();
+  });
+
+  it('returns the first row to arrive as a one-row result, with `waitedSeconds` and the arrived notice, on both surfaces', async () => {
+    const { calls, streams } = upstream();
+    const call = await start({ topic: TOPIC, wait_seconds: 30 });
+    streams[0]?.send(openLine(NTFY_NOW));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(call.settledAfterMs).toBeUndefined();
+    streams[0]?.send(JSON.stringify(row('m1')));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const notice =
+      "Arrived after 3 s of waiting. To wait for the next message, call again with `since` set to this message's `id`; a row that shares its `time` may have been published before it.";
+    expect(call.value).toEqual({
+      structuredContent: {
+        messages: [
+          {
+            id: 'm1',
+            time: '2026-11-14T06:08:22.000Z',
+            event: 'message',
+            topic: 'alerts',
+            message: 'body m1',
+          },
+        ],
+        topic: 'alerts',
+        since: '10m',
+        count: 1,
+        totalCount: 1,
+        truncated: false,
+        waitedSeconds: 3,
+        notice,
+      },
+      content: [
+        {
+          type: 'text',
+          text: '### `m1` — `message` on `alerts`\nTime: 2026-11-14T06:08:22.000Z\n\n```text\nbody m1\n```',
+        },
+        {
+          type: 'text',
+          text: `\n\n**topic:** \`alerts\`\n**since:** \`10m\`\n**count:** 1\n**totalCount:** 1\n**truncated:** false\n**waitedSeconds:** 3\n> ${notice}`,
+        },
+      ],
+    });
+    // The stream reads the poll's own window, and its request ends with the wait.
+    expect(calls).toHaveLength(2);
+    const [poll, stream] = calls;
+    expect(stream?.url.searchParams.has('poll')).toBe(false);
+    poll?.url.searchParams.delete('poll');
+    expect(stream?.url.href).toBe(poll?.url.href);
+    expect(streams[0]?.aborted).toBe(true);
+  });
+
+  it.each(['message_clear', 'message_delete'] as const)(
+    'ends the wait on a `%s` event, returned as its row',
+    async (event) => {
+      const { streams } = upstream();
+      const call = await start({ topic: TOPIC, wait_seconds: 30 });
+      streams[0]?.send(openLine(NTFY_NOW));
+      await vi.advanceTimersByTimeAsync(1_000);
+      streams[0]?.send(
+        JSON.stringify({
+          id: 'ev0000000001',
+          time: NTFY_NOW + 1,
+          event,
+          topic: TOPIC,
+          sequence_id: 'backup-42',
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(structured(call)).toMatchObject({
+        messages: [{ id: 'ev0000000001', event, sequence_id: 'backup-42' }],
+        count: 1,
+        totalCount: 1,
+        waitedSeconds: 1,
+      });
+      expect(text(call)).toContain(`### \`ev0000000001\` — \`${event}\` on \`alerts\``);
+    },
+  );
+
+  it('opens the stream on the `base_url` host the poll went to, not the configured server', async () => {
+    const { calls, streams } = upstream({ hosts: ['ntfy.test', 'other.ntfy.test'] });
+    const call = await start({
+      topic: TOPIC,
+      wait_seconds: 30,
+      base_url: 'https://other.ntfy.test/',
+    });
+    streams[0]?.send(openLine(NTFY_NOW), JSON.stringify(row('m1')));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(structured(call)).toMatchObject({ messages: [{ id: 'm1' }], count: 1 });
+    expect(calls.map(({ url }) => url.origin)).toEqual([
+      'https://other.ntfy.test',
+      'https://other.ntfy.test',
+    ]);
+    expect(calls[1]?.url.searchParams.has('poll')).toBe(false);
+  });
+
+  it('answers at once from a poll that returned rows: no stream request, no `waitedSeconds`', async () => {
+    const { calls } = upstream({ poll: [JSON.parse(openLine(NTFY_NOW)), row('m1')] });
+    const call = await start({ topic: TOPIC, wait_seconds: 30 });
+    expect(calls).toHaveLength(1);
+    expect(structured(call)).toMatchObject({ messages: [{ id: 'm1' }], count: 1 });
+    expect(structured(call)).not.toHaveProperty('waitedSeconds');
+    expect(structured(call)).not.toHaveProperty('notice');
+    expect(text(call)).not.toContain('waitedSeconds');
+  });
+
+  it('never waits with `id` set: one poll, and a notice that `wait_seconds` was ignored', async () => {
+    const { calls } = upstream();
+    const call = await start({ topic: TOPIC, id: 'AbCdEf123456', wait_seconds: 30 });
+    expect(calls).toHaveLength(1);
+    const ignored =
+      '`wait_seconds` is ignored when `id` is set: no new message carries an existing ID.';
+    expect(structured(call)).not.toHaveProperty('waitedSeconds');
+    expect(structured(call).notice).toBe(
+      `No messages on topic \`alerts\` (since \`10m\`) with filters id=\`AbCdEf123456\`. Try a wider \`since\` window, drop filters, or verify the topic name. A delayed message ntfy has not delivered yet is returned only with \`scheduled: true\`. ${JUST_PUBLISHED} ${ignored}`,
+    );
+    expect(text(call)).toContain(ignored);
+  });
+
+  it.each([
+    ['holds the cursor message', [row('m1'), row('m2')], false],
+    ['is empty', [], true],
+  ])('never waits on a `cursor` call whose window %s', async (_label, poll, isError) => {
+    const { calls } = upstream({ poll });
+    const call = await start({ topic: TOPIC, since: 'all', cursor: 'm2', wait_seconds: 30 });
+    expect(calls).toHaveLength(1);
+    expect(call.value?.isError ?? false).toBe(isError);
+    expect(structured(call)).not.toHaveProperty('waitedSeconds');
+  });
+
+  it("waits through ntfy's own filters: the stream carries every filter the poll sent, and a frame the handler drops from a poll does not end the wait", async () => {
+    // A poll of transport frames only is an empty window, so the wait starts.
+    const { calls, streams } = upstream({
+      poll: [
+        JSON.parse(openLine(NTFY_NOW)),
+        { id: 'kpa0000000ab', time: NTFY_NOW, event: 'keepalive', topic: TOPIC },
+      ],
+    });
+    const call = await start({
+      topic: 'alerts,backups',
+      since: 'AbCdEf123456',
+      scheduled: true,
+      priority: [4, 5],
+      tags: ['a', 'b'],
+      title: 'Hit',
+      message: 'exact body',
+      wait_seconds: 30,
+    });
+    expect(calls).toHaveLength(2);
+    streams[0]?.send(
+      openLine(NTFY_NOW),
+      JSON.stringify({ id: 'kpa0000000ac', time: NTFY_NOW + 1, event: 'keepalive', topic: TOPIC }),
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(call.settledAfterMs).toBeUndefined();
+    streams[0]?.send(
+      JSON.stringify(
+        row('hit000000001', { title: 'Hit', priority: 4, tags: ['a', 'b'], message: 'exact body' }),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(structured(call)).toMatchObject({
+      messages: [{ id: 'hit000000001' }],
+      count: 1,
+      waitedSeconds: 5,
+    });
+    // ntfy applies `since`, `scheduled`, and every filter itself, on the stream as on the poll.
+    const [poll, stream] = calls;
+    poll?.url.searchParams.delete('poll');
+    expect(stream?.url.href).toBe(poll?.url.href);
+    expect(Object.fromEntries(stream?.url.searchParams ?? [])).toEqual({
+      since: 'AbCdEf123456',
+      scheduled: '1',
+      priority: '4,5',
+      tags: 'a,b',
+      title: 'Hit',
+      message: 'exact body',
+    });
+  });
+
+  it('times out with the empty result, its notice saying how long it waited in place of the just-published caveat', async () => {
+    const { streams } = upstream();
+    const call = await start({ topic: TOPIC, wait_seconds: 10 });
+    streams[0]?.send(openLine(NTFY_NOW));
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(call.settledAfterMs).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+
+    const notice = `${empty(TOPIC)} None arrived during the 10-second wait; call again with the same arguments to keep waiting.`;
+    expect(call.value).toEqual({
+      structuredContent: {
+        messages: [],
+        topic: 'alerts',
+        since: '10m',
+        count: 0,
+        totalCount: 0,
+        truncated: false,
+        waitedSeconds: 10,
+        notice,
+      },
+      content: [
+        { type: 'text', text: 'No messages matched the query.' },
+        {
+          type: 'text',
+          text: `\n\n**topic:** \`alerts\`\n**since:** \`10m\`\n**count:** 0\n**totalCount:** 0\n**truncated:** false\n**waitedSeconds:** 10\n> ${notice}`,
+        },
+      ],
+    });
+    expect(streams[0]?.aborted).toBe(true);
+  });
+
+  /**
+   * ntfy re-sends a message it has just written to every stream that subscribed
+   * after the message went out, without applying the stream's `since`: X stands
+   * for one published a moment before the call, which reaches the wait's stream
+   * that way.
+   */
+  describe("skips a row ntfy re-sends from before the poll's `since` window, and waits on", () => {
+    const X = row('Xmarker00001', { time: NTFY_NOW - 1 });
+
+    it('times out with the empty result when the `since` message is all that arrives', async () => {
+      const { streams } = upstream();
+      const call = await start({ topic: TOPIC, since: X.id, wait_seconds: 4 });
+      streams[0]?.send(openLine(NTFY_NOW), JSON.stringify(X));
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(call.settledAfterMs).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+
+      const notice = `No messages on topic \`alerts\` (since \`${X.id}\`). Try a wider \`since\` window or verify the topic name. A delayed message ntfy has not delivered yet is returned only with \`scheduled: true\`. None arrived during the 4-second wait; call again with the same arguments to keep waiting.`;
+      expect(call.value).toEqual({
+        structuredContent: {
+          messages: [],
+          topic: 'alerts',
+          since: X.id,
+          count: 0,
+          totalCount: 0,
+          truncated: false,
+          waitedSeconds: 4,
+          notice,
+        },
+        content: [
+          { type: 'text', text: 'No messages matched the query.' },
+          {
+            type: 'text',
+            text: `\n\n**topic:** \`alerts\`\n**since:** \`${X.id}\`\n**count:** 0\n**totalCount:** 0\n**truncated:** false\n**waitedSeconds:** 4\n> ${notice}`,
+          },
+        ],
+      });
+      expect(streams[0]?.aborted).toBe(true);
+    });
+
+    it("returns the next message, not X again, to a call made at once with `since` set to the arrived X's `id`", async () => {
+      const { streams } = upstream();
+      const first = await start({ topic: TOPIC, wait_seconds: 30 });
+      streams[0]?.send(openLine(NTFY_NOW - 2));
+      await vi.advanceTimersByTimeAsync(1_000);
+      streams[0]?.send(JSON.stringify(X));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(structured(first)).toMatchObject({ messages: [{ id: X.id }], waitedSeconds: 1 });
+
+      // As the arrival notice advises.
+      const next = await start({ topic: TOPIC, since: X.id, wait_seconds: 4 });
+      streams[1]?.send(openLine(NTFY_NOW), JSON.stringify(X));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(next.settledAfterMs).toBeUndefined();
+      streams[1]?.send(JSON.stringify(row('Ynext0000001')));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const notice =
+        "Arrived after 2 s of waiting. To wait for the next message, call again with `since` set to this message's `id`; a row that shares its `time` may have been published before it.";
+      expect(structured(next)).toEqual({
+        messages: [
+          {
+            id: 'Ynext0000001',
+            time: '2026-11-14T06:08:22.000Z',
+            event: 'message',
+            topic: 'alerts',
+            message: 'body Ynext0000001',
+          },
+        ],
+        topic: 'alerts',
+        since: X.id,
+        count: 1,
+        totalCount: 1,
+        truncated: false,
+        waitedSeconds: 2,
+        notice,
+      });
+      expect(text(next)).toContain(
+        '### `Ynext0000001` — `message` on `alerts`\nTime: 2026-11-14T06:08:22.000Z\n',
+      );
+      expect(text(next)).toContain(`**waitedSeconds:** 2\n> ${notice}`);
+      expect(text(next)).not.toContain(`### \`${X.id}\``);
+    });
+
+    it('skips X under a Unix-seconds `since` one second past its `time`, and returns a row timed at that second', async () => {
+      const { streams } = upstream();
+      const call = await start({ topic: TOPIC, since: String(X.time + 1), wait_seconds: 4 });
+      streams[0]?.send(openLine(NTFY_NOW), JSON.stringify(X));
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(call.settledAfterMs).toBeUndefined();
+      // Sparse, as ntfy writes a message with no optional field set.
+      streams[0]?.send(
+        JSON.stringify({ id: 'atSince00001', time: X.time + 1, event: 'message', topic: TOPIC }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(structured(call)).toMatchObject({
+        messages: [
+          { id: 'atSince00001', time: '2026-11-14T06:08:20.000Z', event: 'message', topic: TOPIC },
+        ],
+        since: String(NTFY_NOW),
+        count: 1,
+        totalCount: 1,
+        waitedSeconds: 1.5,
+      });
+      expect(structured(call).messages).toEqual([
+        { id: 'atSince00001', time: '2026-11-14T06:08:20.000Z', event: 'message', topic: TOPIC },
+      ]);
+      expect(text(call)).toContain('### `atSince00001` — `message` on `alerts`\n');
+      expect(text(call)).toContain('**waitedSeconds:** 1.5\n');
+      expect(text(call)).not.toContain(`### \`${X.id}\``);
+    });
+
+    it('reads a 12-digit `since` as a message ID, as ntfy does: it skips that message, never a row timed below the digits', async () => {
+      const marker = '123456789012';
+      const { streams } = upstream();
+      const call = await start({ topic: TOPIC, since: marker, wait_seconds: 4 });
+      streams[0]?.send(openLine(NTFY_NOW), JSON.stringify(row(marker, { time: NTFY_NOW - 1 })));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(call.settledAfterMs).toBeUndefined();
+      streams[0]?.send(JSON.stringify(row('m2')));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(structured(call)).toMatchObject({
+        messages: [{ id: 'm2', time: '2026-11-14T06:08:22.000Z' }],
+        since: marker,
+        count: 1,
+        waitedSeconds: 1,
+        notice: expect.stringContaining(
+          'ntfy reads the 12-digit `since` `123456789012` as a message ID, not a Unix timestamp',
+        ),
+      });
+      expect(text(call)).toContain('### `m2` — `message` on `alerts`\n');
+      expect(text(call)).toContain('**waitedSeconds:** 1\n');
+    });
+  });
+
+  describe('a wait that fails returns the empty result, its notice naming the cause and no topic', () => {
+    const SECRET = 'secret_topic_x7';
+
+    it('before the stream opened (ntfy’s 42903 subscription limit): `waitedSeconds` 0, "could not start"', async () => {
+      const { calls } = upstream({
+        stream: () =>
+          new Response(SUBSCRIPTION_LIMIT, {
+            status: 429,
+            headers: { 'content-type': 'application/json' },
+          }),
+      });
+      const call = await start({ topic: SECRET, wait_seconds: 30 });
+      expect(calls).toHaveLength(2);
+      const cause =
+        'ntfy returned HTTP 429: limit reached: too many active subscriptions (see https://ntfy.sh/docs/publish/#limitations)';
+      const notice = `${empty(SECRET)} ${JUST_PUBLISHED} The wait could not start: \`${cause}\`. Poll again later instead of waiting.`;
+      expect(structured(call)).toMatchObject({ messages: [], count: 0, waitedSeconds: 0, notice });
+      // The topic appears once: the echo of the caller's own criteria.
+      expect(notice.split(SECRET)).toHaveLength(2);
+      expect(text(call)).toContain(`**waitedSeconds:** 0\n> ${notice}`);
+
+      // The handler's log line carries the cause, never the topic.
+      const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+      await ntfyFetchMessages.handler(
+        ntfyFetchMessages.input.parse({ topic: SECRET, wait_seconds: 30 }),
+        ctx,
+      );
+      const logged = (ctx.log as MockContextLogger).calls;
+      expect(logged).toContainEqual({
+        level: 'info',
+        msg: 'Waited for an ntfy message',
+        data: { outcome: 'failed', waitedSeconds: 0, cause },
+      });
+      expect(JSON.stringify(logged)).not.toContain(SECRET);
+    });
+
+    it('after the stream opened (ntfy closed it): the seconds waited, "ended after"', async () => {
+      const { streams } = upstream();
+      const call = await start({ topic: SECRET, wait_seconds: 30 });
+      streams[0]?.send(openLine(NTFY_NOW));
+      await vi.advanceTimersByTimeAsync(4_000);
+      streams[0]?.close();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const notice = `${empty(SECRET)} ${JUST_PUBLISHED} The wait ended after 4 s: \`the stream closed before any message arrived\`. Poll again later instead of waiting.`;
+      expect(structured(call)).toMatchObject({ messages: [], count: 0, waitedSeconds: 4, notice });
+      expect(notice.split(SECRET)).toHaveLength(2);
+      expect(text(call)).toContain(`**waitedSeconds:** 4\n> ${notice}`);
+    });
+  });
+
+  it(`returns at once with the busy notice while ${MAX_OPEN_WAITS} calls wait, and reuses a slot a cancelled call frees`, async () => {
+    const { calls, streams } = upstream();
+    // One per call that opens a stream, so the `finally` can end each of them.
+    const callers = Array.from({ length: MAX_OPEN_WAITS + 1 }, () => new AbortController());
+    try {
+      const held = callers.slice(0, MAX_OPEN_WAITS).map((caller) => ({
+        caller,
+        call: track(
+          runToolContract(
+            ntfyFetchMessages,
+            { topic: TOPIC, wait_seconds: 30 },
+            { context: { signal: caller.signal } },
+          ),
+        ),
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      for (const stream of streams) stream.send(openLine(NTFY_NOW));
+      expect(streams).toHaveLength(MAX_OPEN_WAITS);
+      expect(openWaitCount()).toBe(MAX_OPEN_WAITS);
+
+      // The eleventh polls, then returns without asking ntfy for a stream. It
+      // never waited, so its over-cap `wait_seconds` was served as nothing.
+      const busy = await start({ topic: TOPIC, wait_seconds: 90 });
+      expect(calls).toHaveLength(2 * MAX_OPEN_WAITS + 1);
+      const notice = `${empty(TOPIC)} ${JUST_PUBLISHED} This server already has ${MAX_OPEN_WAITS} waits open, the most it runs at once, so this call returned without waiting.`;
+      expect(structured(busy)).toMatchObject({ messages: [], waitedSeconds: 0, notice });
+      expect(structured(busy).notice).not.toContain('served as');
+      expect(text(busy)).toContain(`**waitedSeconds:** 0\n> ${notice}`);
+      expect(text(busy)).not.toContain('served as');
+
+      const [cancelled] = held;
+      cancelled?.caller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancelled?.call.value).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: JsonRpcErrorCode.RequestCancelled } },
+      });
+      expect(openWaitCount()).toBe(MAX_OPEN_WAITS - 1);
+
+      const reused = await start(
+        { topic: TOPIC, wait_seconds: 30 },
+        callers[MAX_OPEN_WAITS]?.signal,
+      );
+      streams.at(-1)?.send(openLine(NTFY_NOW));
+      expect(streams).toHaveLength(MAX_OPEN_WAITS + 1);
+      expect(openWaitCount()).toBe(MAX_OPEN_WAITS);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      for (const { call } of held.slice(1)) {
+        expect(structured(call)).toMatchObject({ waitedSeconds: 30 });
+      }
+      expect(structured(reused)).toMatchObject({ waitedSeconds: 30 });
+      expect(openWaitCount()).toBe(0);
+    } finally {
+      // Whatever failed above, every stream ends here, so the tests after this one start from zero slots held.
+      for (const caller of callers) caller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+    }
+  });
+
+  describe('the `wait_seconds` cap', () => {
+    /** The `wait_seconds` property as `tools/list` advertises it. */
+    const advertised = () =>
+      (
+        z.toJSONSchema(ntfyFetchMessages.input, { io: 'input' }) as unknown as {
+          properties: { wait_seconds: Record<string, unknown> };
+        }
+      ).properties.wait_seconds;
+    const described = (capRule: string) =>
+      `Seconds to wait when the poll matches nothing: the call holds ntfy's stream open and returns the first matching message to arrive, or an empty result once the time is up. Default 0, no wait. ${capRule} Keep it under your client's tool-call timeout (60 s by default in MCP SDK clients). The poll runs first, so to wait for something newer than a message already in the window, your own question included, pass that message's \`id\` as \`since\`; a row whose \`time\` equals that message's may have been published just before it. Each wait holds one of ntfy's per-visitor open-subscription slots (30 by default), which every client behind this server's address shares. Ignored when \`id\` is set.`;
+
+    it('serves 90 as 40: the call holds the stream 40 s, says so, and logs the clamp naming `wait_seconds`', async () => {
+      const { streams } = upstream();
+      const ctx = createMockContext({ errors: ntfyFetchMessages.errors });
+      const pending = track(
+        ntfyFetchMessages.handler(
+          ntfyFetchMessages.input.parse({ topic: TOPIC, wait_seconds: 90 }),
+          ctx,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      streams[0]?.send(openLine(NTFY_NOW));
+      await vi.advanceTimersByTimeAsync(39_999);
+      expect(pending.settledAfterMs).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(pending.settledAfterMs).toBe(40_000);
+      expect(getEnrichment(ctx)).toMatchObject({
+        waitedSeconds: 40,
+        notice: `${empty(TOPIC)} None arrived during the 40-second wait; call again with the same arguments to keep waiting. \`wait_seconds\` 90 was served as 40, the most one call waits.`,
+      });
+      expect((ctx.log as MockContextLogger).calls.filter((c) => c.msg === 'Clamped limit')).toEqual(
+        [
+          {
+            level: 'info',
+            msg: 'Clamped limit',
+            data: {
+              tool: 'ntfy_fetch_messages',
+              input: 'wait_seconds',
+              requested: 90,
+              applied: 40,
+            },
+          },
+        ],
+      );
+    });
+
+    it('joins the clamp notice to the arrival notice in the one notice, on both surfaces', async () => {
+      const { streams } = upstream();
+      const call = await start({ topic: TOPIC, wait_seconds: 90 });
+      streams[0]?.send(openLine(NTFY_NOW));
+      await vi.advanceTimersByTimeAsync(5_000);
+      streams[0]?.send(JSON.stringify(row('m1')));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const notice =
+        "Arrived after 5 s of waiting. To wait for the next message, call again with `since` set to this message's `id`; a row that shares its `time` may have been published before it. `wait_seconds` 90 was served as 40, the most one call waits.";
+      expect(structured(call)).toMatchObject({ waitedSeconds: 5, notice });
+      expect(text(call)).toContain(`**waitedSeconds:** 5\n> ${notice}`);
+    });
+
+    it('advertises minimum 0, default 0, no maximum, and the clamping sentence while clamping', () => {
+      expect(advertised()).toMatchObject({ type: 'integer', minimum: 0, default: 0 });
+      expect(advertised()).not.toHaveProperty('maximum');
+      expect(advertised().description).toBe(
+        described('One call waits at most 40 s; a larger value is served as 40, with a notice.'),
+      );
+    });
+
+    it('advertises and enforces maximum 40 with NTFY_CLAMP_LIMITS=false', async () => {
+      process.env.NTFY_CLAMP_LIMITS = 'false';
+      resetServerConfig();
+      expect(advertised()).toMatchObject({ type: 'integer', minimum: 0, maximum: 40, default: 0 });
+      expect(advertised().description).toBe(described('At most 40.'));
+
+      const { calls } = upstream();
+      const rejected = await start({ topic: TOPIC, wait_seconds: 90 });
+      expect(rejected.value).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
+      });
+      expect(calls).toHaveLength(0);
+      expect(ntfyFetchMessages.input.safeParse({ topic: TOPIC, wait_seconds: 40 }).success).toBe(
+        true,
+      );
+    });
+  });
+
+  it('waits only what the call deadline leaves: a poll answered after 30 s holds the stream 20 s', async () => {
+    // A request timeout long enough for one slow poll to be answered.
+    waitService(45_000);
+    const { streams } = upstream({ pollDelayMs: 30_000 });
+    const call = await start({ topic: TOPIC, wait_seconds: 40 });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.send(openLine(NTFY_NOW));
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(call.settledAfterMs).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(call.settledAfterMs).toBe(CALL_DEADLINE_MS);
+    expect(structured(call)).toMatchObject({
+      waitedSeconds: 20,
+      notice: `${empty(TOPIC)} None arrived during the 20-second wait; call again with the same arguments to keep waiting.`,
+    });
+  });
+
+  it("fails on the caller's cancellation mid-wait with that cancellation, and aborts the stream", async () => {
+    const { calls, streams } = upstream();
+    const caller = new AbortController();
+    const reason = new Error('client went away');
+    const ctx = createMockContext({ errors: ntfyFetchMessages.errors, signal: caller.signal });
+    const pending = track(
+      ntfyFetchMessages.handler(
+        ntfyFetchMessages.input.parse({ topic: TOPIC, wait_seconds: 30 }),
+        ctx,
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    streams[0]?.send(openLine(NTFY_NOW));
+    await vi.advanceTimersByTimeAsync(2_000);
+    caller.abort(reason);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(pending.settledAfterMs).toBe(2_000);
+    const err = pending.error as Error & { code?: number };
+    expect(err.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(err.message).toBe('The ntfy request was cancelled by the caller.');
+    expect(err.cause).toBe(reason);
+    expect(streams[0]?.aborted).toBe(true);
+    expect(calls[1]?.signal?.reason).toBe(reason);
+
+    // A client reads the same cancellation.
+    const wire = new AbortController();
+    const onWire = await start({ topic: TOPIC, wait_seconds: 30 }, wire.signal);
+    streams[1]?.send(openLine(NTFY_NOW));
+    wire.abort(reason);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onWire.value).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: JsonRpcErrorCode.RequestCancelled,
+          message: 'The ntfy request was cancelled by the caller.',
+        },
+      },
+    });
+    expect(streams[1]?.aborted).toBe(true);
+  });
+
+  it("flags a waited row against ntfy's clock on the stream: a delayed message that fired during the wait is unflagged, a replayed queued one is flagged", async () => {
+    // This server's clock and the poll's `Date` both read before every row, so
+    // only the stream's `open` line can leave one unflagged.
+    vi.setSystemTime(new Date('2000-01-01T00:00:00Z'));
+    const { streams } = upstream({ date: 'Sat, 14 Nov 2026 05:00:00 GMT' });
+
+    const fired = await start({ topic: TOPIC, scheduled: true, wait_seconds: 30 });
+    streams[0]?.send(openLine(NTFY_NOW));
+    await vi.advanceTimersByTimeAsync(4_000);
+    // Due 3 s after the stream opened; ntfy writes it when it fires.
+    streams[0]?.send(JSON.stringify(row('fired0000001', { time: NTFY_NOW + 3 })));
+    await vi.advanceTimersByTimeAsync(0);
+    const [firedRow] = structured(fired).messages as Array<Record<string, unknown>>;
+    expect(firedRow).toMatchObject({ id: 'fired0000001', time: '2026-11-14T06:08:23.000Z' });
+    expect(firedRow).not.toHaveProperty('scheduled');
+    expect(text(fired)).toContain(
+      '### `fired0000001` — `message` on `alerts`\nTime: 2026-11-14T06:08:23.000Z\n',
+    );
+
+    const queued = await start({ topic: TOPIC, scheduled: true, wait_seconds: 30 });
+    // ntfy replays a message still queued an hour ahead as soon as the stream opens.
+    streams[1]?.send(
+      openLine(NTFY_NOW),
+      JSON.stringify(row('queued000001', { time: NTFY_NOW + 3_600 })),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(structured(queued)).toMatchObject({
+      messages: [{ id: 'queued000001', scheduled: true }],
+    });
+    expect(text(queued)).toContain(
+      '### `queued000001` — `message` on `alerts`\nDelivers: 2026-11-14T07:08:20.000Z (scheduled)\n',
+    );
+  });
+
+  it('parses through the production success schema with `waitedSeconds` and without it, and never renders an absent one', async () => {
+    // The schema the framework parses a success against: output plus enrichment.
+    const success = ntfyFetchMessages.output.extend(ntfyFetchMessages.enrichment ?? {});
+    const { streams } = upstream();
+
+    const waited = await start({ topic: TOPIC, wait_seconds: 30 });
+    streams[0]?.send(openLine(NTFY_NOW));
+    await vi.advanceTimersByTimeAsync(1_500);
+    streams[0]?.send(JSON.stringify(row('m1')));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(success.parse(structured(waited))).toMatchObject({ waitedSeconds: 1.5 });
+    expect(text(waited)).toContain('**waitedSeconds:** 1.5\n');
+
+    const unwaited = await start({ topic: TOPIC });
+    expect(streams).toHaveLength(1);
+    expect(structured(unwaited)).not.toHaveProperty('waitedSeconds');
+    expect(success.parse(structured(unwaited))).not.toHaveProperty('waitedSeconds');
+    expect(text(unwaited)).not.toContain('waitedSeconds');
+    expect(text(unwaited)).not.toContain('undefined');
+  });
+});
+
+describe('ntfyFetchMessages `sequence_id` rows (#62)', () => {
+  beforeEach(() => {
+    resetServerConfig();
+    resetNtfyService();
+    for (const k of ENV_KEYS) delete process.env[k];
+    process.env.NTFY_BASE_URL = 'https://ntfy.test';
+    freshService();
+  });
+  afterEach(() => {
+    for (const k of ENV_KEYS) delete process.env[k];
+    resetServerConfig();
+    resetNtfyService();
+    vi.restoreAllMocks();
+  });
+
+  it('carries the sequence ID a first publish chose under `Sequence ID:`, and no sequence line on one that chose none, on both surfaces', async () => {
+    // Rows as ntfy writes them: it omits `sequence_id` when it equals the message's own `id`.
+    const rows = [
+      {
+        id: 'Q1fNWHrqZ0Ab',
+        time: 1_794_636_600,
+        event: 'message',
+        topic: 'alerts',
+        message: 'no sequence chosen',
+      },
+      {
+        id: 'ImgiPdg02oLq',
+        time: 1_794_636_601,
+        event: 'message',
+        topic: 'alerts',
+        sequence_id: 'backup-42',
+        message: 'backup started',
+      },
+      {
+        id: 'Kc3vL0pQx9Zt',
+        time: 1_794_636_602,
+        event: 'message_clear',
+        topic: 'alerts',
+        sequence_id: 'backup-42',
+      },
+    ];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (new URL(url).hostname !== 'ntfy.test') throw new Error(`Unmocked fetch: ${url}`);
+      return new Response(rows.map((r) => JSON.stringify(r)).join('\n'), {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
+      });
+    });
+
+    const result = await runToolContract(ntfyFetchMessages, { topic: 'alerts', since: 'all' });
+    const { messages } = JSON.parse(JSON.stringify(result.structuredContent)) as {
+      messages: Array<Record<string, unknown>>;
+    };
+    expect(messages.map((m) => m.sequence_id)).toEqual([undefined, 'backup-42', 'backup-42']);
+    expect(messages[0]).not.toHaveProperty('sequence_id');
+    expect((result.content[0] as { text: string }).text).toBe(
+      [
+        '### `Q1fNWHrqZ0Ab` — `message` on `alerts`',
+        'Time: 2026-11-14T06:10:00.000Z',
+        '',
+        '```text',
+        'no sequence chosen',
+        '```',
+        '',
+        '### `ImgiPdg02oLq` — `message` on `alerts`',
+        'Time: 2026-11-14T06:10:01.000Z',
+        'Sequence ID: `backup-42`',
+        '',
+        '```text',
+        'backup started',
+        '```',
+        '',
+        '### `Kc3vL0pQx9Zt` — `message_clear` on `alerts`',
+        'Time: 2026-11-14T06:10:02.000Z',
+        'Sequence ID: `backup-42`',
+      ].join('\n'),
+    );
   });
 });
