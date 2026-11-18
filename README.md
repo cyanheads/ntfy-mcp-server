@@ -58,8 +58,9 @@ Plugin, npm, Docker, and MCPB installs ship it from `skills/`; MCP clients that 
 - Takes `title`, `priority` (1–5), `tags`, `click`, `attach`, `icon`, `filename`, `markdown` (rendered by the web app and the Android app), `delay`, `timezone`, `email`, `call`, `cache`, `firebase`, and up to three action buttons (`view`, `broadcast`, `http`, `copy`); body capped at 4096 bytes, empty body defaults to `triggered`; pass the original `sequence_id` to update a sent message
 - `delay` takes a duration, a Unix timestamp, an RFC 3339 time with its `Z` or `±hh:mm` offset, or a natural-language time; ntfy reads a natural-language time in `timezone` (an IANA zone name) when set, otherwise in its own server's timezone. `email: "yes"` uses the account's primary verified address
 - Publishes with `email`, `call`, or a `broadcast`/`http` button ask the user to confirm the target before sending; declining fails with `consent_declined`
-- A per-call `base_url` gets credentials only if it matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request is unauthenticated
-- Failures carry typed reasons: `payload_too_large` (body, attachment, `title`, or combined `tags` over ntfy's limits), `invalid_delay`, `invalid_timezone` (a `timezone` ntfy doesn't know, checked only when `delay` is set), `invalid_attachment` (malformed `attach` URL, or `filename` without `attach`), and `unverified_contact` (`email`/`call` without a verified address or number, or without auth), alongside the shared reasons under Features
+- A per-call `base_url` gets credentials only if it matches a registered server (`NTFY_BASE_URL` or an `NTFY_SERVERS` entry); otherwise the request is unauthenticated. A base URL may not carry `user:password@`; credentials are set through the auth fields
+- Every successful call reports `quota`: the daily `messages` allowance and the `requests` burst, each with its `limit` and `remaining`, when ntfy reports them (ntfy v2.37.0 and later)
+- Failures carry typed reasons: `payload_too_large` (body, attachment, `title`, combined `tags`, or the request as a whole over ntfy's limits), `invalid_delay`, `invalid_timezone` (a `timezone` ntfy doesn't know, checked only when `delay` is set), `invalid_attachment` (malformed `attach` URL, or `filename` without `attach`), and `unverified_contact` (`email`/`call` without a verified address or number, or without auth), alongside the shared reasons under Features
 
 ---
 
@@ -67,14 +68,15 @@ Plugin, npm, Docker, and MCPB installs ship it from `skills/`; MCP clients that 
 
 - `operation`: `clear` marks the notification read and dismisses it (subscribers see `message_clear`); `delete` removes it from the drawer (subscribers see `message_delete`)
 - Every call asks the user to confirm the topic, `sequence_id`, and operation first; declining fails with `consent_declined`
+- Reports `quota` on every successful call, as `ntfy_publish_message` does
 - The original message stays in cache, and repeating an operation is safe; ntfy.sh accepts an unknown `sequence_id`, stricter deployments return `not_found`
 
 ---
 
 ### `ntfy_fetch_messages` <sub>tool</sub>
 
-- Returns a snapshot, not a live stream; accepts comma-separated topics (e.g. `alerts,backups`, each 1–64 characters) and filters `since` (duration / Unix timestamp in seconds / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, plus `scheduled` to include delayed messages; a still-queued row comes back `scheduled: true`, and its `time` is the delivery time
-- Default window `10m`, default limit 20, at most 100 per call (a larger `limit` is served as 100 with a notice; `NTFY_CLAMP_LIMITS=false` rejects it instead); a larger window returns the newest `limit` messages with `totalCount` and a `nextCursor` to pass back as `cursor`. Bodies truncate at ~500 UTF-16 code units, on a code-point boundary (`messageTruncated` gives the dropped count in that unit); refetch with `id` for the full text. Rows carry `icon`, `encoding`, and an action `id` when ntfy sent them. `upstreamTruncated` flags a replay ntfy capped
+- Returns a snapshot of cached messages; `wait_seconds` (default 0, at most 40 per call) holds ntfy's stream open when the poll matches nothing and returns the first matching message to arrive, or the empty result when the time is up (pass the last message's `id` as `since` to wait for the next one; a row with the same `time` may have been published just before it). Accepts comma-separated topics (e.g. `alerts,backups`, each 1–64 characters) and filters `since` (duration / Unix timestamp in seconds / message ID / `all` / `latest`), `priority`, `tags`, `id`, `title`, `message`, plus `scheduled` to include delayed messages; a still-queued row comes back `scheduled: true`, and its `time` is the delivery time
+- Default window `10m`, default limit 20, at most 100 per call (a larger `limit` is served as 100 with a notice, and a larger `wait_seconds` as 40; `NTFY_CLAMP_LIMITS=false` rejects it instead); a larger window returns the newest `limit` messages with `totalCount` and a `nextCursor` to pass back as `cursor`. Bodies truncate at ~500 UTF-16 code units, on a code-point boundary (`messageTruncated` gives the dropped count in that unit); refetch with `id` for the full text. Rows carry `icon`, `encoding`, and an action `id` when ntfy sent them. `upstreamTruncated` flags a replay ntfy capped
 - A numeric `since` is Unix seconds: a value of 10¹² or more (a millisecond timestamp) is rejected, and a value under 10⁹ or a 12-digit number gets a notice, since ntfy would read it as a time before 2001 (a bare `10` is 1970) or as a message ID
 - Failures carry typed reasons: `invalid_since` (malformed `since` value, or a numeric one of 10¹² or more), `cursor_not_found` (the cursor's message expired, or came from a call with different topics, `since`, or filters), and `upstream_malformed` (the response wasn't an ntfy message stream), alongside the shared reasons under Features
 
@@ -108,8 +110,8 @@ ntfy-specific:
 
 Agent-friendly output:
 
-- Publish and manage echo the resolved topic, ID, and timestamp; fetch also echoes the resolved `since` and applied filters
-- Typed `reason` codes let callers branch on failure mode. Shared across the tools and the resource: `forbidden_topic` (ntfy refused the topic with 401/403: missing or insufficient credentials), `rate_limited` (429 after retries), `upstream_unreachable` (network failure, a 5xx that outlasted retries or whose `Retry-After` the call can't wait out, or no complete answer within the 50 s call deadline; carries `retryAfter` when ntfy sent one), `upstream_malformed` (a reply that isn't ntfy's message format or couldn't be read in full; publish and manage don't retry it, since the event may already be out), `not_ntfy_endpoint` (the answer didn't come from an ntfy topic route: a non-2xx answer without ntfy's JSON error envelope on a status no other reason claims, such as a 404, 405, or 501, or a proxy's 401 or 403, or ntfy's own 40401 `page not found`; the code stays the one the HTTP status maps to, an answer without the envelope names the host the request was sent to, and `ntfy_manage_message` keeps every 404 as `not_found`). `consent_declined`, `not_found`, and the rest are listed per entry
+- Publish and manage echo the resolved topic, ID, and timestamp, and report the remaining `quota`; fetch also echoes the resolved `since` and applied filters
+- Typed `reason` codes let callers branch on failure mode. Shared across the tools and the resource: `forbidden_topic` (ntfy refused the topic with 401/403: missing or insufficient credentials), `rate_limited` (429 after retries; `data.limit` names which limit ntfy hit, when its error says), `upstream_unreachable` (network failure, a 5xx that outlasted retries or whose `Retry-After` the call can't wait out, or no complete answer within the 50 s call deadline; carries `retryAfter` when ntfy sent one), `upstream_malformed` (a reply that isn't ntfy's message format or couldn't be read in full; publish and manage don't retry it, since the event may already be out), `not_ntfy_endpoint` (the answer didn't come from an ntfy topic route: a non-2xx answer without ntfy's JSON error envelope on a status no other reason claims, such as a 404, 405, or 501, or a proxy's 401 or 403, or ntfy's own 40401 `page not found`; the code stays the one the HTTP status maps to, an answer without the envelope names the host the request was sent to, and `ntfy_manage_message` keeps every 404 as `not_found`). `consent_declined`, `not_found`, and the rest are listed per entry
 - Fetch and emoji search report `truncated`, `totalCount`, and a `notice` naming the next step (pass `nextCursor` as `cursor`, advance `offset`)
 
 ## Getting started
@@ -139,8 +141,8 @@ Public ntfy.sh works without an account. Set `NTFY_DEFAULT_TOPIC` so calls can o
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `NTFY_SERVERS` | JSON array of `{ baseUrl, authToken? \| authUsername?+authPassword? }` entries, one per ntfy server; the first is the default. Takes precedence over the single-server vars below. | — |
-| `NTFY_BASE_URL` | Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when `NTFY_SERVERS` is unset. | `https://ntfy.sh` |
+| `NTFY_SERVERS` | JSON array of `{ baseUrl, authToken? \| authUsername?+authPassword? }` entries, one per ntfy server; the first is the default. A `baseUrl` may not carry `user:password@`; startup fails on one. Takes precedence over the single-server vars below. | — |
+| `NTFY_BASE_URL` | Single-server shorthand — base URL of the ntfy server (no trailing slash, no `user:password@`; credentials go in the auth variables below). Used when `NTFY_SERVERS` is unset. | `https://ntfy.sh` |
 | `NTFY_DEFAULT_TOPIC` | Topic used when a tool call omits `topic`. | — |
 | `NTFY_AUTH_TOKEN` | Bearer access token (`tk_…`) for the single-server shorthand. Mutually exclusive with `NTFY_AUTH_USERNAME` / `NTFY_AUTH_PASSWORD`. | — |
 | `NTFY_AUTH_USERNAME` | Basic-auth username for the single-server shorthand — required together with `NTFY_AUTH_PASSWORD`. | — |
@@ -148,7 +150,7 @@ Public ntfy.sh works without an account. Set `NTFY_DEFAULT_TOPIC` so calls can o
 | `NTFY_REQUEST_TIMEOUT_MS` | Per-attempt HTTP timeout in milliseconds. Each call is also capped at 50 s across all attempts. | `15000` |
 | `NTFY_MAX_RETRIES` | Max retry attempts for transient upstream failures (5xx, network, 429). | `3` |
 | `NTFY_BLOCK_PRIVATE_HOSTS` | When `true`, a per-call `base_url` override must resolve to a public address and redirects are not followed. Registered servers are exempt. Turn it on where callers you don't control can reach the server. | `false` |
-| `NTFY_CLAMP_LIMITS` | When `true`, a `limit` above a tool's per-call cap (100 for `ntfy_fetch_messages`, 200 for `ntfy_search_emoji_tags`) is served as the cap with a notice, and the schema advertises no maximum. Set to `false` to advertise and enforce the cap as a schema maximum, rejecting a larger value. | `true` |
+| `NTFY_CLAMP_LIMITS` | When `true`, a `limit` above a tool's per-call cap (100 for `ntfy_fetch_messages`, 200 for `ntfy_search_emoji_tags`), or a `wait_seconds` above 40, is served as the cap with a notice, and the schema advertises no maximum. Set to `false` to advertise and enforce the cap as a schema maximum, rejecting a larger value. | `true` |
 | `NTFY_ENABLE_EMOJI_TAGS` | Set to `false` to disable `ntfy_search_emoji_tags`. An unrecognized value fails startup. | `true` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_SESSION_MODE` | HTTP session model: `auto`, `stateful`, or `stateless`. Over HTTP this server requires `stateful` (`auto` resolves to it); `stateless` is refused at start. Ignored on stdio. | `stateful` |

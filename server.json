@@ -17,13 +17,13 @@
       "environmentVariables": [
         {
           "name": "NTFY_SERVERS",
-          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
+          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. A `baseUrl` may not carry `user:password@`; set credentials with the entry's auth fields. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "NTFY_BASE_URL",
-          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when NTFY_SERVERS is unset.",
+          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash, no `user:password@`; set credentials with the NTFY_AUTH_* variables). Used when NTFY_SERVERS is unset.",
           "format": "string",
           "isRequired": false,
           "default": "https://ntfy.sh"
@@ -75,7 +75,7 @@
         },
         {
           "name": "NTFY_CLAMP_LIMITS",
-          "description": "When true, a `limit` above a tool's per-call cap (100 for ntfy_fetch_messages, 200 for ntfy_search_emoji_tags) is served as the cap with a notice, and the input schema advertises no maximum. Set to false to advertise and enforce a schema maximum at the cap instead, so a larger value is rejected.",
+          "description": "When true, a `limit` above a tool's per-call cap (100 for ntfy_fetch_messages, 200 for ntfy_search_emoji_tags), or a `wait_seconds` above 40 on ntfy_fetch_messages, is served as the cap with a notice, and the input schema advertises no maximum. Set to false to advertise and enforce a schema maximum at the cap instead, so a larger value is rejected.",
           "format": "string",
           "isRequired": false,
           "default": "true"
@@ -128,13 +128,13 @@
         },
         {
           "name": "NTFY_SERVERS",
-          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
+          "description": "JSON array of `{ baseUrl, authToken? | authUsername?+authPassword? }` entries — one per ntfy server. First entry is the default base. A `baseUrl` may not carry `user:password@`; set credentials with the entry's auth fields. Auth is scoped to the entry's `baseUrl`; per-call `base_url` overrides that match a registered base forward that server's auth. Takes precedence over the single-server NTFY_BASE_URL / NTFY_AUTH_* shorthand.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "NTFY_BASE_URL",
-          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash). Used when NTFY_SERVERS is unset.",
+          "description": "Single-server shorthand — base URL of the ntfy server (no trailing slash, no `user:password@`; set credentials with the NTFY_AUTH_* variables). Used when NTFY_SERVERS is unset.",
           "format": "string",
           "isRequired": false,
           "default": "https://ntfy.sh"
@@ -186,7 +186,7 @@
         },
         {
           "name": "NTFY_CLAMP_LIMITS",
-          "description": "When true, a `limit` above a tool's per-call cap (100 for ntfy_fetch_messages, 200 for ntfy_search_emoji_tags) is served as the cap with a notice, and the input schema advertises no maximum. Set to false to advertise and enforce a schema maximum at the cap instead, so a larger value is rejected.",
+          "description": "When true, a `limit` above a tool's per-call cap (100 for ntfy_fetch_messages, 200 for ntfy_search_emoji_tags), or a `wait_seconds` above 40 on ntfy_fetch_messages, is served as the cap with a notice, and the input schema advertises no maximum. Set to false to advertise and enforce a schema maximum at the cap instead, so a larger value is rejected.",
           "format": "string",
           "isRequired": false,
           "default": "true"

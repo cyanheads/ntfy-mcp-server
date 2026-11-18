@@ -4,7 +4,7 @@ description: Gates and identifier rules for the ntfy_* tools — choosing the to
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.1"
+  version: "1.2"
 ---
 
 ## Scope
@@ -12,7 +12,7 @@ metadata:
 ntfy pushes notifications to the phones and desktops subscribed to a topic. Use it to reach the user outside the chat: a long task finished or failed, a checkpoint, a reminder at a set time. Use `ntfy_fetch_messages` (or the `ntfy://{topic}` snapshot) to look back at what a topic received.
 
 - The server watches nothing. "Notify me when the build finishes" means you publish when the work you are running ends.
-- Fetching polls the server's message cache. It is not a subscription: you cannot wait for a reply, and a tapped action button reports nothing back here.
+- Fetching polls the server's message cache. It is not a subscription, and a tapped action button reports nothing back here. To wait for a reply, fetch with `wait_seconds` (at most 40 per call).
 - Only cached messages can be fetched. ntfy.sh keeps them about 12 hours; a self-hosted server sets its own window. An empty result for an older period does not mean nothing was sent.
 - Leave `base_url` out to use the configured server. Credentials go only to a URL that matches a configured server (a trailing `/` aside), so another spelling of the same host (`localhost` for `127.0.0.1`, an uppercase scheme) is sent without them.
 
@@ -21,7 +21,7 @@ ntfy pushes notifications to the phones and desktops subscribed to a topic. Use 
 | Identifier | Comes from | Goes to |
 |:--|:--|:--|
 | Topic | The user, who must be subscribed to it, or the server's configured default | Every tool; fetch also takes a comma-separated list |
-| Message `id` | The publish result; each fetch row | Fetch's `id` filter (full body) or `since` (only messages after it) |
+| Message `id` | The publish result; each fetch row | Fetch's `id` filter (full body) or `since` (the messages after it, plus any published earlier in the same second) |
 | Sequence id | The `id` of the notification's first message, or a name you chose on that first publish | `sequence_id` on every update, and on clear or delete |
 | `event_id` | The clear or delete result | Nothing. It names the event, not the notification |
 
@@ -38,7 +38,7 @@ A notification keeps one sequence id for its whole life:
 3. **An update replaces the notification; it does not merge into it.** Resend every field the notification should keep (title, tags, priority, click URL, icon, buttons). The update carries only what that call sets.
 4. **The publish result is the receipt.** A successful publish means the server accepted the message. A fetch made right after it can come back empty for a few seconds before the message shows up. That is not a lost message or a wrong topic, and resending delivers a duplicate. Fetch to confirm only when a publish failed in a way that says it may have gone out, and wait a few seconds first.
 5. **Prompted actions need a client that can prompt.** A clear, a delete, or a publish that sends email, places a call, or carries a broadcast or `http` button asks the user to confirm through the client. A failure saying the client did not declare the elicitation capability (`client_capability_missing`, or JSON-RPC error `-32021` with `requiredCapabilities`) means this client cannot show that prompt. Tell the user the action is unavailable here and don't retry it. A plain notification, a `view` or `copy` button, and a `click` URL never prompt.
-6. **Every update counts against the quota.** Each update, clear, and delete is a message against the server's daily per-visitor limit, which is low on public ntfy.sh. Update a progress notification at milestones, not on every step.
+6. **Every update counts against the quota.** Each update, clear, and delete is a message against the server's daily per-visitor limit, which is low on public ntfy.sh. Update a progress notification at milestones, not on every step. A publish, clear, or delete reports what is left as `quota.messages.remaining` when ntfy says; plan a run of updates against it.
 
 ## Workflows
 
@@ -51,6 +51,8 @@ A notification keeps one sequence id for its whole life:
 - Move it: publish again with the same sequence id and the new `delay` while the first is still pending. The pending one is replaced rather than joined by a second reminder. Give a reschedule a few seconds after the publish it replaces; two sent back to back can both stay queued.
 - Cancel it: delete that sequence id before it fires. It is removed and never delivered.
 - Check what is queued: pending reminders appear in a fetch only when the call sets `scheduled: true`. Each one still queued then carries `scheduled: true` on its row (shown as `Delivers: <time> (scheduled)`), and its `time` is when it will deliver. A reminder that came due seconds ago can still be queued without the flag.
+
+**Waiting for a reply.** Fetch with `wait_seconds` (up to 40). When nothing matches yet, the call holds the connection open and returns the first matching message to arrive, or the empty result when the time is up; call again to keep waiting. To wait for the next message after one you already have, pass that message's `id` as `since`, since the poll runs first and would return the message already there. A row whose `time` equals that message's may have been published just before it, so check its `id` against the ones you have already read. `wait_seconds` is ignored when `id` is set.
 
 **What arrived on a topic.** Fetch with a `since` that covers the period. For "since this morning", use that moment as a Unix timestamp in seconds, never milliseconds; a bare `10` means 1970, not ten minutes. Durations stop at hours (`24h`, not `1d`). One call returns at most `limit` rows (20 by default, 100 at most); while a result has a `nextCursor`, call again with `cursor` set to it, keeping `topic`, `since`, and filters the same. The last page has no `nextCursor` even when it still says `truncated: true`, so stop there. The first call returns the newest rows and the cursor walk then covers the whole window from the oldest, so those rows come back at the end of the walk: count messages with `totalCount`, not by adding up pages. Then reduce all the rows:
 
