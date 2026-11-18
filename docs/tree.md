@@ -1,6 +1,6 @@
 # ntfy-mcp-server - Directory Structure
 
-Generated on: 2026-11-14 07:42:57
+Generated on: 2026-11-18 06:17:20
 
 ```text
 ntfy-mcp-server/
@@ -170,7 +170,8 @@ ntfy-mcp-server/
 │   │       └── utils/
 │   │           ├── confirm-action.ts
 │   │           ├── limit-clamp.ts
-│   │           └── markdown-literal.ts
+│   │           ├── markdown-literal.ts
+│   │           └── quota-enrichment.ts
 │   ├── services/
 │   │   ├── emoji-tags/
 │   │   │   ├── data.generated.ts
@@ -180,6 +181,7 @@ ntfy-mcp-server/
 │   │       ├── error-classifier.ts
 │   │       ├── message-shape.ts
 │   │       ├── ntfy-service.ts
+│   │       ├── quota.ts
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
@@ -196,12 +198,14 @@ ntfy-mcp-server/
 │   │   │   ├── base-url-guard.test.ts
 │   │   │   ├── error-classifier.test.ts
 │   │   │   ├── message-shape.test.ts
-│   │   │   └── ntfy-service.test.ts
+│   │   │   ├── ntfy-service.test.ts
+│   │   │   └── quota.test.ts
 │   │   └── emoji-tag-service.test.ts
 │   ├── tools/
 │   │   ├── utils/
 │   │   │   ├── limit-clamp.test.ts
-│   │   │   └── markdown-literal.test.ts
+│   │   │   ├── markdown-literal.test.ts
+│   │   │   └── quota-enrichment.test.ts
 │   │   ├── ntfy-fetch-messages.tool.test.ts
 │   │   ├── ntfy-manage-message.tool.test.ts
 │   │   ├── ntfy-publish-message.tool.test.ts

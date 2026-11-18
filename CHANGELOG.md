@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [2.4.2](changelog/2.4.x/2.4.2.md) — 2026-11-17 · 🛡️ Security
+
+ntfy_fetch_messages gains wait_seconds to wait for the next matching message. Publish and manage results report the remaining ntfy quota, rate_limited errors name the limit hit, a base URL can no longer carry credentials, and consent prompts name the label and payload of each button.
+
 ## [2.4.1](changelog/2.4.x/2.4.1.md) — 2026-11-14 · 🛡️ Security
 
 Log records and the log notifications sent to clients no longer carry topic names. ntfy_publish_message gains timezone for natural-language delay, ntfy_fetch_messages marks reminders still queued, and an answer from a host that is not ntfy fails as not_ntfy_endpoint. Built on mcp-ts-core 0.13.22.
